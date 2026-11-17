@@ -1,0 +1,9452 @@
+<?php
+/**
+ * Fourge CMS — Server API
+ * Place at: yoursite.com/admin/api.php
+ * Add admin/api.php to .gitignore — never commit this file.
+ */
+
+require_once __DIR__ . '/db.php';      // SQLite data layer (users, sessions, encrypted secrets)
+
+// ── CONFIGURATION ────────────────────────────────────────────────────────────
+// Secrets (API token + Mailgun) are read from config.secret.php when present, so
+// deploying or self-updating api.php NEVER clobbers your live values. The inline
+// strings are only fallbacks for a brand-new install. config.secret.php is
+// gitignored and never deployed — put your real keys there.
+$__secret = (function () {
+    $f = __DIR__ . '/config.secret.php';
+    $c = file_exists($f) ? (include $f) : [];
+    return is_array($c) ? $c : [];
+})();
+
+// Read SMTP mail credentials out of a legacy PHPMailer "send.php" (the handler a
+// site used before it was moved onto the CMS). The file is parsed as TEXT and is
+// NEVER included or executed — we only pull the string/number literals from its
+// $CONFIG array. This lets an already-launched site keep sending form email with
+// no config.secret.php rewrite. Returns [] when there's no usable send.php.
+function fourgeLegacySendConfig($root) {
+    if (!$root) return [];
+    $files = [];
+    if (is_file($root . '/send.php')) $files[] = $root . '/send.php';
+    else foreach (glob($root . '/*/send.php') ?: [] as $g) $files[] = $g;   // one level down, only if not at root
+    foreach ($files as $file) {
+        $src = @file_get_contents($file);
+        if ($src === false || stripos($src, 'smtp_host') === false) continue;
+        $str = function ($key) use ($src) {
+            return preg_match('/[\'"]' . $key . '[\'"]\s*=>\s*[\'"]([^\'"]*)[\'"]/', $src, $m) ? trim($m[1]) : '';
+        };
+        $host = $str('smtp_host'); $user = $str('smtp_username'); $pass = $str('smtp_password');
+        if ($host === '' || $user === '' || $pass === '') continue;   // not a usable SMTP block
+        $cfg = [
+            'smtp_host'     => $host,
+            'smtp_port'     => preg_match('/[\'"]smtp_port[\'"]\s*=>\s*(\d+)/', $src, $m) ? (int)$m[1] : 587,
+            'smtp_username' => $user,
+            'smtp_password' => $pass,
+        ];
+        $sec = $str('smtp_secure'); if ($sec !== '') $cfg['smtp_secure'] = $sec;
+        $fe = $str('from_email');   $fn = $str('from_name');
+        if ($fe !== '') $cfg['mg_from'] = ($fn !== '' ? $fn . ' <' . $fe . '>' : $fe);
+        $to = $str('to_email');     if ($to !== '') $cfg['mg_notify_to'] = $to;
+        return $cfg;
+    }
+    return [];
+}
+// A list of email addresses: one, several separated by commas, semicolons or
+// spaces, or "Name <address>" forms. Anything that isn't a valid address is
+// dropped, and so are repeats. Returns "a@x.com, b@y.com", or ''.
+function fourgeEmailList($s) {
+    $out = []; $seen = [];
+    foreach (preg_split('/[\s,;]+/', (string)$s, -1, PREG_SPLIT_NO_EMPTY) as $a) {
+        $a = trim($a, " \t\r\n<>\"'");
+        if ($a === '' || !filter_var($a, FILTER_VALIDATE_EMAIL) || isset($seen[strtolower($a)])) continue;
+        $seen[strtolower($a)] = true; $out[] = $a;
+    }
+    return implode(', ', $out);
+}
+// The CC list in a legacy send.php's $CONFIG ('cc_email'): who the old handler
+// copied on every form email. Read as text, never run, like the settings above;
+// a commented-out line doesn't count. One address, a comma-separated list, or an
+// array of them. Returns fourgeEmailList()'s form, or '' when there is none.
+function fourgeLegacySendCc($root) {
+    if (!$root) return '';
+    $files = [];
+    if (is_file($root . '/send.php')) $files[] = $root . '/send.php';
+    else foreach (glob($root . '/*/send.php') ?: [] as $g) $files[] = $g;
+    foreach ($files as $file) {
+        $src = @file_get_contents($file);
+        if ($src === false || stripos($src, 'cc_email') === false) continue;
+        $src = preg_replace(['~/\*[\s\S]*?\*/~', '~^[ \t]*(?://|#).*$~m'], '', $src);
+        if (!preg_match('/[\'"]cc_email[\'"]\s*=>\s*(\[[^\]]*\]|array\s*\([^)]*\)|\'[^\']*\'|"[^"]*")/i', $src, $m)) continue;
+        preg_match_all('/\'([^\']*)\'|"([^"]*)"/', $m[1], $q);
+        $list = fourgeEmailList(implode(',', array_merge($q[1], $q[2])));
+        if ($list !== '') return $list;
+    }
+    return '';
+}
+// Only when config.secret.php configures no mail of its own — explicit config always wins.
+// Record where the mail credentials ultimately came from so the "Send test email"
+// diagnostic can show it (config.secret.php vs the legacy send.php vs none).
+$GLOBALS['__mail_source'] = (!empty($__secret['smtp_host']) || !empty($__secret['mg_api_key'])) ? 'config.secret.php' : 'none';
+if (empty($__secret['smtp_host']) && empty($__secret['mg_api_key'])) {
+    $__legacy = fourgeLegacySendConfig(dirname(__DIR__));
+    if ($__legacy) { $__secret = array_merge($__legacy, $__secret); $GLOBALS['__mail_source'] = 'send.php'; }
+}
+
+define('API_TOKEN',    (string)($__secret['api_token'] ?? 'CHANGE_ME')); // optional now (login uses sessions); kept for legacy/external callers
+define('PUBLIC_HTML',  realpath(dirname(__DIR__)));
+
+// ── Not hoisted ──────────────────────────────────────────────────────────────
+// PHP defines a top-level `const` only when execution reaches its line. The
+// request dispatcher below runs handlers long before the bottom of this file, so
+// every constant a handler may touch has to be declared up here — declared next
+// to the function that uses it, it is "Undefined constant" at request time (which
+// is exactly how form file uploads and the GitHub mirror hooks failed).
+// Form uploads (fourgeStoreFormUpload): accepted types and per-file size cap.
+const FOURGE_UPLOAD_ALLOWED_EXT = ['pdf','doc','docx','xls','xlsx','ppt','pptx','png','jpg','jpeg','gif','webp','txt','csv','zip'];
+const FOURGE_UPLOAD_MAX_BYTES = 10485760;   // 10 MB per file
+// GitHub mirror (cmsGhShouldMirror / cmsGhMaxBytes): folders never mirrored, and
+// the largest file the mirror will push — see the policy comment by those functions.
+const FOURGE_GH_SKIP_DIRS = ['.git', 'admin', 'node_modules', 'cgi-bin', 'data/uploads'];
+const FOURGE_GH_MAX_BYTES = 20971520;
+define('FOURGE_API_VERSION', '1.14.159');   // this file's engine version — KEEP EQUAL to CMS_VERSION / version.json (CI + the sign-in api-version check compare them)
+define('FOURGE_POSTS_RUNTIME_VERSION', 4);   // the public post-list runtime's version — KEEP EQUAL to POSTS_RUNTIME_SWEEP_VERSION in admin/index.html (parity-tested)
+
+// Mailgun (forms)
+define('MG_DOMAIN',    (string)($__secret['mg_domain']    ?? 'mg.example.com'));
+define('MG_API_KEY',   (string)($__secret['mg_api_key']   ?? ''));
+define('MG_FROM',      (string)($__secret['mg_from']      ?? 'Fourge CMS <postmaster@mg.example.com>'));
+define('MG_NOTIFY_TO', (string)($__secret['mg_notify_to'] ?? ''));
+
+// GoHighLevel (Lead Generation) — must be defined BEFORE the request dispatch
+// below, since define() runs top-to-bottom (functions are hoisted; constants are not).
+define('GHL_API_BASE',    'https://services.leadconnectorhq.com');
+define('GHL_API_VERSION', '2021-07-28');
+// Google Analytics: the service-account credentials and the cached access token
+// (gaSaveCredentials / gaStatus / gaReport).
+define('GA_CRED_FILE',  __DIR__ . '/ga-service-account.json');
+define('GA_TOKEN_CACHE', __DIR__ . '/.ga-token.json');
+// llms.txt (fourgeEnsureLlms) and the AI auto-fix (fourgeAiAutofix, its daily run,
+// the Fleet Dashboard snapshot). These sat next to their functions, below the
+// dispatcher, so they never existed when it called them: on PHP 8 the auto-fix
+// failed with "Undefined constant FOURGE_AI_STATE" and llms.txt was never written.
+define('FOURGE_LLMS_MARK', '<!-- generated by Fourge from this site\'s own pages -->');
+define('FOURGE_AI_MODEL', 'claude-haiku-4-5-20251001');
+define('FOURGE_AI_STATE', 'ai_autofix.json');
+// The lengths the audit grades. Outside these a value is "weak" and gets redone.
+define('FOURGE_TITLE_MIN', 20); define('FOURGE_TITLE_MAX', 65);
+define('FOURGE_DESC_MIN', 70);  define('FOURGE_DESC_MAX', 165);
+
+// Contact-form email via SMTP (Mailgun/SendGrid/any relay). When these are set,
+// the form handler sends over SMTP instead of the Mailgun HTTP API — so a
+// migrated site's EXISTING SMTP credentials work as-is, no API key needed. Kept
+// in config.secret.php (gitignored) so it never passes through the repo. The
+// From address uses mg_from; the recipient uses the form's notify address (or
+// mg_notify_to). smtp_secure: 'auto' (STARTTLS on 587, implicit TLS on 465),
+// or force 'tls' / 'ssl' / 'none'.
+define('SMTP_HOST',   (string)($__secret['smtp_host']     ?? ''));
+define('SMTP_PORT',   (int)   ($__secret['smtp_port']     ?? 587));
+define('SMTP_USER',   (string)($__secret['smtp_username'] ?? ''));
+define('SMTP_PASS',   (string)($__secret['smtp_password'] ?? ''));
+define('SMTP_SECURE', (string)($__secret['smtp_secure']   ?? 'auto'));
+
+// Require a secure (HTTPS) connection for sign-in and credential/secret changes.
+// Defaults ON. Localhost/dev is always exempt. To allow plain HTTP in an unusual
+// setup, add  'require_https' => false  to your config.secret.php array.
+define('REQUIRE_HTTPS', array_key_exists('require_https', $__secret) ? (bool)$__secret['require_https'] : true);
+
+// Team onboarding (optional). A NEW email on ONBOARD_EMAIL_DOMAIN that signs in
+// with ONBOARD_PASSWORD self-provisions an EDITOR account with a forced first-
+// login password change — a convenience for standing up your team across client
+// sites. It NEVER overrides an existing account (so it can't be a backdoor into
+// established logins), only ever grants the 'editor' role (never Architect), and
+// stays OFF unless onboard_password is set. Keep that password in
+// config.secret.php, NOT here: api.php ships in a public repo, so a value in this
+// file would be world-readable. The domain isn't secret, so it defaults inline.
+define('ONBOARD_EMAIL_DOMAIN', strtolower((string)($__secret['onboard_domain']   ?? '44interactive.com')));
+define('ONBOARD_PASSWORD',              (string)($__secret['onboard_password'] ?? ''));
+
+// Folders to always exclude from scan (relative paths from public_html root)
+// Add any site-specific paths you want hidden from import
+define('SKIP_PATHS', [
+    'uploads/html-site-boilerplate',
+    'boilerplate',
+    'backup',
+    'backups',
+    '_archive',
+]);
+
+// Directories to never recurse into. 'data' holds the CMS's own files —
+// pages.json, site.json, and revision snapshots written on every save
+// (data/rev_rev_<ts>.html) — which must never be scanned as editable pages.
+// 'fleet-dashboard' is the agency's Fleet Dashboard tool, not a page of the
+// site, wherever a copy of it ends up (see fourgeRemoveStrayFleetDashboard).
+define('SKIP_DIRS', [
+    'admin', '.git', '.github', 'node_modules', 'vendor',
+    'cgi-bin', 'wp-admin', 'wp-includes', 'data', 'fleet-dashboard',
+]);
+
+// Pattern that uniquely identifies a Fourge CMS shell.
+// IMPORTANT: must be specific enough to never match a regular HTML file.
+// Only the generated makeShell() output contains this exact string.
+define('CMS_PATTERN', 'src="../block-renderer.jsx"');
+
+// ── HTTPS HELPERS ──────────────────────────────────────────────────────────
+// True when the request reached us over TLS. Also handles reverse proxies /
+// load balancers that terminate TLS at the edge and forward plain HTTP to PHP
+// (common on shared hosts), where $_SERVER['HTTPS'] is unset but an
+// X-Forwarded-Proto / X-Forwarded-SSL header marks the visitor's leg as HTTPS.
+// A curl handle is an object freed with its last reference since PHP 8.0, and
+// PHP 8.5 deprecates curl_close(), so it is only called where it still does
+// something. On a host that displays errors, the deprecation notice landed in
+// front of every API answer that had made an outbound request, and the admin
+// could not read the JSON. tests/run.sh keeps direct calls out of this file.
+function fourgeCurlClose($ch) { if (PHP_VERSION_ID < 80000) curl_close($ch); }
+function fourgeIsHttps() {
+    if (!empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off') return true;
+    if ((int)($_SERVER['SERVER_PORT'] ?? 0) === 443) return true;
+    $xfp = strtolower(trim(explode(',', (string)($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? ''))[0]));
+    if ($xfp === 'https') return true;
+    if (strtolower((string)($_SERVER['HTTP_X_FORWARDED_SSL'] ?? '')) === 'on') return true;
+    return false;
+}
+// True for local development hosts, which are exempt from the HTTPS requirement
+// so you can work over http://localhost without a certificate.
+function fourgeIsLocalRequest() {
+    $host = strtolower(preg_replace('/:\d+$/', '', (string)($_SERVER['HTTP_HOST'] ?? '')));
+    if (in_array($host, ['localhost', '127.0.0.1', '::1', '[::1]'], true)) return true;
+    if (preg_match('/(\.local|\.localhost|\.test)$/', $host)) return true;
+    $ra = (string)($_SERVER['REMOTE_ADDR'] ?? '');
+    return ($ra === '127.0.0.1' || $ra === '::1');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Catch ALL PHP output — errors become JSON instead of empty body
+ob_start();
+
+header('Content-Type: application/json');
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: POST, OPTIONS');
+header('Access-Control-Allow-Headers: Content-Type, X-Api-Token');
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    ob_end_clean();
+    http_response_code(204);
+    exit;
+}
+
+// Parse the request body first so auth can be routed per-action.
+$raw    = file_get_contents('php://input');
+$body   = json_decode($raw, true) ?: [];
+// $_GET is honored last so the pretty machine endpoints installed in .htaccess
+// (/api/seo-platform/package → admin/api.php?action=seo_package) can carry the
+// action while the POST body is the raw package JSON.
+$action = $body['action'] ?? $_POST['action'] ?? ($_GET['action'] ?? '');
+
+// ── AUTH MODEL ────────────────────────────────────────────────────────────────
+//  • 'login' is public — it verifies the email/password itself.
+//  • 'send_form' is public — it's the public contact-form endpoint. Site visitors
+//    have no token or session, so it must be reachable without auth; spam is held
+//    off by the optional reCAPTCHA check inside cmsSendForm.
+//  • Account + secret actions require a valid session token (from login).
+//  • Legacy file / GA / AI actions accept the shared API_TOKEN OR a session token.
+//  • 'seo_package' / 'seo_pkg_tick' are listed public ONLY so the machine-to-machine
+//    Bearer-token path can reach them; both handlers authenticate internally
+//    (session OR constant-time Bearer match) and refuse everything else.
+//    'blog_sync_tick' is the same shape, for the same reason: an external
+//    scheduler needs to reach it with no session at all.
+//  • 'check_form_password' / 'form_view' are public for the same reason as
+//    'send_form': a site visitor has no token or session. Neither exposes
+//    anything beyond a single form's own pass/fail check or view counter.
+//  • 'chat_start' / 'chat_send' / 'chat_poll' are the website chat widget's
+//    calls (fourge-chat.js), public for the same reason. They answer only while
+//    the chat is switched on, reach a conversation only with the random chat id
+//    chat_start handed out, and are rate-limited per chat, address and site.
+//  • 'markup_hello' / 'markup_read' / 'markup_write' / 'markup_upload' are the
+//    agency's MarkUp hub's calls. Each needs an Ed25519 signature from a hub key
+//    this engine trusts, made for this site's host, under 5 minutes old and never
+//    seen before (fourgeMarkupVerify); without one they answer 401 and do nothing.
+//    They reach only the pages the Pages list shows and an images folder, and a
+//    site can switch them off in Plugins.
+//  • 'markup_hub_key' / 'markup_webhook' answer only on the MarkUp hub. The first
+//    publishes the hub's PUBLIC key (what sites check its signatures with — it
+//    can't sign anything). The second is MarkUp's webhook: it answers only at its
+//    secret address (/integrations/markup/webhook/<secret>), records the event and
+//    never acts on what it says — the hub reads everything again from MarkUp's API.
+$PUBLIC_ACTIONS  = ['login', 'send_form', 'check_form_password', 'form_view', 'seo_package', 'seo_pkg_tick', 'blog_sync_tick', 'blog_sync_poke', 'blog_sync_subscribe', 'host_probe', 'chat_start', 'chat_send', 'chat_poll', 'markup_hello', 'markup_read', 'markup_write', 'markup_upload', 'markup_hub_key', 'markup_webhook'];   // markup_*: checked by the hub's signature (fourgeMarkupVerify); markup_webhook by its secret address
+$SESSION_ACTIONS = ['logout','session','list_users','save_user','delete_user','change_password','get_secrets','set_secret','repo_fetch','set_page_password','install_clean_urls','ghl_test','ghl_dashboard','ghl_messages','ghl_send','ghl_form_def','gh_mirror','gh_set_private','gh_sync_all','send_test_email','recaptcha_status','seo_pkg_admin','ai_endpoint_test','blog_sync_admin','chat_bot_status','chat_bot_save','chat_ai_test','chat_ai_test_poll',
+                    'markup_hub_status','markup_hub_save','markup_hub_process','markup_hub_pull','markup_hub_queue','markup_hub_sites','markup_hub_page','markup_hub_item','markup_hub_apply','markup_hub_image'];
+
+$apiTok      = $_SERVER['HTTP_X_API_TOKEN'] ?? ($body['token'] ?? ($_POST['token'] ?? ''));
+$hasApiToken = ($apiTok !== '' && hash_equals(API_TOKEN, (string)$apiTok));
+
+$sessionToken = $_SERVER['HTTP_X_SESSION_TOKEN'] ?? ($body['session_token'] ?? '');
+// The Architect accounts are restored before anyone is resolved, so a sign-in or
+// a signed-in request already sees them as they should be (fourgeEnsureArchitects).
+if ($sessionToken || $action === 'login') { try { fourgeEnsureArchitects(fourgeDb()); } catch (Throwable $e) {} }
+// A new password for a shared agency account lands the same way, so it works from the very first sign-in (fourgeApplyManagedPasswords).
+if ($sessionToken || $action === 'login') { try { fourgeApplyManagedPasswords(fourgeDb()); } catch (Throwable $e) {} }
+$authUser     = null;
+try { if ($sessionToken) $authUser = fourgeSessionUser(fourgeDb(), $sessionToken); } catch (Throwable $e) { $authUser = null; }
+
+if (!in_array($action, $PUBLIC_ACTIONS, true)) {
+    if (in_array($action, $SESSION_ACTIONS, true)) {
+        if (!$authUser) {
+            ob_end_clean(); http_response_code(401);
+            echo json_encode(['error' => 'Not signed in. Please log in again.']); exit;
+        }
+        // A must-change-password session may ONLY change its own password.
+        if (!empty($authUser['must_change_password']) && $action !== 'change_password') {
+            ob_end_clean(); http_response_code(403);
+            echo json_encode(['error' => 'You must set a new password before continuing.']); exit;
+        }
+    } elseif (!$hasApiToken && !$authUser) {
+        ob_end_clean(); http_response_code(401);
+        echo json_encode(['error' => 'Unauthorized. Provide a valid Server API token or sign in.']); exit;
+    }
+}
+
+// ── REQUIRE HTTPS FOR CREDENTIALS ───────────────────────────────────────────
+// Passwords are hashed at rest, but a login or secret sent over plain HTTP is
+// exposed in transit. The root .htaccess redirects HTTP→HTTPS site-wide; this
+// is the server-side backstop for hosts that don't honor .htaccess (e.g. nginx)
+// or have mod_rewrite disabled. Localhost/dev is exempt; set 'require_https' =>
+// false in config.secret.php only for a deliberate plain-HTTP setup.
+$HTTPS_REQUIRED_ACTIONS = ['login', 'change_password', 'set_secret', 'save_user', 'ga_save_credentials', 'set_page_password', 'seo_pkg_admin', 'blog_sync_admin', 'markup_hub_save'];
+if (REQUIRE_HTTPS && in_array($action, $HTTPS_REQUIRED_ACTIONS, true) && !fourgeIsHttps() && !fourgeIsLocalRequest()) {
+    ob_end_clean(); http_response_code(403);
+    echo json_encode(['error' => 'For your security, signing in and changing credentials require a secure (HTTPS) connection. Please load this site over https:// and try again.']);
+    exit;
+}
+
+// Analytics switched off for a signed-in editor: none of its data or credentials,
+// whatever calls for them (the API token's machine callers carry no account).
+if (in_array($action, ['ga_status', 'ga_report', 'ga_save_credentials'], true) && $authUser && !fourgeEditorModuleOn($authUser, 'analytics')) {
+    ob_end_clean(); http_response_code(403);
+    echo json_encode(['error' => 'Analytics is switched off for your account. An Admin can turn it on in Users.']); exit;
+}
+
+try {
+    switch ($action) {
+        case 'ping':        ob_end_clean(); echo json_encode(['ok' => true, 'root' => PUBLIC_HTML, 'php' => PHP_VERSION, 'version' => FOURGE_API_VERSION, 'api_version' => FOURGE_API_VERSION, 'db' => true]); break;
+        // ── Auth + accounts + secrets (SQLite-backed) ──
+        case 'login':           ob_end_clean(); fourgeApiLogin($body); break;
+        case 'logout':          ob_end_clean(); fourgeApiLogout($sessionToken); break;
+        case 'session':         ob_end_clean(); echo json_encode(['ok' => true, 'user' => fourgePublicUser($authUser)]); break;
+        case 'list_users':      ob_end_clean(); fourgeApiListUsers($authUser); break;
+        case 'save_user':       ob_end_clean(); fourgeApiSaveUser($authUser, $body); break;
+        case 'delete_user':     ob_end_clean(); fourgeApiDeleteUser($authUser, $body); break;
+        case 'change_password': ob_end_clean(); fourgeApiChangePassword($authUser, $body); break;
+        case 'get_secrets':     ob_end_clean(); fourgeApiGetSecrets($authUser); break;
+        case 'set_secret':      ob_end_clean(); fourgeApiSetSecret($authUser, $body); break;
+        case 'ghl_test':        ob_end_clean(); fourgeApiGhlTest($authUser, $body); break;
+        case 'ghl_dashboard':   ob_end_clean(); fourgeApiGhlDashboard($authUser, $body); break;
+        case 'ghl_messages':    ob_end_clean(); fourgeApiGhlMessages($authUser, $body); break;
+        case 'ghl_send':        ob_end_clean(); fourgeApiGhlSend($authUser, $body); break;
+        case 'ghl_form_def':    ob_end_clean(); fourgeApiGhlFormDef($authUser, $body); break;
+        // Website chat: the widget's public calls, then the Super Admin bot setup + AI test.
+        case 'chat_start':      ob_end_clean(); fourgeApiChatStart($body); break;
+        case 'chat_send':       ob_end_clean(); fourgeApiChatSend($body); break;
+        case 'chat_poll':       ob_end_clean(); fourgeApiChatPoll($body); break;
+        case 'chat_bot_status': ob_end_clean(); fourgeApiChatBotStatus($authUser, $body); break;
+        case 'chat_bot_save':   ob_end_clean(); fourgeApiChatBotSave($authUser, $body); break;
+        case 'chat_ai_test':    ob_end_clean(); fourgeApiChatAiTest($authUser, $body); break;
+        case 'chat_ai_test_poll': ob_end_clean(); fourgeApiChatAiTestPoll($authUser, $body); break;
+        case 'gh_mirror':       ob_end_clean(); fourgeApiGhMirror($authUser, $body); break;
+        case 'gh_set_private':  ob_end_clean(); fourgeApiGhSetPrivate($authUser, $body); break;
+        case 'gh_sync_all':     ob_end_clean(); fourgeApiGhSyncAll($authUser, $body); break;
+        case 'gh_test':         ob_end_clean(); fourgeApiGhTest($authUser, $body); break;
+        // Which installation answers at this address? (public; the canonical-host check asks the Website URL this before redirecting other domains there)
+        case 'host_probe':      ob_end_clean(); echo json_encode(['ok' => true, 'install' => fourgeInstallId()]); break;
+        case 'canonical_host':  ob_end_clean(); fourgeApiCanonicalHost($authUser, $body); break;
+        case 'send_test_email': ob_end_clean(); fourgeApiSendTestEmail($authUser, $body); break;
+        case 'recaptcha_status': ob_end_clean(); fourgeApiRecaptchaStatus($authUser, $body); break;
+        case 'ai_endpoint_test': ob_end_clean(); fourgeApiAiEndpointTest($authUser, $body); break;
+        case 'secret_exposure':    ob_end_clean(); fourgeApiSecretExposure($authUser, $body); break;
+        case 'ai_autofix':         ob_end_clean(); fourgeApiAiAutofix($authUser, $body); break;
+        case 'reviews_fetch':      ob_end_clean(); fourgeApiReviewsFetch($authUser, $body); break;
+        case 'reviews_find_place': ob_end_clean(); fourgeApiReviewsFindPlace($authUser, $body); break;
+        case 'map_geocode':        ob_end_clean(); fourgeApiMapGeocode($authUser, $body); break;
+        case 'tlp_feed':           ob_end_clean(); fourgeApiTlpFeed($authUser, $body); break;
+        case 'seo_package':     ob_end_clean(); fourgeApiSeoPackage($authUser, $body); break;
+        case 'seo_pkg_tick':    ob_end_clean(); fourgeApiSeoPkgTick($authUser, $body); break;
+        case 'seo_pkg_admin':   ob_end_clean(); fourgeApiSeoPkgAdmin($authUser, $body); break;
+        case 'seo_pkg_publish_all': ob_end_clean(); fourgeApiSeoPkgPublishAll($authUser, $body); break;
+        case 'blog_sync_tick':  ob_end_clean(); fourgeApiBlogSyncTick($authUser, $body); break;
+        case 'blog_sync_poke':  ob_end_clean(); fourgeApiBlogSyncPoke($body); break;
+        case 'blog_sync_subscribe': ob_end_clean(); fourgeApiBlogSyncSubscribe($body); break;
+        case 'blog_sync_admin': ob_end_clean(); fourgeApiBlogSyncAdmin($authUser, $body); break;
+        case 'set_page_password': ob_end_clean(); fourgeApiSetPagePassword($authUser, $body); break;
+        case 'install_clean_urls': ob_end_clean(); fourgeApiInstallCleanUrls($authUser); break;
+        case 'repo_fetch':      ob_end_clean(); fourgeApiRepoFetch($authUser, $body); break;
+        case 'list_pages':  ob_end_clean(); cmsListPages();    break;
+        case 'list_media':  ob_end_clean(); cmsListMedia();    break;
+        case 'read_file':   ob_end_clean(); cmsReadFile($body); break;
+        case 'write_file':  ob_end_clean(); cmsWriteFile($body); break;
+        case 'upload':      ob_end_clean(); handleUpload();    break;
+        case 'delete_file': ob_end_clean(); cmsDeleteFile($body); break;
+        case 'send_form':   ob_end_clean(); cmsSendForm($body); break;
+        case 'markup_hello':  ob_end_clean(); fourgeApiMarkupHello($body); break;
+        case 'markup_read':   ob_end_clean(); fourgeApiMarkupRead($body); break;
+        case 'markup_write':  ob_end_clean(); fourgeApiMarkupWrite($body); break;
+        case 'markup_upload': ob_end_clean(); fourgeApiMarkupUpload($body); break;
+        case 'markup_hub_key':     ob_end_clean(); fourgeApiMarkupHubKey(); break;
+        case 'markup_webhook':     ob_end_clean(); fourgeApiMarkupWebhook($body); break;
+        case 'markup_hub_status':  ob_end_clean(); fourgeApiMarkupHubStatus($authUser, $body); break;
+        case 'markup_hub_save':    ob_end_clean(); fourgeApiMarkupHubSave($authUser, $body); break;
+        case 'markup_hub_process': ob_end_clean(); fourgeApiMarkupHubProcess($authUser, $body); break;
+        case 'markup_hub_pull':    ob_end_clean(); fourgeApiMarkupHubPull($authUser, $body); break;
+        case 'markup_hub_queue':   ob_end_clean(); fourgeApiMarkupHubQueue($authUser, $body); break;
+        case 'markup_hub_sites':   ob_end_clean(); fourgeApiMarkupHubSites($authUser, $body); break;
+        case 'markup_hub_page':    ob_end_clean(); fourgeApiMarkupHubPage($authUser, $body); break;
+        case 'markup_hub_item':    ob_end_clean(); fourgeApiMarkupHubItem($authUser, $body); break;
+        case 'markup_hub_apply':   ob_end_clean(); fourgeApiMarkupHubApply($authUser, $body); break;
+        case 'markup_hub_image':   ob_end_clean(); fourgeApiMarkupHubImage($authUser, $body); break;
+        case 'check_form_password': ob_end_clean(); fourgeApiCheckFormPassword($body); break;
+        case 'form_view':   ob_end_clean(); fourgeApiFormView($body); break;
+        case 'hash_form_password': ob_end_clean(); fourgeApiHashFormPassword($body); break;
+        case 'ga_save_credentials': ob_end_clean(); gaSaveCredentials($body); break;
+        case 'ga_status':   ob_end_clean(); gaStatus();          break;
+        case 'ga_report':   ob_end_clean(); gaReport($body);     break;
+        case 'claude_proxy': ob_end_clean(); claudeProxy($body); break;
+        default:
+            ob_end_clean();
+            echo json_encode(['error' => 'Unknown action: ' . htmlspecialchars($action)]);
+    }
+} catch (Throwable $e) {
+    $buffered = ob_get_clean();
+    http_response_code(500);
+    echo json_encode([
+        'error'   => $e->getMessage(),
+        'file'    => basename($e->getFile()),
+        'line'    => $e->getLine(),
+        'output'  => $buffered ?: null,
+    ]);
+}
+
+// ── LIST PAGES ────────────────────────────────────────────────────────────────
+
+function cmsListPages() {
+    $root       = PUBLIC_HTML;
+    $skipFiles  = ['preview.html','404.html','500.html','maintenance.html','coming-soon.html','offline.html'];
+    $pages      = [];
+
+    scanHtml($root, $root, $skipFiles, $pages);
+
+    usort($pages, function($a, $b) {
+        if ($a['file'] === 'index.html') return -1;
+        if ($b['file'] === 'index.html') return  1;
+        return strcmp($a['path'], $b['path']);
+    });
+
+    // postsHtml: whether the generated blog page exists — the Posts tab shows
+    // "Publish Blog Page" as the fix when synced posts have nowhere to display.
+    echo json_encode(['pages' => $pages, 'root' => $root, 'postsHtml' => is_file($root . '/posts.html')]);
+}
+
+function scanHtml($root, $dir, $skipFiles, &$pages, $depth = 0) {
+    if ($depth > 5) return;
+
+    $items = @scandir($dir);
+    if (!$items) return;
+
+    foreach ($items as $item) {
+        if ($item === '.' || $item === '..') continue;
+
+        $fullPath = $dir . '/' . $item;
+        $relPath  = ltrim(str_replace($root, '', $fullPath), '/');
+
+        // Skip explicitly excluded paths (defined at top of file)
+        foreach (SKIP_PATHS as $sp) {
+            if (strpos($relPath, rtrim($sp, '/')) === 0) continue 2;
+        }
+
+        if (is_dir($fullPath)) {
+            if (!in_array($item, SKIP_DIRS)) {
+                scanHtml($root, $fullPath, $skipFiles, $pages, $depth + 1);
+            }
+            continue;
+        }
+
+        if (!preg_match('/\.html?$/i', $item)) continue;
+        if (in_array($item, $skipFiles)) continue;
+
+        $content = @file_get_contents($fullPath);
+        if ($content === false) continue;
+
+        // Detect existing Fourge CMS shell — only the generated shell contains this exact string
+        $isCMS = strpos($content, CMS_PATTERN) !== false;
+
+        // Extract title
+        $title = ucwords(preg_replace('/[-_]/', ' ', pathinfo($item, PATHINFO_FILENAME)));
+        if (preg_match('/<title[^>]*>([^<]+)<\/title>/i', $content, $m)) {
+            $t = trim(strip_tags($m[1]));
+            if ($t) $title = $t;
+        }
+
+        $snippet = substr(trim(preg_replace('/\s+/', ' ', strip_tags($content))), 0, 200);
+
+        $pages[] = [
+            'file'     => $item,
+            'path'     => $relPath,
+            'title'    => $title,
+            'size'     => filesize($fullPath),
+            'modified' => date('Y-m-d H:i', filemtime($fullPath)),
+            'is_cms'   => $isCMS,
+            'snippet'  => $snippet,
+            // Does this page carry the live post list ([data-fourge-posts])? Lets the
+            // admin say WHERE synced/published posts actually appear on the site.
+            'has_post_list' => strpos($content, 'data-fourge-posts') !== false,
+        ];
+    }
+}
+
+// ── LIST MEDIA ────────────────────────────────────────────────────────────────
+
+function cmsListMedia() {
+    $root      = PUBLIC_HTML;
+    $imageExts = ['jpg','jpeg','png','webp','gif','svg','ico'];
+    $videoExts = ['mp4','m4v','mov','webm','ogv','ogg'];
+    $docExts   = ['pdf','doc','docx','xls','xlsx','ppt','pptx'];
+    $allExts   = array_merge($imageExts, $videoExts, $docExts);
+    $files     = [];
+
+    scanMedia($root, $root, $allExts, $imageExts, $videoExts, $files);
+
+    usort($files, fn($a, $b) => $b['size'] - $a['size']);
+
+    echo json_encode(['files' => $files, 'root' => $root, 'count' => count($files)]);
+}
+
+function scanMedia($root, $dir, $allExts, $imageExts, $videoExts, &$files, $depth = 0) {
+    if ($depth > 5) return;
+
+    $items = @scandir($dir);
+    if (!$items) return;
+
+    foreach ($items as $item) {
+        if ($item === '.' || $item === '..') continue;
+
+        $fullPath = $dir . '/' . $item;
+        $relPath  = ltrim(str_replace($root, '', $fullPath), '/');
+
+        foreach (SKIP_PATHS as $sp) {
+            if (strpos($relPath, rtrim($sp, '/')) === 0) continue 2;
+        }
+
+        if (is_dir($fullPath)) {
+            if (!in_array($item, SKIP_DIRS)) {
+                scanMedia($root, $fullPath, $allExts, $imageExts, $videoExts, $files, $depth + 1);
+            }
+            continue;
+        }
+
+        $ext = strtolower(pathinfo($item, PATHINFO_EXTENSION));
+        if (!in_array($ext, $allExts)) continue;
+
+        $type = in_array($ext, $imageExts) ? 'image'
+              : (in_array($ext, $videoExts) ? 'video' : 'doc');
+
+        $sz   = filesize($fullPath);
+        $size = $sz > 1048576 ? round($sz/1048576, 1).' MB' : round($sz/1024).' KB';
+
+        $files[] = [
+            'name'     => $item,
+            'path'     => $relPath,
+            'size'     => $size,
+            'bytes'    => $sz,
+            'type'     => $type,
+            'ext'      => $ext,
+            'modified' => date('Y-m-d', filemtime($fullPath)),
+        ];
+    }
+}
+
+// ── READ FILE ─────────────────────────────────────────────────────────────────
+
+function gaIsProtectedPath($absPath) {
+    $protected = [realpath(__DIR__ . '/ga-service-account.json'), realpath(__DIR__ . '/.ga-token.json')];
+    $abs = $absPath ? realpath($absPath) : false;
+    // realpath() returns false for non-existent files — also compare raw target names
+    $names = ['ga-service-account.json', '.ga-token.json'];
+    if ($abs && in_array($abs, array_filter($protected), true)) return true;
+    $base = basename($absPath);
+    return in_array($base, $names, true) && strpos($absPath, 'admin') !== false;
+}
+
+function cmsReadFile($body) {
+    $relPath = $body['path'] ?? '';
+    $safe    = realpath(PUBLIC_HTML . '/' . $relPath);
+    if ($safe && gaIsProtectedPath($safe)) {
+        http_response_code(403);
+        echo json_encode(['error' => 'This file is protected']);
+        return;
+    }
+    if (!$safe || strpos($safe, PUBLIC_HTML) !== 0 || !is_file($safe)) {
+        http_response_code(404);
+        echo json_encode(['error' => 'File not found: ' . htmlspecialchars($relPath)]);
+        return;
+    }
+    echo json_encode([
+        'content'  => file_get_contents($safe),
+        'path'     => $relPath,
+        'size'     => filesize($safe),
+        'modified' => date('Y-m-d H:i', filemtime($safe)),
+    ]);
+}
+
+// ── WRITE FILE ────────────────────────────────────────────────────────────────
+
+function cmsWriteFile($body) {
+    $relPath = $body['path'] ?? ($_POST['path'] ?? '');
+    // Content may arrive three ways:
+    //  1) multipart file part (content_file) — primary path; sails past WAFs
+    //     that block raw HTML/JS in a JSON POST (same channel as image uploads),
+    //  2) base64 in JSON (content_b64) — the client's fallback when the file
+    //     part doesn't make it (see apiCall), also a WAF-bypass,
+    //  3) plain JSON content.
+    // $content stays null until one of them actually delivered something: a
+    // request that sent content which never arrived must be an ERROR, never an
+    // empty write. (An upload cut off mid-flight during an engine update once
+    // wrote a 0-byte api.php — a dead API that could no longer update itself.)
+    $content = null;
+    if (is_array($body) && array_key_exists('content', $body) && is_string($body['content'])) $content = $body['content'];
+    if (isset($body['content_b64']) && is_string($body['content_b64'])) {
+        $decoded = base64_decode($body['content_b64'], true);
+        if ($decoded === false) {
+            http_response_code(400);
+            echo json_encode(['error' => 'Invalid base64 content']);
+            return;
+        }
+        $content = $decoded;
+    }
+    $isMultipart = isset($_FILES['content_file']) || stripos((string)($_SERVER['CONTENT_TYPE'] ?? ''), 'multipart/form-data') !== false;
+    if ($isMultipart) {
+        $fp  = $_FILES['content_file'] ?? null;
+        $err = is_array($fp) ? (int)($fp['error'] ?? UPLOAD_ERR_NO_FILE) : UPLOAD_ERR_NO_FILE;
+        if ($err !== UPLOAD_ERR_OK || empty($fp['tmp_name']) || !is_uploaded_file($fp['tmp_name'])) {
+            http_response_code(400);
+            echo json_encode(['error' => 'The file content did not arrive (' . cmsUploadErrText($err) . ') — nothing was written.', 'reason' => 'content_missing']);
+            return;
+        }
+        $c = file_get_contents($fp['tmp_name']);
+        if ($c === false) { http_response_code(400); echo json_encode(['error' => 'The uploaded content could not be read — nothing was written.', 'reason' => 'content_missing']); return; }
+        $content = $c;
+    }
+    if ($content === null) {
+        http_response_code(400);
+        echo json_encode(['error' => 'No content was sent — nothing was written.', 'reason' => 'content_missing']);
+        return;
+    }
+    // The client states how many bytes it sent. Content that PHP received
+    // "successfully" but shorter than that is still a truncated write.
+    $declared = $body['content_length'] ?? ($_POST['content_length'] ?? null);
+    if ($declared !== null && $declared !== '' && (int)$declared !== strlen($content)) {
+        http_response_code(400);
+        echo json_encode(['error' => 'The file content arrived incomplete (' . strlen($content) . ' of ' . (int)$declared . ' bytes) — nothing was written.', 'reason' => 'content_missing']);
+        return;
+    }
+    $dest    = PUBLIC_HTML . '/' . ltrim($relPath, '/');
+    if (gaIsProtectedPath($dest)) {
+        http_response_code(403);
+        echo json_encode(['error' => 'This file is protected — use the Analytics setup panel']);
+        return;
+    }
+    $dir     = dirname($dest);
+    $real    = realpath($dir) ?: $dir;
+    if (strpos($real, PUBLIC_HTML) !== 0) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Path not allowed']);
+        return;
+    }
+    // api.php may be auto-updated by the engine updater, but ONLY on installs that
+    // keep their secrets in config.secret.php. If that file is absent, this site may
+    // still carry secrets inline in api.php — refuse the overwrite so an update can
+    // never wipe them. (Move secrets into config.secret.php to enable auto-update.)
+    if (realpath($dest) === realpath(__FILE__) && !is_file(__DIR__ . '/config.secret.php')) {
+        http_response_code(409);
+        echo json_encode(['error' => 'Refusing to overwrite api.php: config.secret.php not found. Move this site\'s secrets into config.secret.php first — then api.php auto-updates.']);
+        return;
+    }
+    if (!is_dir($dir)) mkdir($dir, 0755, true);
+    // Engine files get a pre-flight before anything touches disk: a PHP file must
+    // parse on THIS server's PHP (a truncated download, or syntax this host's PHP
+    // version doesn't know, would otherwise replace a working api.php with one
+    // that answers every request with an error page — and a CMS whose API is dead
+    // can't even update itself back), and the admin page must at least be whole.
+    // data/site.json from the admin: keep the server's own Blog Sync bookkeeping (see fourgeBlogSyncMergeSiteBookkeeping).
+    if (ltrim(str_replace('\\', '/', (string)$relPath), '/') === 'data/site.json') { try { $content = fourgeBlogSyncMergeSiteBookkeeping($content, $dest); } catch (Throwable $e) {} }
+    if (ltrim(str_replace('\\', '/', (string)$relPath), '/') === 'data/site.json') { try { $content = fourgeSiteJsonKeepWebsite($content); } catch (Throwable $e) {} }   // and never let a stale copy put a dev link back as the Website URL
+    if (ltrim(str_replace('\\', '/', (string)$relPath), '/') === 'data/site.json') { try { $content = fourgeSiteJsonSecretsOut($content); } catch (Throwable $e) {} }   // and keep captcha secrets out of the public file
+    $guard = cmsWriteFilePreflight($dest, $content);
+    if ($guard !== '') { http_response_code(409); echo json_encode(['error' => $guard]); return; }
+    // Atomic write: the whole file lands under a temp name first and is renamed
+    // over the old one only once every byte made it. A short write (a disk quota
+    // hit mid-file) can therefore never leave a half-written page or api.php.
+    $tmp = $dest . '.tmp-' . bin2hex(random_bytes(4));
+    $n = @file_put_contents($tmp, $content);
+    if ($n === false || $n !== strlen($content)) {
+        @unlink($tmp);
+        http_response_code(500);
+        echo json_encode(['error' => 'Could not write ' . htmlspecialchars($relPath) . ($n === false ? ' (folder not writable?)' : ' — only ' . (int)$n . ' of ' . strlen($content) . ' bytes fit (disk quota?)') . '. The existing file was left untouched.']);
+        return;
+    }
+    if (!@rename($tmp, $dest)) {
+        // A host where rename-over can't replace the file (rare): fall back to a
+        // direct write, but only now that the full content is known to fit.
+        $ok = @file_put_contents($dest, $content) === strlen($content);
+        @unlink($tmp);
+        if (!$ok) { http_response_code(500); echo json_encode(['error' => 'Could not write: ' . htmlspecialchars($relPath)]); return; }
+    }
+    // Mirror the saved bytes to the site's GitHub repo right here, and report the
+    // outcome as `gh` so the client can say "Saved to server + GitHub" truthfully
+    // instead of pushing a second time itself. gh=0 opts a write out: the revision
+    // snapshots use it, since they mirror themselves asynchronously and a page
+    // save should not wait on them. A mirror problem never fails the save.
+    $ghOpt = $body['gh'] ?? ($_POST['gh'] ?? null);
+    $gh = ($ghOpt === '0' || $ghOpt === 0 || $ghOpt === false)
+        ? ['ok' => false, 'reason' => 'opted_out']
+        : cmsGhAfterWrite(cmsGhRelPath($dest), $content);
+    echo json_encode(['ok' => true, 'path' => $relPath, 'size' => strlen($content), 'gh' => $gh]);
+    // A publish just landed in data/posts.json: push it to every partner site
+    // that syndicates this blog (see fourgeBlogSyncAfterPostsWrite).
+    if (ltrim(str_replace('\\', '/', (string)$relPath), '/') === 'data/posts.json') fourgeBlogSyncAfterPostsWrite();
+}
+
+// Plain words for a PHP upload error code (cmsWriteFile's multipart channel).
+function cmsUploadErrText($code) {
+    switch ((int)$code) {
+        case UPLOAD_ERR_OK:         return 'no error reported';
+        case UPLOAD_ERR_INI_SIZE:
+        case UPLOAD_ERR_FORM_SIZE:  return 'bigger than this server accepts';
+        case UPLOAD_ERR_PARTIAL:    return 'the upload was cut off before it finished';
+        case UPLOAD_ERR_NO_FILE:    return 'no file part was received';
+        case UPLOAD_ERR_NO_TMP_DIR:
+        case UPLOAD_ERR_CANT_WRITE: return 'the server could not store the upload';
+        default:                    return 'upload error ' . (int)$code;
+    }
+}
+// The pre-flight for cmsWriteFile(): '' when the write may proceed, otherwise the
+// reason it must not. Only engine files are judged — an operator's own pages are
+// theirs to write however they like.
+function cmsWriteFilePreflight($dest, $content) {
+    $rel  = cmsGhRelPath($dest);
+    $base = strtolower(basename($rel));
+    if (strpos($rel, 'admin/') === 0 && substr($base, -4) === '.php') {
+        if (strlen($content) < 1000) return 'Refusing to install ' . $rel . ': the file is only ' . strlen($content) . ' bytes — the download looks incomplete. The current file was left untouched.';
+        try { token_get_all($content, TOKEN_PARSE); }
+        catch (\Throwable $e) {
+            return 'Refusing to install ' . $rel . ': it does not parse on this server\'s PHP ' . PHP_VERSION . ' (line ' . $e->getLine() . ': ' . $e->getMessage() . '). The current file was left untouched.';
+        }
+    }
+    if ($rel === 'admin/index.html') {
+        if (strlen($content) < 10000 || !preg_match('~</html>\s*$~i', $content) || strpos($content, "const CMS_VERSION='") === false)
+            return 'Refusing to install admin/index.html: the download looks incomplete (no closing </html> or no version constant). The current file was left untouched.';
+    }
+    return '';
+}
+
+// ── UPLOAD FILES ──────────────────────────────────────────────────────────────
+
+function handleUpload() {
+    if (empty($_FILES['files'])) {
+        echo json_encode(['error' => 'No files in request']); return;
+    }
+    // Optional destination folder ('to'), so a file can be written back where it
+    // already lives (the image optimizer overwrites images in their own folder,
+    // e.g. images/). Traversal-safe: the folder must ALREADY exist and resolve
+    // inside the web root — nothing is ever created or written outside it.
+    $destDir = PUBLIC_HTML; $toRel = '';
+    $to = isset($_POST['to']) ? str_replace('\\', '/', trim((string)$_POST['to'], "/ \t\n\r")) : '';
+    if ($to !== '') {
+        if (preg_match('~(^|/)\.\.(/|$)~', $to) || strpos($to, "\0") !== false) { echo json_encode(['error' => 'Bad destination folder']); return; }
+        $cand = realpath(PUBLIC_HTML . '/' . $to);
+        if (!$cand || strpos($cand, PUBLIC_HTML) !== 0 || !is_dir($cand)) { echo json_encode(['error' => 'Destination folder not found']); return; }
+        $destDir = $cand; $toRel = $to . '/';
+    }
+    // Every type the CMS actually works with: page/web assets, the images and
+    // documents the media library lists, and video for the video block.
+    //
+    // This list is now ENFORCED. It has existed since the first version of this
+    // function but nothing ever consulted it — only $blocked was checked, and a
+    // deny-list can't cover what it hasn't thought of. ".htaccess" passed it, and
+    // an .htaccess in the web root can turn on PHP execution for any extension;
+    // so could .phps/.pht/.php7/.module. An allow-list can't be outflanked that
+    // way. $blocked is kept as a second line of defence.
+    $allowed = [
+        'html','htm','css','jsx','js','json','svg','xml','txt','csv',            // web + data
+        'jpg','jpeg','png','webp','gif','ico','avif','bmp','tif','tiff',          // images
+        'mp4','m4v','mov','webm','ogv','ogg',                                     // video
+        'mp3','wav','m4a','aac',                                                  // audio
+        'woff','woff2','ttf','otf','eot',                                         // fonts
+        'pdf','doc','docx','xls','xlsx','ppt','pptx','zip',                       // documents
+    ];
+    $blocked  = ['php','php3','php4','php5','php7','php8','phtml','phps','pht','phar','htaccess','htpasswd','asp','aspx','jsp','cgi','pl','py','rb','sh','bash','exe','bat','cmd','com','dll','so'];
+    $results  = [];
+    $names    = (array)$_FILES['files']['name'];
+    $tmps     = (array)$_FILES['files']['tmp_name'];
+    $errors   = (array)$_FILES['files']['error'];
+    // A video is the first file most people upload that is big enough to hit the
+    // server's own limits, and "Upload error 1" is not a useful thing to read.
+    $errText = function ($code) {
+        switch ($code) {
+            case UPLOAD_ERR_INI_SIZE:
+            case UPLOAD_ERR_FORM_SIZE:
+                $lim = trim((string)ini_get('upload_max_filesize'));
+                return 'Bigger than this server accepts' . ($lim !== '' ? ' (limit ' . $lim . ')' : '')
+                     . ' — compress the video or raise upload_max_filesize and post_max_size in PHP.';
+            case UPLOAD_ERR_PARTIAL:   return 'The upload was cut off before it finished — try again.';
+            case UPLOAD_ERR_NO_FILE:   return 'No file was received.';
+            case UPLOAD_ERR_NO_TMP_DIR:
+            case UPLOAD_ERR_CANT_WRITE: return 'The server could not write the file to disk.';
+            default: return 'Upload failed (code ' . (int)$code . ').';
+        }
+    };
+
+    for ($i = 0; $i < count($names); $i++) {
+        $orig = $names[$i]; $tmp = $tmps[$i]; $err = $errors[$i];
+        if ($err !== UPLOAD_ERR_OK) { $results[] = ['name'=>$orig,'success'=>false,'error'=>$errText($err)]; continue; }
+        $safe = preg_replace('/[^a-zA-Z0-9._\-]/', '', $orig);
+        // A name that is nothing but dots/extension ("...", ".htaccess" once the
+        // leading dot survives sanitising) has no basename to speak of.
+        if ($safe === '' || ltrim($safe, '.') === '' || strpos($safe, '.') === false) {
+            $results[] = ['name'=>$orig,'success'=>false,'error'=>'Needs a normal filename with an extension']; continue;
+        }
+        $ext  = strtolower(pathinfo($safe, PATHINFO_EXTENSION));
+        if (in_array($ext, $blocked, true) || $safe[0] === '.') { $results[] = ['name'=>$orig,'success'=>false,'error'=>'File type blocked']; continue; }
+        if (!in_array($ext, $allowed, true)) {
+            $results[] = ['name'=>$orig,'success'=>false,'error'=>'.' . $ext . ' files are not accepted']; continue;
+        }
+        $dest = $destDir . '/' . $safe;
+        if (move_uploaded_file($tmp, $dest)) {
+            $res = ['name'=>$safe,'success'=>true,'path'=>$toRel . $safe];
+            // Same inline GitHub mirror as cmsWriteFile(), binary-safe — so images,
+            // videos, fonts and documents reach the repo too, not just text files.
+            $ghOpt = $_POST['gh'] ?? null;
+            $res['gh'] = ($ghOpt === '0') ? ['ok' => false, 'reason' => 'opted_out']
+                                          : cmsGhAfterWrite(cmsGhRelPath($dest), (string)@file_get_contents($dest));
+            $results[] = $res;
+        } else {
+            $results[] = ['name'=>$safe,'success'=>false,'error'=>'Could not save'];
+        }
+    }
+    echo json_encode(['results' => $results]);
+}
+
+// ── DELETE FILE ───────────────────────────────────────────────────────────────
+
+function cmsDeleteFile($body) {
+    $relPath = $body['path'] ?? '';
+    $safe    = realpath(PUBLIC_HTML . '/' . $relPath);
+    if (!$safe || strpos($safe, PUBLIC_HTML) !== 0 || !is_file($safe)) {
+        http_response_code(404); echo json_encode(['error' => 'File not found']); return;
+    }
+    $rel = cmsGhRelPath($safe);
+    unlink($safe);
+    // Keep the repo in step: a file removed here is removed there (gh=0 opts out,
+    // as for cmsWriteFile). Reported, never fatal.
+    $ghOpt = $body['gh'] ?? null;
+    $gh = ($ghOpt === '0' || $ghOpt === 0 || $ghOpt === false) ? ['ok' => false, 'reason' => 'opted_out'] : cmsGhAfterDelete($rel);
+    echo json_encode(['ok' => true, 'gh' => $gh]);
+}
+
+// ── MAILGUN FORM ──────────────────────────────────────────────────────────────
+
+function cmsStoreEntry($formId, $fields, $siteUrl, $recaptcha = null) {
+    try {
+        $dir = __DIR__ . '/../data';
+        if (!is_dir($dir)) { @mkdir($dir, 0755, true); }
+        $file = $dir . '/entries.json';
+        $entries = [];
+        if (file_exists($file)) {
+            $raw = file_get_contents($file);
+            $entries = json_decode($raw, true) ?: [];
+        }
+        $entry = [
+            'id'     => uniqid('ent_'),
+            'formId' => $formId,
+            'date'   => date('Y-m-d H:i'),
+            'data'   => $fields,
+            'source' => $siteUrl,
+        ];
+        // Only ever 'passed' or 'allowed_unverified' here — cmsSendForm rejects
+        // a 'blocked' submission before this is ever called, so a stored entry
+        // never carries that verdict. Omitted entirely (not even a null) when
+        // there was nothing to check, so old entries and "passed" entries stay
+        // visually distinct from a site that simply has reCAPTCHA off.
+        if (is_array($recaptcha) && !empty($recaptcha['outcome'])) {
+            $entry['recaptcha'] = ['outcome' => $recaptcha['outcome'], 'score' => $recaptcha['score'] ?? null, 'reason' => $recaptcha['reason'] ?? null];
+        }
+        array_unshift($entries, $entry);
+        // Cap at 1000 entries
+        if (count($entries) > 1000) { $entries = array_slice($entries, 0, 1000); }
+        file_put_contents($file, json_encode($entries, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+    } catch (Exception $e) { /* non-fatal */ }
+}
+
+// The reCAPTCHA / hCaptcha secret keys. They used to sit in data/site.json, which
+// every visitor can download (the public site loads it), so they now live in the
+// encrypted secret store as recaptcha_secret / hcaptcha_secret; site.json keeps
+// the public site key and hasSecret. A secret still in site.json is moved out the
+// first time the server sees it (fourgeCaptchaSecretsOut: when the file is
+// written, and at sign-in) and is read from there until then, so a site's forms
+// keep their protection throughout. $kind: 'recaptcha' | 'hcaptcha'.
+function cmsCaptchaSecret($kind) {
+    try { $v = trim((string)fourgeGetSecret(fourgeDb(), $kind . '_secret')); if ($v !== '') return $v; } catch (Throwable $e) {}
+    $site = json_decode((string)@file_get_contents(__DIR__ . '/../data/site.json'), true);
+    return is_array($site) ? trim((string)($site[$kind]['secret'] ?? '')) : '';
+}
+// Store one captcha secret found in site.json. $fresh: someone just saved it (an
+// older admin page still writes it into site.json), so it replaces what is
+// stored; otherwise it is an old copy (a site.json from before this release, or
+// one a deploy put back) and only fills an empty store. True when the store holds
+// a secret afterwards, so the copy in the public file can go.
+function fourgeCaptchaStore($kind, $secret, $fresh) {
+    $name = $kind . '_secret';
+    try {
+        $pdo = fourgeDb();
+        if ($fresh || trim((string)fourgeGetSecret($pdo, $name)) === '') fourgeSetSecret($pdo, $name, $secret, 'site.json');
+        return trim((string)fourgeGetSecret($pdo, $name)) !== '';
+    } catch (Throwable $e) { return false; }
+}
+// Take the captcha secrets out of a site.json array. $disk: the file on disk when
+// $site is about to replace it, so a secret only the old file still has is moved
+// rather than dropped with it. $inFresh: whether a secret in $site was just saved.
+// A secret the store refuses stays in the file: a form never loses its protection.
+function fourgeCaptchaSecretsOut(array $site, $disk = null, $inFresh = true, &$changed = false) {
+    $changed = false;
+    foreach (['recaptcha', 'hcaptcha'] as $kind) {
+        $in  = (is_array($site[$kind] ?? null) && array_key_exists('secret', $site[$kind])) ? trim((string)$site[$kind]['secret']) : null;
+        $old = (is_array($disk) && is_array($disk[$kind] ?? null)) ? trim((string)($disk[$kind]['secret'] ?? '')) : '';
+        if ($in === null && $old === '') continue;
+        if ($in !== null && $in !== '') $ok = fourgeCaptchaStore($kind, $in, $inFresh);
+        elseif ($old !== '')            $ok = fourgeCaptchaStore($kind, $old, false);
+        else                            $ok = true;   // an empty "secret" field: nothing to keep
+        if ($ok) {
+            if (is_array($site[$kind] ?? null)) {
+                unset($site[$kind]['secret']);
+                if (($in !== null && $in !== '') || $old !== '') $site[$kind]['hasSecret'] = true;
+                $changed = true;
+            }
+        } elseif (($in === null || $in === '') && $old !== '') {
+            if (!is_array($site[$kind] ?? null)) $site[$kind] = [];
+            $site[$kind]['secret'] = $old;   // the store refused it: keep the old copy
+            $changed = true;
+        }
+    }
+    return $site;
+}
+// The same for site.json content on its way to disk (write_file).
+function fourgeSiteJsonSecretsOut($content) {
+    $in = json_decode((string)$content, true);
+    if (!is_array($in)) return $content;
+    $disk = json_decode((string)@file_get_contents(PUBLIC_HTML . '/data/site.json'), true);
+    $out = fourgeCaptchaSecretsOut($in, is_array($disk) ? $disk : null, true, $changed);
+    return $changed ? json_encode($out, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) : $content;
+}
+// Sign-in self-heal: move a secret an older admin left in site.json. Answers
+// 'none' (nothing there), 'moved', or 'kept' (the secret store refused it).
+function fourgeMoveCaptchaSecrets() {
+    $f = PUBLIC_HTML . '/data/site.json';
+    $site = is_file($f) ? json_decode((string)@file_get_contents($f), true) : null;
+    if (!is_array($site)) return 'none';
+    $has = false;
+    foreach (['recaptcha', 'hcaptcha'] as $kind) if (is_array($site[$kind] ?? null) && array_key_exists('secret', $site[$kind])) $has = true;
+    if (!$has) return 'none';
+    $out = fourgeCaptchaSecretsOut($site, null, false, $changed);
+    foreach (['recaptcha', 'hcaptcha'] as $kind) if (is_array($out[$kind] ?? null) && array_key_exists('secret', $out[$kind])) return 'kept';
+    return fourgeSitePut($f, json_encode($out, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), 'Fourge: captcha secret moved out of the public site.json') !== false ? 'moved' : 'kept';
+}
+function cmsRecaptchaSecret() {
+    $site = json_decode((string)@file_get_contents(__DIR__ . '/../data/site.json'), true);
+    if (!is_array($site) || empty($site['recaptcha']['enabled'])) return '';
+    return cmsCaptchaSecret('recaptcha');
+}
+
+// The v3 score threshold from data/site.json (default 0.5). v2 ignores it.
+function cmsRecaptchaThreshold() {
+    try {
+        $file = __DIR__ . '/../data/site.json';
+        if (!file_exists($file)) return 0.5;
+        $site = json_decode(file_get_contents($file), true);
+        $t = $site['recaptcha']['threshold'] ?? 0.5;
+        return is_numeric($t) ? (float)$t : 0.5;
+    } catch (Exception $e) { return 0.5; }
+}
+
+// Appends each reCAPTCHA verdict to data/recaptcha-debug.json as a bounded,
+// OLDEST-FIRST log (no secrets, no PII — just the verdict) capped at 1000,
+// same cap cmsStoreEntry already uses for entries.json. Oldest-first (not
+// unshift) is deliberate: Post-Launch Check's reCAPTCHA section already reads
+// this as entries.slice(-10) to mean "the 10 most recent", so recent entries
+// belong at the END of the array. Before this, the file held only a single
+// overwritten record — that dormant .slice(-10) logic never actually saw more
+// than one entry. A pre-upgrade file may still hold that old flat-object
+// shape; it's one throwaway diagnostic record, not worth migrating, so it's
+// simply superseded (not appended to) on the first write under this code.
+function cmsRecaptchaLog($rec) {
+    try {
+        $dir = __DIR__ . '/../data';
+        if (!is_dir($dir) || !is_writable($dir)) return;
+        $file = $dir . '/recaptcha-debug.json';
+        $log = [];
+        if (is_file($file)) {
+            $existing = json_decode((string)@file_get_contents($file), true);
+            if (is_array($existing) && ($existing === [] || array_keys($existing) === range(0, count($existing) - 1))) $log = $existing;
+        }
+        $log[] = $rec;
+        if (count($log) > 1000) $log = array_slice($log, -1000);
+        @file_put_contents($file, json_encode($log, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+    } catch (Throwable $e) {}
+}
+
+// Verify a submission's reCAPTCHA token and decide whether to BLOCK it. Returns
+// the full verdict record (score, reason, hostname, etc.) — also appended to the
+// debug log so the CMS can show it — whose 'outcome' key is one of three values:
+//   'passed'             — verified OK (v3 score >= threshold, or v2 success).
+//   'blocked'            — verified AND scored below the threshold: a real bot.
+//   'allowed_unverified' — verification could NOT run (no token, wrong keys, Google
+//                          unreachable). The submission is ALLOWED so a legitimate
+//                          lead is never lost just because reCAPTCHA is misconfigured
+//                          — a form is only ever BLOCKED when Google actively scores
+//                          it as a bot. The exact reason is recorded so the setup
+//                          problem is visible in Plugins → reCAPTCHA (and can be fixed,
+//                          which turns real protection back on automatically).
+// Common Google error-codes: 'invalid-input-secret' (wrong/mixed v2↔v3 secret),
+// 'invalid-input-response' (bad/expired token, or a v2 key used for v3),
+// 'timeout-or-duplicate' (token reused/stale).
+function cmsVerifyRecaptcha($secret, $token, $threshold = 0.5) {
+    $rec = ['at'=>date('c'), 'outcome'=>'', 'ok'=>false, 'reason'=>'', 'score'=>null, 'threshold'=>(float)$threshold, 'tokenReceived'=>($token!=='' && $token!==null), 'hostname'=>''];
+    $finish = function ($outcome, $reason) use (&$rec) {
+        $rec['outcome'] = $outcome; $rec['reason'] = $reason; $rec['ok'] = ($outcome === 'passed');
+        error_log('Fourge reCAPTCHA: ' . strtoupper($outcome) . ' — ' . $reason);
+        cmsRecaptchaLog($rec);
+        return $rec;   // the full verdict (incl. score) — cmsSendForm attaches it to the stored entry
+    };
+    $letThrough = ' The submission was let through so a real lead is not lost — but reCAPTCHA is NOT protecting this form until this is fixed.';
+    if ($token === '' || $token === null) {
+        return $finish('allowed_unverified', 'No token received from the form — the reCAPTCHA script did not load on the page (the badge is not showing). In Plugins → reCAPTCHA, click Save to publish it to your pages, and make sure the keys are reCAPTCHA v3 keys.' . $letThrough);
+    }
+    $ch = curl_init('https://www.google.com/recaptcha/api/siteverify');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => http_build_query(['secret' => $secret, 'response' => $token]),
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_TIMEOUT        => 10,
+    ]);
+    $res = curl_exec($ch); $curlErr = curl_error($ch);
+    fourgeCurlClose($ch);
+    if (!$res) return $finish('allowed_unverified', 'No response from Google siteverify' . ($curlErr ? ' (' . $curlErr . ')' : '') . ' — the server may be blocking outbound HTTPS.' . $letThrough);
+    $data = json_decode($res, true);
+    if (!empty($data['hostname'])) $rec['hostname'] = $data['hostname'];
+    if (isset($data['score']))     $rec['score']    = (float)$data['score'];
+    if (empty($data['success'])) {
+        $codes = isset($data['error-codes']) ? implode(', ', (array)$data['error-codes']) : 'unknown';
+        $hint = '';
+        if (strpos($codes, 'invalid-input-secret') !== false)        $hint = ' — the SECRET key is wrong, or a v2 secret was pasted for a v3 site.';
+        elseif (strpos($codes, 'invalid-input-response') !== false)  $hint = ' — the token was invalid/expired, or the SITE key is a v2 key being used with v3. Both keys must come from a reCAPTCHA v3 registration.';
+        elseif (strpos($codes, 'timeout-or-duplicate') !== false)    $hint = ' — the token expired or was reused.';
+        return $finish('allowed_unverified', 'Google rejected the verification: ' . $codes . $hint . $letThrough);
+    }
+    // reCAPTCHA v3 returns a 0.0–1.0 score; the threshold check is the ONLY place a
+    // submission is actually blocked. v2 (checkbox) returns no score, so a successful
+    // verification is enough.
+    if (isset($data['score'])) {
+        if (((float)$data['score']) >= (float)$threshold)
+            return $finish('passed', 'passed with score ' . $data['score'] . ' (threshold ' . $threshold . ')');
+        return $finish('blocked', 'score ' . $data['score'] . ' is below your threshold ' . $threshold . ' — this looks like a bot. Lower the threshold in Plugins → reCAPTCHA if real visitors are being blocked.');
+    }
+    return $finish('passed', 'passed (v2 checkbox — no score)');
+}
+
+// hCaptcha: an alternative to reCAPTCHA (Plugins → hCaptcha), same site-wide
+// on/off + two-key shape as reCAPTCHA above, read straight from data/site.json.
+function cmsHcaptchaSecret() {
+    $site = json_decode((string)@file_get_contents(__DIR__ . '/../data/site.json'), true);
+    if (!is_array($site) || empty($site['hcaptcha']['enabled'])) return '';
+    return cmsCaptchaSecret('hcaptcha');
+}
+// hCaptcha's checkbox challenge has no score to threshold against (unlike
+// reCAPTCHA v3) — same non-losing philosophy as reCAPTCHA v2: a successful
+// verification passes, anything else (no token, bad token, hCaptcha
+// unreachable) is 'allowed_unverified' rather than actively blocking, so a
+// real lead is never lost to a misconfigured or momentarily-down check.
+function cmsVerifyHcaptcha($secret, $token) {
+    $rec = ['at' => date('c'), 'outcome' => '', 'ok' => false, 'reason' => '', 'score' => null, 'tokenReceived' => ($token !== '' && $token !== null)];
+    $finish = function ($outcome, $reason) use (&$rec) {
+        $rec['outcome'] = $outcome; $rec['reason'] = $reason; $rec['ok'] = ($outcome === 'passed');
+        error_log('Fourge hCaptcha: ' . strtoupper($outcome) . ' — ' . $reason);
+        return $rec;
+    };
+    $letThrough = ' The submission was let through so a real lead is not lost — but hCaptcha is NOT protecting this form until this is fixed.';
+    if ($token === '' || $token === null) {
+        return $finish('allowed_unverified', 'No token received from the form — the hCaptcha widget did not load on the page.' . $letThrough);
+    }
+    $ch = curl_init('https://hcaptcha.com/siteverify');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => http_build_query(['secret' => $secret, 'response' => $token]),
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_TIMEOUT        => 10,
+    ]);
+    $res = curl_exec($ch); $curlErr = curl_error($ch);
+    fourgeCurlClose($ch);
+    if (!$res) return $finish('allowed_unverified', 'No response from hCaptcha siteverify' . ($curlErr ? ' (' . $curlErr . ')' : '') . ' — the server may be blocking outbound HTTPS.' . $letThrough);
+    $data = json_decode($res, true);
+    if (empty($data['success'])) {
+        $codes = isset($data['error-codes']) ? implode(', ', (array)$data['error-codes']) : 'unknown';
+        return $finish('allowed_unverified', 'hCaptcha rejected the verification: ' . $codes . '.' . $letThrough);
+    }
+    return $finish('passed', 'passed');
+}
+
+// Admin diagnostic: report the current reCAPTCHA config + the outcome of the most
+// recent submission check, so the exact reason a form is blocked is visible in the
+// CMS (Plugins → reCAPTCHA) without needing server-log access. Never returns keys.
+function fourgeApiRecaptchaStatus($me, $body) {
+    if (fourgeLevel($me) < 2) { http_response_code(403); echo json_encode(['error' => 'Admin access required']); return; }
+    $cfg = ['enabled' => false, 'version' => '', 'hasSecret' => false, 'hasSiteKey' => false, 'threshold' => cmsRecaptchaThreshold()];
+    try {
+        $site = json_decode(@file_get_contents(__DIR__ . '/../data/site.json'), true);
+        $rc = ($site['recaptcha'] ?? []);
+        $cfg['enabled']    = !empty($rc['enabled']);
+        $cfg['version']    = (string)($rc['version'] ?? '');
+        $cfg['hasSecret']  = !empty($rc['secret']);
+        $cfg['hasSiteKey'] = !empty($rc['siteKey']);
+    } catch (Throwable $e) {}
+    // data/recaptcha-debug.json is now a bounded, oldest-first log (see
+    // cmsRecaptchaLog) — 'last' stays the single most recent record, flat,
+    // for this panel's own direct field reads (last.score, last.reason, …);
+    // the full log rides along as last.entries for anything that wants
+    // recent history, e.g. Post-Launch Check's "how many of the last 10 were
+    // blocked". A file still in the old pre-upgrade single-record shape (not
+    // a list) is treated as no history yet rather than guessed at — it's
+    // superseded the next time a form is submitted.
+    $log = [];
+    try {
+        $j = @file_get_contents(__DIR__ . '/../data/recaptcha-debug.json');
+        $d = json_decode((string)$j, true);
+        if (is_array($d) && ($d === [] || array_keys($d) === range(0, count($d) - 1))) $log = $d;
+    } catch (Throwable $e) {}
+    $last = null;
+    if ($log) { $last = $log[count($log) - 1]; $last['entries'] = $log; }
+    echo json_encode(['ok' => true, 'config' => $cfg, 'last' => $last]);
+}
+
+// ── GOHIGHLEVEL (GHL) LEAD PUSH ─────────────────────────────────────────────
+// Pushes a website form submission into GoHighLevel as a contact (lead) via the
+// v2 API, using a Private Integration Token stored encrypted server-side — so no
+// GHL form is needed and the token never reaches the browser. Config lives in
+// data/site.json { ghl: { enabled, locationId } } + the encrypted 'ghl_token'.
+// (GHL_API_BASE / GHL_API_VERSION are define()d at the top of this file, BEFORE
+// the request dispatch, so they exist by the time these functions run.)
+
+// Returns ['token'=>, 'locationId'=>] when GHL is enabled + fully configured, else null.
+function cmsGhlConfig() {
+    try {
+        $file = __DIR__ . '/../data/site.json';
+        if (!is_file($file)) return null;
+        $site = json_decode(file_get_contents($file), true);
+        $ghl  = $site['ghl'] ?? null;
+        if (!is_array($ghl) || empty($ghl['enabled'])) return null;
+        $loc  = trim((string)($ghl['locationId'] ?? ''));
+        if ($loc === '') return null;
+        $token = '';
+        try { $token = (string)fourgeGetSecret(fourgeDb(), 'ghl_token'); } catch (Throwable $e) { $token = ''; }
+        if ($token === '') return null;
+        return ['token' => $token, 'locationId' => $loc];
+    } catch (Throwable $e) { return null; }
+}
+
+// PURE (no network): map a submission (assoc fieldName=>value) to a GHL contact
+// payload + a human-readable note body. Detects email/phone/name heuristically.
+function cmsGhlMapContact($fields, $locationId, $formName, $siteUrl, $mapping = null) {
+    $humanize = function ($k) {
+        $k = preg_replace('/-[a-z0-9]{2,6}$/i', '', (string)$k);   // drop the "-ab12" id suffix
+        $k = trim(preg_replace('/\s+/', ' ', preg_replace('/[_\-]+/', ' ', $k)));
+        return $k === '' ? 'Field' : ucwords($k);
+    };
+    $email = ''; $phone = ''; $first = ''; $last = ''; $full = ''; $noteLines = [];
+    foreach ((array)$fields as $k => $v) {
+        if (is_array($v)) $v = implode(', ', $v);
+        $v = trim((string)$v);
+        if ($v === '') continue;
+        $key = strtolower((string)$k);
+        $noteLines[] = $humanize($k) . ': ' . $v;
+        if ($email === '' && (strpos($key, 'email') !== false || filter_var($v, FILTER_VALIDATE_EMAIL))) { $email = $v; continue; }
+        if ($phone === '' && (preg_match('/phone|tel|mobile|cell/', $key) || preg_match('/^[\+\(]?[\d][\d\s().\-]{6,}$/', $v))) { $phone = $v; continue; }
+        if (preg_match('/first/', $key)) { $first = $v; continue; }
+        if (preg_match('/last|surname/', $key)) { $last = $v; continue; }
+        if ($full === '' && strpos($key, 'name') !== false && strpos($key, 'user') === false && strpos($key, 'file') === false) { $full = $v; }
+    }
+    if ($first === '' && $full !== '') { $p = preg_split('/\s+/', $full, 2); $first = $p[0]; $last = $p[1] ?? ''; }
+    $tags = array_values(array_filter(['Website Lead', $formName ? ('Form: ' . $formName) : '']));
+    $contact = ['locationId' => $locationId, 'tags' => $tags, 'source' => 'Website form' . ($formName ? " ({$formName})" : '')];
+    if ($first !== '') $contact['firstName'] = $first;
+    if ($last  !== '') $contact['lastName']  = $last;
+    if ($first === '' && $last === '' && $full !== '') $contact['name'] = $full;
+    if ($email !== '') $contact['email'] = $email;
+    if ($phone !== '') $contact['phone'] = $phone;
+    // A form matched to a CRM form (cmsGhlApplyMapping) overrides the heuristics:
+    // its explicit standard-field values win, and its custom fields ride along so
+    // automations can key on them (the note still carries the full submission).
+    if ($mapping && !empty($mapping['mapped'])) {
+        foreach (($mapping['contact'] ?? []) as $k => $v) { if ($v !== '' && $v !== null) $contact[$k] = $v; }
+        if (!empty($mapping['custom'])) $contact['customFields'] = $mapping['custom'];
+        // A single "Name" field mapped to the CRM's first_name arrives as the
+        // FULL name. Without this, firstName became the whole string while the
+        // heuristic's split lastName survived underneath — every contact came
+        // out like "Amy Jenson" / "Jenson". When the mapping supplies
+        // first_name but no last_name: drop any heuristic lastName, and if the
+        // mapped value contains whitespace, split it (first token → firstName,
+        // remainder → lastName; single-token names keep lastName empty).
+        $mc = $mapping['contact'] ?? [];
+        if (!empty($mc['firstName']) && empty($mc['lastName'])) {
+            unset($contact['lastName']);
+            $fn = trim((string)$mc['firstName']);
+            if (preg_match('/\s/', $fn)) {
+                $p = preg_split('/\s+/', $fn, 2);
+                $contact['firstName'] = $p[0];
+                if (isset($p[1]) && trim($p[1]) !== '') $contact['lastName'] = trim($p[1]);
+            }
+        }
+    }
+    $note = 'New website form submission' . ($formName ? " — {$formName}" : '') . "\n\n" . implode("\n", $noteLines);
+    if ($siteUrl) $note .= "\n\nPage: " . $siteUrl;
+    $hasContact = ($email !== '' || $phone !== '' || !empty($contact['email']) || !empty($contact['phone']));
+    return ['contact' => $contact, 'note' => $note, 'hasContactInfo' => $hasContact];
+}
+
+// Push a submission to GHL. Best-effort; returns true when the contact upserts.
+// When the CMS form is matched to a CRM form (its fields carry a 'ghl' mapping,
+// set in the form builder from the CRM form's share link), the submission's
+// values are sent as the CRM's REAL fields — standard ones and custom fields —
+// so automations that key on those fields fire with the data they need.
+function cmsGhlPushLead($token, $locationId, $fields, $formName, $siteUrl, $formId = '') {
+    $mapping = null;
+    if ($formId !== '') { try { $mapping = cmsGhlFormMapping($formId, $fields); } catch (Throwable $e) {} }
+    $map = cmsGhlMapContact($fields, $locationId, $formName, $siteUrl, $mapping);
+    if (!$map['hasContactInfo']) return false;   // no email/phone → nothing GHL can dedupe or act on
+    $headers = ['Authorization: Bearer ' . $token, 'Version: ' . GHL_API_VERSION, 'Content-Type: application/json', 'Accept: application/json'];
+    $ch = curl_init(GHL_API_BASE . '/contacts/upsert');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_HTTPHEADER => $headers,
+        CURLOPT_POSTFIELDS => json_encode($map['contact']), CURLOPT_SSL_VERIFYPEER => true, CURLOPT_TIMEOUT => 12,
+    ]);
+    $res = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); fourgeCurlClose($ch);
+    if ($code < 200 || $code >= 300 || !$res) return false;
+    $d = json_decode($res, true);
+    $contactId = $d['contact']['id'] ?? ($d['id'] ?? '');
+    if ($contactId && $map['note']) {   // attach the full submission as a note (best-effort)
+        $ch2 = curl_init(GHL_API_BASE . '/contacts/' . rawurlencode($contactId) . '/notes');
+        curl_setopt_array($ch2, [
+            CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_POSTFIELDS => json_encode(['body' => $map['note']]), CURLOPT_SSL_VERIFYPEER => true, CURLOPT_TIMEOUT => 10,
+        ]);
+        curl_exec($ch2); fourgeCurlClose($ch2);
+    }
+    return true;
+}
+
+// Look up one form's own definition in data/forms.json by id — the shared
+// lookup behind cmsGhlFormMapping, cmsFormWebhookConfig, the form-password
+// check, and the response-limit/close-date check below.
+function cmsFormById($formId) {
+    if ($formId === '') return null;
+    $forms = json_decode(@file_get_contents(__DIR__ . '/../data/forms.json'), true);
+    if (!is_array($forms)) return null;
+    foreach ($forms as $f) { if (($f['id'] ?? '') === $formId) return $f; }
+    return null;
+}
+// Generic outbound webhook config for one form — its settings.webhookUrl/
+// webhookSecret, or null if the form has none configured.
+function cmsFormWebhookConfig($formId) {
+    $form = cmsFormById($formId);
+    if (!$form) return null;
+    $url = trim((string)($form['settings']['webhookUrl'] ?? ''));
+    if ($url === '') return null;
+    return ['url' => $url, 'secret' => (string)($form['settings']['webhookSecret'] ?? '')];
+}
+// POSTs one submission as JSON to an operator-supplied URL. Guarded by the same
+// https-and-public-host check every other operator-supplied URL in this codebase
+// gets (fourgeTlpUrlOk — see the TLP feed / Fleet Dashboard / custom AI endpoint).
+// When a secret is set, the raw JSON body is HMAC-SHA256 signed the same way
+// GitHub/Stripe webhooks are, so the receiving end can verify it really came from
+// this form and wasn't forged or replayed by a different sender.
+function cmsSendWebhook($url, $secret, $payload) {
+    if (!fourgeTlpUrlOk($url)) return false;
+    $body = json_encode($payload);
+    $headers = ['Content-Type: application/json'];
+    if ($secret !== '') {
+        $headers[] = 'X-Fourge-Signature: sha256=' . hash_hmac('sha256', $body, $secret);
+    }
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_HTTPHEADER     => $headers,
+        CURLOPT_POSTFIELDS     => $body,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_TIMEOUT        => 10,
+    ]);
+    curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    fourgeCurlClose($ch);
+    return $code >= 200 && $code < 300;
+}
+
+// Returns a user-facing reason this form is closed (past its close date, or
+// at its response cap), or '' if it's open. Checked before reCAPTCHA/hCaptcha
+// in cmsSendForm — no point verifying a captcha for a submission that can't
+// be accepted anyway.
+function cmsFormClosedReason($form) {
+    $s = $form['settings'] ?? [];
+    $closeDate = trim((string)($s['closeDate'] ?? ''));
+    if ($closeDate !== '') {
+        $ts = strtotime($closeDate . ' 23:59:59');
+        if ($ts !== false && time() > $ts) return 'This form is no longer accepting responses.';
+    }
+    $max = (int)($s['maxResponses'] ?? 0);
+    if ($max > 0 && cmsCountEntriesForForm((string)($form['id'] ?? '')) >= $max) {
+        return 'This form has reached its response limit.';
+    }
+    return '';
+}
+function cmsCountEntriesForForm($formId) {
+    $entries = json_decode(@file_get_contents(__DIR__ . '/../data/entries.json'), true);
+    if (!is_array($entries)) return 0;
+    $n = 0;
+    foreach ($entries as $e) { if (($e['formId'] ?? '') === $formId) $n++; }
+    return $n;
+}
+// A submission itself carries the password it was unlocked with (the client
+// only reveals the real form after a successful check_form_password call —
+// see ffCheckFormPassword in admin/index.html), so cmsSendForm can verify it
+// independently. Without this, a password-protected form's real gate would
+// be purely a client-side courtesy: anyone could skip straight to send_form.
+function cmsFormPasswordOk($form, $submitted) {
+    $hash = (string)($form['settings']['password'] ?? '');
+    if ($hash === '') return true;   // not password-protected
+    return $submitted !== '' && password_verify($submitted, $hash);
+}
+// Public: verify a visitor-entered password against a password-protected
+// form's stored hash (bcrypt, same approach as page passwords — see
+// fourgeApiSetPagePassword). A low-stakes gate on who can see/submit a form,
+// not a high-security boundary, so no extra rate-limiting beyond bcrypt's
+// own inherent slowness.
+function fourgeApiCheckFormPassword($body) {
+    $formId = (string)($body['formId'] ?? '');
+    $password = (string)($body['password'] ?? '');
+    $form = cmsFormById($formId);
+    $hash = (string)($form['settings']['password'] ?? '');
+    if ($hash === '') { echo json_encode(['ok' => true]); return; }   // not password-protected — nothing to check
+    if ($password !== '' && password_verify($password, $hash)) {
+        echo json_encode(['ok' => true]);
+    } else {
+        http_response_code(403);
+        echo json_encode(['ok' => false, 'error' => 'Incorrect password']);
+    }
+}
+// Public, best-effort view counter feeding the Forms list's analytics — never
+// blocks or errors loudly; a lost increment under concurrent writes is an
+// acceptable tradeoff for not needing file locking on every page view.
+function fourgeApiFormView($body) {
+    $formId = (string)($body['formId'] ?? '');
+    if ($formId === '') { echo json_encode(['ok' => false]); return; }
+    try {
+        $file = __DIR__ . '/../data/form-analytics.json';
+        $data = is_file($file) ? json_decode(file_get_contents($file), true) : [];
+        if (!is_array($data)) $data = [];
+        if (!isset($data[$formId]) || !is_array($data[$formId])) $data[$formId] = ['views' => 0];
+        $data[$formId]['views'] = (int)($data[$formId]['views'] ?? 0) + 1;
+        file_put_contents($file, json_encode($data, JSON_PRETTY_PRINT));
+    } catch (Throwable $e) {}
+    echo json_encode(['ok' => true]);
+}
+// The form builder calls this once when the admin sets/changes a form's
+// password, then saves the returned hash into settings.password itself via
+// the normal saveForm()/write_file flow — so this endpoint only ever hashes,
+// it never touches forms.json (no second write path to conflict with the
+// builder's own full-array save). Requires the same auth the read_file/
+// write_file actions already require (session or the shared API token) —
+// the dispatcher gates that before this function ever runs.
+function fourgeApiHashFormPassword($body) {
+    $password = (string)($body['password'] ?? '');
+    if (strlen($password) < 4) { http_response_code(400); echo json_encode(['error' => 'Password must be at least 4 characters']); return; }
+    echo json_encode(['ok' => true, 'hash' => password_hash($password, PASSWORD_DEFAULT)]);
+}
+
+// Same slug the form renderer uses for input names (admin/index.html slugify()),
+// so submitted keys — slug(label)-<first 4 of field id> — can be matched back to
+// the form's field definitions here on the server.
+function cmsSlug($s) {
+    $s = function_exists('mb_strtolower') ? mb_strtolower((string)$s) : strtolower((string)$s);
+    return preg_replace('/[^a-z0-9-]/', '', preg_replace('/\s+/', '-', $s));
+}
+
+// Build the CRM push mapping for one submission: read the form's definition from
+// data/forms.json, and for every field carrying a 'ghl' mapping, find its
+// submitted value and file it under the CRM's REAL field — a standard contact
+// field (firstName/email/companyName/…) or a custom field (by id/key). Hidden
+// CRM fields the form was matched with (settings.ghlAuto) are sent as constants.
+function cmsGhlFormMapping($formId, $fields) {
+    $form = cmsFormById($formId);
+    if (!$form) return null;
+    return cmsGhlApplyMapping($form, $fields);
+}
+function cmsGhlApplyMapping($form, $fields) {
+    $STD = ['first_name'=>'firstName','last_name'=>'lastName','email'=>'email','phone'=>'phone',
+            'full_name'=>'name','company_name'=>'companyName','organization'=>'companyName'];
+    $contact = []; $custom = []; $mapped = false;
+    // Submitted values for a form field: keys are slug(label)-<id4>, with optional
+    // -sub suffixes (name -first/-last, address -street/-city/…) or [] (checkboxes).
+    $valuesFor = function ($f) use ($fields) {
+        $p = cmsSlug($f['label'] ?? '') . '-' . substr((string)($f['id'] ?? ''), 0, 4);
+        $out = [];
+        foreach ((array)$fields as $k => $v) {
+            $k = (string)$k;
+            if (is_array($v)) $v = implode(', ', $v);
+            $v = trim((string)$v); if ($v === '') continue;
+            if ($k === $p || $k === $p.'[]')            $out[''] = $v;
+            elseif (strpos($k, $p.'-') === 0)           $out[substr($k, strlen($p)+1)] = $v;
+            elseif ($k === ($f['label'] ?? ''))         $out[''] = $v;   // hidden fields post by label
+        }
+        return $out;
+    };
+    foreach ((array)($form['fields'] ?? []) as $f) {
+        $g = $f['ghl'] ?? null;
+        if (!$g || !is_array($g)) continue;
+        $vals = $valuesFor($f);
+        if (!$vals) continue;
+        $flat = trim(implode(' ', array_values($vals)));
+        if (!empty($g['std'])) {
+            $std = (string)$g['std'];
+            if ($std === 'address') {
+                if (isset($vals['street'])) $contact['address1']   = $vals['street'];
+                if (isset($vals['city']))   $contact['city']       = $vals['city'];
+                if (isset($vals['state']))  $contact['state']      = $vals['state'];
+                if (isset($vals['zip']))    $contact['postalCode'] = $vals['zip'];
+            } elseif (isset($STD[$std])) {
+                if ($std === 'full_name' && isset($vals['first'])) $flat = trim($vals['first'].' '.($vals['last'] ?? ''));
+                $contact[$STD[$std]] = $flat;
+            }
+            $mapped = true;
+        } elseif (!empty($g['id']) || !empty($g['key'])) {
+            $entry = ['field_value' => $flat];
+            if (!empty($g['id'])) $entry['id'] = (string)$g['id'];
+            else $entry['key'] = preg_replace('/^contact\./', '', (string)$g['key']);
+            $custom[] = $entry; $mapped = true;
+        }
+    }
+    foreach ((array)($form['settings']['ghlAuto'] ?? []) as $a) {   // hidden CRM constants (e.g. Source Page)
+        if (!is_array($a) || (!isset($a['id']) && !isset($a['key'])) || !isset($a['value']) || $a['value']==='') continue;
+        $entry = ['field_value' => (string)$a['value']];
+        if (!empty($a['id'])) $entry['id'] = (string)$a['id'];
+        else $entry['key'] = preg_replace('/^contact\./', '', (string)$a['key']);
+        $custom[] = $entry; $mapped = true;
+    }
+    return $mapped ? ['mapped' => true, 'contact' => $contact, 'custom' => $custom] : null;
+}
+
+// ── CRM FORM DEFINITION (share-link import) ─────────────────────────
+// The CRM's form share page embeds its full definition (fields, custom-field ids
+// and keys, picklists, hidden defaults) in a NUXT devalue payload — public, no
+// token needed. Parse it so the form builder can match CMS fields to the CRM
+// form's REAL fields. Devalue is a flat array where object/array members are
+// integer POINTERS into the same array; resolve with cycle + depth guards.
+function cmsGhlParseFormWidget($html) {
+    if (!preg_match('~<script[^>]*id="__NUXT_DATA__"[^>]*>(.*?)</script>~s', (string)$html, $m)) return null;
+    $arr = json_decode($m[1], true);
+    if (!is_array($arr)) return null;
+    $isList = function ($a) { if (!is_array($a)) return false; $i = 0; foreach ($a as $k => $_) { if ($k !== $i++) return false; } return true; };
+    $res = function ($i, $depth, $seen) use (&$res, $arr, $isList) {
+        if (!is_int($i)) return $i;
+        if ($i < 0 || $i >= count($arr) || $depth > 20 || isset($seen[$i])) return null;
+        $v = $arr[$i]; $seen[$i] = true;
+        if (is_array($v)) {
+            $out = [];
+            foreach ($v as $k => $x) $out[$k] = $res($x, $depth + 1, $seen);
+            return $out;
+        }
+        return $v;
+    };
+    foreach ($arr as $v) {
+        if (!is_array($v) || $isList($v) || !isset($v['form'], $v['locationId'])) continue;
+        $form = $res($v['form'], 0, []);
+        if (!is_array($form) || !isset($form['fields'])) continue;
+        $fields = [];
+        foreach ((array)$form['fields'] as $f) {
+            if (!is_array($f)) continue;
+            $type = (string)($f['type'] ?? '');
+            if ($type === 'submit' || ($f['tag'] ?? '') === 'button') continue;
+            $o = [
+                'label'    => trim(html_entity_decode(strip_tags((string)($f['label'] ?? ($f['name'] ?? ''))))),
+                'type'     => $type,
+                'required' => !empty($f['required']),
+                'standard' => !empty($f['standard']),
+            ];
+            if ($o['standard']) {
+                $o['std'] = (string)($f['tag'] ?? ($f['hiddenFieldQueryKey'] ?? ''));
+            } else {
+                $o['id']       = (string)($f['id'] ?? ($f['Id'] ?? ''));
+                $o['key']      = (string)($f['fieldKey'] ?? '');
+                $o['dataType'] = (string)($f['dataType'] ?? '');
+                if (!empty($f['picklistOptions']) && is_array($f['picklistOptions'])) $o['options'] = array_values(array_map('strval', $f['picklistOptions']));
+                if (!empty($f['hidden'])) { $o['hidden'] = true; $o['hiddenValue'] = (string)($f['hiddenFieldValue'] ?? ''); }
+            }
+            $fields[] = $o;
+        }
+        return [
+            'locationId' => (string)$res($v['locationId'], 0, []),
+            'name'       => (string)$res($v['name'] ?? -1, 0, []),
+            'fields'     => $fields,
+        ];
+    }
+    return null;
+}
+// Admin action: fetch a CRM form's public share page and return its parsed field
+// definition. Only a form ID is accepted (or a share link it's extracted from) and
+// the URL is constructed server-side — the server never fetches a caller-supplied
+// URL, so this can't be used to probe internal hosts.
+function fourgeApiGhlFormDef($me, $body) {
+    if (fourgeLevel($me) < 2) { http_response_code(403); echo json_encode(['error' => 'Admin access required']); return; }
+    $raw = trim((string)($body['form'] ?? ''));
+    $id = '';
+    if (preg_match('~/widget/form/([A-Za-z0-9_-]{6,64})~', $raw, $m)) $id = $m[1];
+    elseif (preg_match('~^[A-Za-z0-9_-]{6,64}$~', $raw)) $id = $raw;
+    if ($id === '') { http_response_code(400); echo json_encode(['error' => 'Paste the form’s share link (it looks like …/widget/form/…).']); return; }
+    $ch = curl_init('https://api.leadconnectorhq.com/widget/form/' . $id);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true, CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_SSL_VERIFYPEER => true, CURLOPT_TIMEOUT => 15,
+        CURLOPT_HTTPHEADER => ['Accept: text/html'],
+    ]);
+    $res = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); $err = curl_error($ch); fourgeCurlClose($ch);
+    if ($err || $code !== 200 || !$res) { http_response_code(502); echo json_encode(['error' => 'Could not load the form’s share page' . ($err ? ' ('.$err.')' : ($code ? ' (HTTP '.$code.')' : '')) . ' — check the link.']); return; }
+    $def = cmsGhlParseFormWidget($res);
+    if (!$def || empty($def['fields'])) { http_response_code(422); echo json_encode(['error' => 'That page didn’t contain a readable form definition — make sure it’s the form’s share link.']); return; }
+    echo json_encode(['ok' => true, 'formId' => $id, 'locationId' => $def['locationId'], 'name' => $def['name'], 'fields' => $def['fields']]);
+}
+
+// ── GITHUB MIRROR (server-side) ─────────────────────────────────────
+// Pushes a file into the site's GitHub repo FROM THE SERVER, using the
+// github_pat stored encrypted in the DB — so page saves and revision snapshots
+// mirror for EVERY signed-in user, from any browser. (Previously the push ran
+// in the browser with the Architect-only PAT, so any non-Architect session
+// silently skipped the mirror — server copies existed, GitHub stayed empty.)
+// The token is only USED here; it is never returned to the caller.
+function cmsGhMirrorCfg() {
+    $repo = ''; $branch = 'main'; $token = '';
+    try {
+        $site = json_decode(@file_get_contents(__DIR__ . '/../data/site.json'), true);
+        $gh = $site['github'] ?? [];
+        $repo = (string)($gh['repo'] ?? '');
+        if (!empty($gh['branch'])) $branch = (string)$gh['branch'];
+    } catch (Throwable $e) {}
+    try { $ov = (string)fourgeGetSecret(fourgeDb(), 'repo_override'); if ($ov !== '') $repo = $ov; } catch (Throwable $e) {}
+    try { $token = (string)fourgeGetSecret(fourgeDb(), 'github_pat'); } catch (Throwable $e) {}
+    return [$repo, $branch, $token];
+}
+// One GitHub REST call. Returns [httpCode, decodedJson|null, curlError].
+// $timeout grows with the payload (a 20 MB image is a ~27 MB base64 body, and
+// a shared host can take a while to push that); the connect phase is always
+// capped so an unreachable GitHub costs a save seconds, not the full budget.
+function cmsGhApi($method, $url, $token, $payload = null, $timeout = 25) {
+    $ch = curl_init($url); $hdrs = [];
+    $opts = [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CUSTOMREQUEST  => $method,
+        CURLOPT_HTTPHEADER     => ['Authorization: Bearer ' . $token, 'Accept: application/vnd.github+json', 'User-Agent: FourgeCMS', 'X-GitHub-Api-Version: 2022-11-28'],
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_TIMEOUT        => max(5, (int)$timeout),
+        // Response headers carry the rate limit and the token's expiry date.
+        CURLOPT_HEADERFUNCTION => function ($ch, $line) use (&$hdrs) { $p = strpos($line, ':'); if ($p !== false) $hdrs[strtolower(trim(substr($line, 0, $p)))] = trim(substr($line, $p + 1)); return strlen($line); },
+    ];
+    if ($payload !== null) $opts[CURLOPT_POSTFIELDS] = json_encode($payload);
+    curl_setopt_array($ch, $opts);
+    $res = curl_exec($ch); $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE); $err = curl_error($ch);
+    fourgeCurlClose($ch);
+    $json = $res ? json_decode($res, true) : null;
+    cmsGhLast(['code' => $code, 'message' => is_array($json) ? (string)($json['message'] ?? '') : '', 'headers' => $hdrs, 'curl' => (string)$err]);
+    return [$code, $json, $err];
+}
+
+// ── What belongs in the site's repo ──────────────────────────────────
+// Everything under the web root that IS the site — pages, data/*.json, images,
+// video, fonts, documents, .htaccess files — minus what must never land in a
+// repo:
+//  • .git internals, and the CMS engine itself (admin/): api.php can carry
+//    inline secrets on installs without config.secret.php, and the engine is
+//    updated from the FoundryCMS template repo by the updater anyway, so a copy
+//    in the site's own repo would only ever be a stale fork;
+//  • credentials and PII: users.json (password hashes), entries.json and
+//    data/uploads/ (form submissions and their attachments — once in git
+//    history they are there forever), .htpasswd, the databases (and their
+//    WAL/SHM siblings), any dot-file or dot-folder other than .htaccess and
+//    .well-known (.env, .ga-token.json, .DS_Store, .github …);
+//  • pure churn: the form-analytics counter, the reCAPTCHA debug log, logs,
+//    backups and temp files.
+function cmsGhSkipDir($relDir) {
+    $relDir = trim(str_replace('\\', '/', (string)$relDir), '/');
+    if ($relDir === '') return false;
+    foreach (FOURGE_GH_SKIP_DIRS as $d) { if (strcasecmp($relDir, $d) === 0) return true; }
+    $seg = basename($relDir);
+    return $seg === '' || $seg === '.' || $seg === '..' || ($seg[0] === '.' && $seg !== '.well-known');
+}
+function cmsGhShouldMirror($rel) {
+    $rel = str_replace('\\', '/', ltrim((string)$rel, '/'));
+    if ($rel === '' || strpos($rel, "\0") !== false || substr($rel, -1) === '/') return false;
+    $parts = explode('/', $rel);
+    $base  = array_pop($parts);
+    $dir   = '';
+    foreach ($parts as $seg) {
+        $dir = ($dir === '' ? $seg : $dir . '/' . $seg);
+        if ($seg === '' || $seg === '.' || $seg === '..' || cmsGhSkipDir($dir)) return false;
+    }
+    $lb = strtolower($base);
+    if ($lb === '' || $lb === '.' || $lb === '..') return false;
+    if ($lb[0] === '.' && $lb !== '.htaccess') return false;
+    if (preg_match('~\.(db|sqlite|sqlite3|db-wal|db-shm|sqlite-wal|sqlite-shm|sqlite3-wal|sqlite3-shm|log|bak|tmp|swp)$~', $lb)) return false;
+    if (in_array($lb, ['error_log', 'php_errorlog', 'thumbs.db', 'config.secret.php', 'ga-service-account.json'], true)) return false;
+    if (preg_match('~^data/(users|entries|form-analytics|recaptcha-debug)\.json$~i', $rel)) return false;
+    return true;
+}
+// A file's path relative to the web root, forward-slashed — the path it has in the repo.
+function cmsGhRelPath($absPath) {
+    $abs = realpath($absPath) ?: (string)$absPath;
+    if (strpos($abs, PUBLIC_HTML) === 0) $abs = substr($abs, strlen(PUBLIC_HTML));
+    return ltrim(str_replace('\\', '/', $abs), '/');
+}
+// Biggest file the mirror will push. GitHub's Contents API stops at 100 MB, but
+// a PHP request has to hold the file, its base64 form and the JSON body at once,
+// so this also bows to memory_limit. 20 MB covers every image, PDF and short
+// clip the media library realistically stores; anything bigger stays server-only
+// and is reported as skipped rather than failing the save.
+function cmsGhMaxBytes() {
+    $ml = trim((string)ini_get('memory_limit'));
+    if ($ml === '' || $ml === '-1') return FOURGE_GH_MAX_BYTES;
+    $n = (float)$ml; $u = strtolower(substr($ml, -1));
+    if ($u === 'g') $n *= 1073741824; elseif ($u === 'm') $n *= 1048576; elseif ($u === 'k') $n *= 1024;
+    $room = (int)(($n - memory_get_usage(true)) / 4);
+    return max(1048576, min(FOURGE_GH_MAX_BYTES, $room));
+}
+// Local git blob id of a byte string — the very sha GitHub reports for a file,
+// so "does the repo already hold exactly these bytes?" needs no download.
+function cmsGhBlobSha($bytes) { return sha1('blob ' . strlen($bytes) . "\0" . $bytes); }
+function cmsGhContentsUrl($repo, $rel) {
+    $enc = ($rel === '') ? '' : '/' . implode('/', array_map('rawurlencode', explode('/', $rel)));
+    return cmsGhBase() . '/repos/' . $repo . '/contents' . $enc;
+}
+function cmsGhFail($what, $c, $d, $e) {
+    return ['ok' => false, 'reason' => cmsGhReason($c), 'error' => cmsGhExplain($what, $c, $d, $e)];
+}
+// The repo's blob sha for a path: a sha string, '' when the file isn't in the
+// repo, or false when GitHub couldn't be asked. The per-file lookup stops at
+// 1 MB (GitHub answers 403 "too large"); the parent folder's listing carries
+// every entry's sha whatever its size, so that is the fallback.
+function cmsGhRemoteSha($repo, $branch, $token, $rel) {
+    list($c, $d) = cmsGhApi('GET', cmsGhContentsUrl($repo, $rel) . '?ref=' . rawurlencode($branch), $token);
+    if ($c === 200 && isset($d['sha'])) return (string)$d['sha'];
+    if ($c === 404) return '';
+    if ($c === 403) {
+        $dir = dirname($rel); if ($dir === '.' || $dir === '/') $dir = '';
+        list($lc, $ld) = cmsGhApi('GET', cmsGhContentsUrl($repo, $dir) . '?ref=' . rawurlencode($branch), $token);
+        if ($lc === 200 && is_array($ld)) {
+            foreach ($ld as $ent) { if (is_array($ent) && ($ent['path'] ?? '') === $rel) return (string)($ent['sha'] ?? ''); }
+            return '';
+        }
+        if ($lc === 404) return '';
+    }
+    return false;
+}
+// Every blob in the branch as path => sha, from one call — or null when GitHub
+// couldn't give a complete listing (callers then look files up one at a time).
+// A repo with no commits yet has no tree (404/409): nothing is there, which is
+// an honest empty map.
+function cmsGhFetchTree($repo, $branch, $token) {
+    list($c, $d) = cmsGhApi('GET', cmsGhBase() . '/repos/' . $repo . '/git/trees/' . rawurlencode($branch) . '?recursive=1', $token, null, 40);
+    if ($c === 404 || $c === 409) return [];
+    if ($c !== 200 || !is_array($d) || !empty($d['truncated']) || !isset($d['tree']) || !is_array($d['tree'])) return null;
+    $map = [];
+    foreach ($d['tree'] as $ent) { if (($ent['type'] ?? '') === 'blob' && isset($ent['path'], $ent['sha'])) $map[$ent['path']] = (string)$ent['sha']; }
+    return $map;
+}
+// Mirror one file's bytes into the repo — text or binary alike. Same result
+// shape the gh_mirror action has always returned: ['ok'=>true],
+// ['ok'=>true,'skipped'=>true] (the repo already holds these exact bytes) or
+// ['ok'=>false,'reason'=>…,'error'=>…]. $cfg lets a bulk run reuse one
+// cmsGhMirrorCfg() lookup; $remoteSha (a blob sha, or '' for "known absent")
+// lets it reuse one tree listing instead of a GET per file.
+function cmsGhMirrorBytes($rel, $bytes, $msg = '', $cfg = null, $remoteSha = null) {
+    $rel = str_replace('\\', '/', ltrim((string)$rel, '/'));
+    $bytes = (string)$bytes;
+    if (!cmsGhShouldMirror($rel)) return ['ok' => false, 'reason' => 'bad_path', 'error' => 'That file can’t be mirrored.'];
+    $max = cmsGhMaxBytes();
+    if (strlen($bytes) > $max) return ['ok' => false, 'reason' => 'too_big', 'error' => 'Too big to mirror (' . round(strlen($bytes) / 1048576, 1) . ' MB — the limit is ' . round($max / 1048576) . ' MB)'];
+    list($repo, $branch, $token) = is_array($cfg) ? $cfg : cmsGhMirrorCfg();
+    if ($repo === '' || !preg_match('~^[\w.-]+/[\w.-]+$~', $repo)) return ['ok' => false, 'reason' => 'no_repo'];
+    if ($token === '') return ['ok' => false, 'reason' => 'no_token'];
+    $msg = trim((string)$msg); if ($msg === '') $msg = 'Fourge: update ' . $rel;
+    if (!is_string($remoteSha)) {
+        $remoteSha = cmsGhRemoteSha($repo, $branch, $token, $rel);
+        if ($remoteSha === false) return ['ok' => false, 'reason' => cmsGhReason(cmsGhLast()['code']), 'error' => cmsGhExplain('Could not check ' . $rel . ' on GitHub')];
+    }
+    $msg = cmsGhSkipCi($msg);
+    $local = cmsGhBlobSha($bytes);
+    if ($remoteSha !== '' && $remoteSha === $local) return ['ok' => true, 'skipped' => true];
+    $url = cmsGhContentsUrl($repo, $rel);
+    $payload = ['message' => $msg, 'content' => base64_encode($bytes), 'branch' => $branch];
+    if ($remoteSha !== '') $payload['sha'] = $remoteSha;
+    $timeout = 25 + (int)ceil(strlen($bytes) / 262144);   // +1 s per 256 KB
+    list($c, $d, $e) = cmsGhApi('PUT', $url, $token, $payload, $timeout);
+    if ($c === 409 || $c === 422) {
+        // The sha we held was stale (someone pushed in between), or a tree
+        // listing said "absent" and the file is there after all: look it up
+        // fresh and try once more.
+        $fresh = cmsGhRemoteSha($repo, $branch, $token, $rel);
+        if (is_string($fresh) && $fresh !== $remoteSha) {
+            if ($fresh !== '' && $fresh === $local) return ['ok' => true, 'skipped' => true];
+            if ($fresh === '') unset($payload['sha']); else $payload['sha'] = $fresh;
+            list($c, $d, $e) = cmsGhApi('PUT', $url, $token, $payload, $timeout);
+        }
+    }
+    if ($c >= 200 && $c < 300) return ['ok' => true];
+    error_log('Fourge GitHub mirror failed for ' . $rel . ': HTTP ' . $c . ' ' . ($d['message'] ?? $e));
+    return cmsGhFail('GitHub returned', $c, $d, $e);
+}
+function cmsGhDeletePath($rel, $msg = '', $cfg = null) {
+    $rel = str_replace('\\', '/', ltrim((string)$rel, '/'));
+    if (!cmsGhShouldMirror($rel)) return ['ok' => false, 'reason' => 'bad_path', 'error' => 'That file can’t be mirrored.'];
+    list($repo, $branch, $token) = is_array($cfg) ? $cfg : cmsGhMirrorCfg();
+    if ($repo === '' || !preg_match('~^[\w.-]+/[\w.-]+$~', $repo)) return ['ok' => false, 'reason' => 'no_repo'];
+    if ($token === '') return ['ok' => false, 'reason' => 'no_token'];
+    $msg = trim((string)$msg); if ($msg === '') $msg = 'Fourge: delete ' . $rel;
+    $sha = cmsGhRemoteSha($repo, $branch, $token, $rel);
+    if ($sha === false) return ['ok' => false, 'reason' => cmsGhReason(cmsGhLast()['code']), 'error' => cmsGhExplain('Could not check ' . $rel . ' on GitHub')];
+    if ($sha === '') return ['ok' => true, 'skipped' => 'absent'];   // nothing to prune
+    list($c, $d, $e) = cmsGhApi('DELETE', cmsGhContentsUrl($repo, $rel), $token, ['message' => cmsGhSkipCi($msg), 'sha' => $sha, 'branch' => $branch]);
+    if ($c >= 200 && $c < 300) return ['ok' => true];
+    error_log('Fourge GitHub delete failed for ' . $rel . ': HTTP ' . $c . ' ' . ($d['message'] ?? $e));
+    return cmsGhFail('GitHub delete failed', $c, $d, $e);
+}
+// The write_file / upload / delete_file hooks. GitHub trouble must never touch
+// a save that has already succeeded on disk: every outcome comes back as data
+// in the response's `gh` field, and a path the repo must not hold reports
+// 'excluded' (so the engine updater writing admin/ is a quiet no-op here).
+function cmsGhAfterWrite($rel, $bytes) {
+    try {
+        $rel = str_replace('\\', '/', ltrim((string)$rel, '/'));
+        if (!cmsGhShouldMirror($rel)) return ['ok' => false, 'reason' => 'excluded'];
+        return cmsGhMirrorBytes($rel, $bytes, 'Fourge: update ' . $rel);
+    } catch (Throwable $e) { return ['ok' => false, 'reason' => 'error', 'error' => $e->getMessage()]; }
+}
+function cmsGhAfterDelete($rel) {
+    try {
+        $rel = str_replace('\\', '/', ltrim((string)$rel, '/'));
+        if (!cmsGhShouldMirror($rel)) return ['ok' => false, 'reason' => 'excluded'];
+        return cmsGhDeletePath($rel, 'Fourge: delete ' . $rel);
+    } catch (Throwable $e) { return ['ok' => false, 'reason' => 'error', 'error' => $e->getMessage()]; }
+}
+function fourgeApiGhMirror($me, $body) {
+    // Any signed-in user: mirroring rides along with saving. cmsGhShouldMirror()
+    // keeps it to real site files — no traversal, and never .git internals, the
+    // engine, credentials or form PII (see the policy above).
+    $path = str_replace('\\', '/', (string)($body['path'] ?? ''));
+    $del  = !empty($body['delete']);
+    $msg  = trim((string)($body['message'] ?? ''));
+    if ($path === '' || $path[0] === '/' || !cmsGhShouldMirror($path)) {
+        http_response_code(400); echo json_encode(['ok' => false, 'reason' => 'bad_path', 'error' => 'That file can’t be mirrored.']); return;
+    }
+    echo json_encode($del ? cmsGhDeletePath($path, $msg) : cmsGhMirrorBytes($path, (string)($body['content'] ?? ''), $msg));
+}
+// A client site's own repo is source control for its business content — no
+// reason for it to be publicly readable. Idempotent: a GET first, so an
+// already-private repo is a silent no-op rather than a redundant PATCH.
+// Admin+ only, same as the content sync this rides alongside (see
+// ghSyncSiteContent()/ghEnsureRepoPrivate() in admin/index.html).
+function fourgeApiGhSetPrivate($me, $body) {
+    if (fourgeLevel($me) < 2) { http_response_code(403); echo json_encode(['ok' => false, 'error' => 'Admin access required']); return; }
+    list($repo, , $token) = cmsGhMirrorCfg();
+    if ($repo === '' || !preg_match('~^[\w.-]+/[\w.-]+$~', $repo)) { echo json_encode(['ok' => false, 'reason' => 'no_repo']); return; }
+    if ($token === '') { echo json_encode(['ok' => false, 'reason' => 'no_token']); return; }
+    $base = cmsGhBase() . '/repos/' . $repo;
+    list($gc, $gd) = cmsGhApi('GET', $base, $token);
+    if ($gc === 200 && !empty($gd['private'])) { echo json_encode(['ok' => true, 'already' => true]); return; }
+    if ($gc !== 200) {
+        // 404 here is almost never "no such repo": GitHub answers 404 for a
+        // private repo the token can't see — cmsGhExplain says what to check.
+        echo json_encode(['ok' => false, 'reason' => cmsGhReason($gc), 'error' => cmsGhExplain('Could not confirm the repo is private', $gc, $gd, null)]); return;
+    }
+    list($c, $d, $e) = cmsGhApi('PATCH', $base, $token, ['private' => true]);
+    if ($c >= 200 && $c < 300) { echo json_encode(['ok' => true]); return; }
+    error_log('Fourge GitHub set-private failed for ' . $repo . ': HTTP ' . $c . ' ' . ($d['message'] ?? $e));
+    // Pushing files needs only "Contents: write"; flipping visibility needs repo
+    // administration rights, which most tokens made for mirroring don't carry.
+    if ($c === 403 || $c === 404) { echo json_encode(['ok' => false, 'reason' => 'forbidden', 'error' => 'GitHub would not let this token change the repo’s visibility (' . $c . '). It needs repository administration rights: "Administration: Read and write" on a fine-grained token, or the full "repo" scope on a classic one.']); return; }
+    echo json_encode(['ok' => false, 'reason' => cmsGhReason($c), 'error' => cmsGhExplain('Could not set the repo private', $c, $d, $e)]);
+}
+// Every file under the web root that belongs in the repo, as sorted relative
+// paths — the same policy cmsGhShouldMirror() applies to single writes, with
+// whole folders pruned early so .git/ and admin/ are never even walked.
+// Symlinks are skipped: a link out of the web root must not pull outside files in.
+function cmsGhListSiteFiles() {
+    $root = PUBLIC_HTML; $out = [];
+    $walk = function ($dir, $relDir) use (&$walk, &$out) {
+        $items = @scandir($dir); if (!$items) return;
+        foreach ($items as $item) {
+            if ($item === '.' || $item === '..') continue;
+            $full = $dir . '/' . $item; $rel = ($relDir === '' ? $item : $relDir . '/' . $item);
+            if (is_link($full)) continue;
+            if (is_dir($full)) { if (!cmsGhSkipDir($rel)) $walk($full, $rel); continue; }
+            if (is_file($full) && cmsGhShouldMirror($rel)) $out[] = $rel;
+        }
+    };
+    $walk($root, '');
+    sort($out, SORT_STRING);
+    return $out;
+}
+// ── GITHUB: what the last answer was, and what it means ──────────────────────
+// GitHub API base — overridable so the test suite can point the engine at a
+// stub server (tests/lib/gh_stub.php) and prove every request it makes.
+function cmsGhBase() { $b = getenv('FOURGE_GH_API_BASE'); return ($b && preg_match('~^https?://~', $b)) ? rtrim($b, '/') : 'https://api.github.com'; }
+// The last GitHub answer this request saw: code, GitHub's message, response
+// headers (lowercase names) and the curl error — so a failure can be explained.
+function cmsGhLast($set = null) {
+    static $last = ['code' => 0, 'message' => '', 'headers' => [], 'curl' => ''];
+    if ($set !== null) $last = $set;
+    return $last;
+}
+function cmsGhReason($code) {
+    $code = (int)$code; $h = cmsGhLast()['headers'];
+    if ($code === 401) return 'bad_token';
+    if ($code === 404) return 'repo';
+    if ($code === 403 && isset($h['x-ratelimit-remaining']) && (int)$h['x-ratelimit-remaining'] === 0) return 'rate_limit';
+    if ($code === 403) return 'forbidden';
+    if ($code === 0) return 'network';
+    return 'github';
+}
+// One plain sentence for a GitHub failure. A rejected token is the common case
+// and used to surface as "could not be reached", which sent people chasing
+// network problems; it now says what happened and where to fix it.
+function cmsGhExplain($what, $c = null, $d = null, $e = null) {
+    $last = cmsGhLast();
+    if ($c === null) { $c = $last['code']; $e = $last['curl']; }
+    $c = (int)$c;
+    $msg = is_array($d) ? (string)($d['message'] ?? '') : (($c === (int)$last['code']) ? (string)$last['message'] : '');
+    $h = $last['headers'];
+    if ($c === 0)   return $what . ': GitHub could not be reached' . ($e ? ' (' . $e . ')' : '') . '.';
+    if ($c === 401) return $what . ': GitHub rejected the saved token (401 Bad credentials) — it has expired or been revoked. Create a new token and save it under Settings → GitHub Integration.';
+    if ($c === 403 && isset($h['x-ratelimit-remaining']) && (int)$h['x-ratelimit-remaining'] === 0) {
+        $reset = (int)($h['x-ratelimit-reset'] ?? 0);
+        return $what . ': GitHub’s rate limit for this token is used up' . ($reset ? ' — it resets at ' . gmdate('H:i', $reset) . ' UTC' : '') . '. Try again then.';
+    }
+    if ($c === 403) return $what . ': GitHub refused (403' . ($msg ? ' — ' . $msg : '') . '). The token may lack permission for this repository, or an organization policy (SAML, token restrictions) is blocking it.';
+    if ($c === 404) return $what . ': GitHub answered 404 — the token cannot see this repository. Check the repo name (owner/name) and that the token was granted access to it; for an organization repository a fine-grained token’s Resource owner must be the organization.';
+    return $what . ': GitHub returned ' . $c . ($msg ? ' — ' . $msg : ($e ? ' — ' . $e : '')) . '.';
+}
+// Mirror commits must never start the site repo's own deploy workflow: the
+// server IS the source of these files, so deploying them back is circular, one
+// run per file fails loudly (hundreds of emails) and a full re-upload puts the
+// repo's stale copy of the engine (admin/) back on the live server.
+function cmsGhSkipCi($msg) { $msg = trim((string)$msg); if ($msg === '') $msg = 'Fourge: update'; return (stripos($msg, '[skip ci]') === false) ? ($msg . ' [skip ci]') : $msg; }
+
+// ── ONE COMMIT FOR THE WHOLE SITE (Git Data API) ─────────────────────────────
+// gh_sync_all used to push one commit per file through the Contents API — a
+// thousand commits for a thousand files, each a workflow run. It now stages
+// blobs batch by batch (the client keeps calling with {offset, run}) and, on
+// the last batch, writes ONE tree, ONE commit and moves the branch once.
+// Unchanged files cost nothing: their git blob sha is computed locally and
+// compared with the repo's tree listing. State between batches lives in
+// admin/gh-sync-state.php (PHP exits before the JSON, so it is never served).
+function cmsGhSyncStatePath() { return __DIR__ . '/gh-sync-state.php'; }
+function cmsGhSyncStateRead() {
+    $f = cmsGhSyncStatePath(); if (!is_file($f)) return null;
+    $raw = (string)@file_get_contents($f); $p = strpos($raw, "\n");
+    $j = json_decode($p === false ? '' : substr($raw, $p + 1), true);
+    return is_array($j) ? $j : null;
+}
+function cmsGhSyncStateWrite($state) { return @file_put_contents(cmsGhSyncStatePath(), "<?php exit; ?>\n" . json_encode($state)) !== false; }
+function cmsGhSyncStateClear() { @unlink(cmsGhSyncStatePath()); }
+// Can this token see the repo? Also reads what GitHub says about the token.
+// Returns ['ok'=>true,'private'=>bool,'canPush'=>bool,'expires'=>string,'scopes'=>string]
+// or ['ok'=>false,'reason'=>…,'error'=>…].
+function cmsGhProbe($repo, $token) {
+    list($c, $d, $e) = cmsGhApi('GET', cmsGhBase() . '/repos/' . $repo, $token);
+    $h = cmsGhLast()['headers'];
+    $info = ['expires' => (string)($h['github-authentication-token-expiration'] ?? ''), 'scopes' => (string)($h['x-oauth-scopes'] ?? '')];
+    if ($c !== 200 || !is_array($d)) return ['ok' => false, 'reason' => cmsGhReason($c), 'error' => cmsGhExplain('GitHub sync did not start', $c, $d, $e)] + $info;
+    return ['ok' => true, 'private' => !empty($d['private']), 'canPush' => !empty($d['permissions']['push']), 'fullName' => (string)($d['full_name'] ?? $repo)] + $info;
+}
+// The branch head: ['sha'=>commit,'tree'=>tree sha], ['empty'=>true] for a
+// branch (or repository) with no commits yet, or ['error'=>…].
+function cmsGhHead($repo, $branch, $token) {
+    list($c, $d, $e) = cmsGhApi('GET', cmsGhBase() . '/repos/' . $repo . '/git/ref/heads/' . rawurlencode($branch), $token);
+    if ($c === 404 || $c === 409) return ['empty' => true];
+    if ($c !== 200 || empty($d['object']['sha'])) return ['error' => cmsGhExplain('GitHub could not read the branch', $c, $d, $e)];
+    $sha = (string)$d['object']['sha'];
+    list($c2, $d2, $e2) = cmsGhApi('GET', cmsGhBase() . '/repos/' . $repo . '/git/commits/' . $sha, $token);
+    if ($c2 !== 200 || empty($d2['tree']['sha'])) return ['error' => cmsGhExplain('GitHub could not read the latest commit', $c2, $d2, $e2)];
+    return ['sha' => $sha, 'tree' => (string)$d2['tree']['sha']];
+}
+// Upload one file's bytes as a blob (no commit): the blob sha, or ['error'=>…].
+function cmsGhCreateBlob($repo, $token, $bytes) {
+    $timeout = 25 + (int)ceil(strlen($bytes) / 262144);
+    list($c, $d, $e) = cmsGhApi('POST', cmsGhBase() . '/repos/' . $repo . '/git/blobs', $token, ['content' => base64_encode($bytes), 'encoding' => 'base64'], $timeout);
+    if ($c === 201 && !empty($d['sha'])) return (string)$d['sha'];
+    return ['error' => cmsGhExplain('GitHub did not accept the file', $c, $d, $e), 'reason' => cmsGhReason($c)];
+}
+// Turn the staged blobs into one tree + one commit and move the branch. If the
+// branch moved while we were staging (someone pushed), rebuild once on the new
+// head — blobs are content-addressed, so nothing is uploaded twice. A repository
+// with no commits yet cannot take trees, so its first file goes through the
+// Contents API to create the initial commit, and the rest follow in one commit.
+function cmsGhCommitStaged($repo, $branch, $token, &$state, $message) {
+    $extra = 0;   // a first file that had to go through the Contents API still counts as pushed
+    if (!empty($state['empty'])) {
+        $first = array_key_first($state['blobs']);
+        if ($first === null) return ['ok' => true, 'sha' => '', 'count' => 0];
+        $bytes = @file_get_contents(PUBLIC_HTML . '/' . $first);
+        if ($bytes === false) return ['ok' => false, 'error' => $first . ' could not be read'];
+        $r = cmsGhMirrorBytes($first, $bytes, $message, [$repo, $branch, $token], '');
+        if (empty($r['ok'])) return ['ok' => false, 'error' => $r['error'] ?? 'GitHub refused the first commit'];
+        unset($state['blobs'][$first]);
+        $h = cmsGhHead($repo, $branch, $token);
+        if (isset($h['error'])) return ['ok' => false, 'error' => $h['error']];
+        if (!empty($h['empty'])) return ['ok' => false, 'error' => 'GitHub still reports the repository as empty after the first commit'];
+        $state['head'] = $h['sha']; $state['baseTree'] = $h['tree']; $state['empty'] = false; $extra = 1;
+        if (!$state['blobs']) return ['ok' => true, 'sha' => $h['sha'], 'count' => 1];
+    }
+    $entries = [];
+    foreach ($state['blobs'] as $path => $sha) $entries[] = ['path' => $path, 'mode' => '100644', 'type' => 'blob', 'sha' => $sha];
+    for ($attempt = 0; $attempt < 2; $attempt++) {
+        $treeBody = ['tree' => $entries]; if ($state['baseTree'] !== '') $treeBody['base_tree'] = $state['baseTree'];
+        list($c, $d, $e) = cmsGhApi('POST', cmsGhBase() . '/repos/' . $repo . '/git/trees', $token, $treeBody, 90);
+        if ($c !== 201 || empty($d['sha'])) return ['ok' => false, 'error' => cmsGhExplain('GitHub could not build the tree', $c, $d, $e)];
+        list($c2, $d2, $e2) = cmsGhApi('POST', cmsGhBase() . '/repos/' . $repo . '/git/commits', $token, ['message' => cmsGhSkipCi($message), 'tree' => (string)$d['sha'], 'parents' => [$state['head']]], 60);
+        if ($c2 !== 201 || empty($d2['sha'])) return ['ok' => false, 'error' => cmsGhExplain('GitHub could not create the commit', $c2, $d2, $e2)];
+        list($c3, $d3, $e3) = cmsGhApi('PATCH', cmsGhBase() . '/repos/' . $repo . '/git/refs/heads/' . rawurlencode($branch), $token, ['sha' => (string)$d2['sha'], 'force' => false], 30);
+        if ($c3 >= 200 && $c3 < 300) return ['ok' => true, 'sha' => (string)$d2['sha'], 'count' => count($entries) + $extra];
+        if (($c3 === 422 || $c3 === 409) && $attempt === 0) {
+            $h = cmsGhHead($repo, $branch, $token);
+            if (isset($h['error']) || !empty($h['empty'])) return ['ok' => false, 'error' => $h['error'] ?? 'the branch disappeared while syncing'];
+            $state['head'] = $h['sha']; $state['baseTree'] = $h['tree'];
+            continue;
+        }
+        return ['ok' => false, 'error' => cmsGhExplain('GitHub refused to move the branch', $c3, $d3, $e3)];
+    }
+    return ['ok' => false, 'error' => 'GitHub kept moving the branch while the sync ran — try again'];
+}
+// Settings → "Test Connection" (admin+): who the token is, whether it sees the
+// repo, and when it expires. The token itself never leaves the server.
+function fourgeApiGhTest($me, $body) {
+    if (fourgeLevel($me) < 2) { http_response_code(403); echo json_encode(['ok' => false, 'error' => 'Admin access required']); return; }
+    list($repo, $branch, $token) = cmsGhMirrorCfg();
+    if ($token === '') { echo json_encode(['ok' => false, 'reason' => 'no_token', 'error' => 'No GitHub token is saved yet.']); return; }
+    if ($repo === '' || !preg_match('~^[\w.-]+/[\w.-]+$~', $repo)) { echo json_encode(['ok' => false, 'reason' => 'no_repo', 'error' => 'No repository is configured (owner/name).']); return; }
+    list($c, $d, $e) = cmsGhApi('GET', cmsGhBase() . '/user', $token);
+    if ($c !== 200) { echo json_encode(['ok' => false, 'reason' => cmsGhReason($c), 'error' => cmsGhExplain('Token check failed', $c, $d, $e)]); return; }
+    $login = (string)($d['login'] ?? '');
+    $p = cmsGhProbe($repo, $token);
+    if (empty($p['ok'])) { echo json_encode(['ok' => false, 'reason' => $p['reason'], 'error' => $p['error'], 'login' => $login, 'expires' => $p['expires'] ?? '']); return; }
+    echo json_encode(['ok' => true, 'login' => $login, 'repo' => $p['fullName'], 'branch' => $branch, 'private' => $p['private'], 'canPush' => $p['canPush'], 'expires' => $p['expires'], 'scopes' => $p['scopes']]);
+}
+// Push EVERY site file to the repo in ONE commit, staged in time-boxed batches:
+// the client calls with {offset, run} and keeps calling while `next` isn't
+// null; the final batch commits. Counts in every response are cumulative for
+// the run. Admin+ only, like gh_set_private.
+// Response: {ok,run,repo,total,done,next,staged,pushed,upToDate,failed,skipped,errors,commit,tokenExpires}.
+// The admin shows `repo` on its Settings line: a Super Admin's browser never
+// holds the Repository Override, so the server says which repo it synced to.
+function fourgeApiGhSyncAll($me, $body) {
+    if (fourgeLevel($me) < 2) { http_response_code(403); echo json_encode(['ok' => false, 'error' => 'Admin access required']); return; }
+    $cfg = cmsGhMirrorCfg(); list($repo, $branch, $token) = $cfg;
+    if ($repo === '' || !preg_match('~^[\w.-]+/[\w.-]+$~', $repo)) { echo json_encode(['ok' => false, 'reason' => 'no_repo']); return; }
+    if ($token === '') { echo json_encode(['ok' => false, 'reason' => 'no_token']); return; }
+    @set_time_limit(90);
+    $files  = cmsGhListSiteFiles(); $total = count($files);
+    $offset = max(0, (int)($body['offset'] ?? 0));
+    $limit  = min(100, max(1, (int)($body['batch'] ?? 50)));
+    $budget = 18.0; $t0 = microtime(true);
+    if ($offset === 0) {
+        // One look at the repo first: a rejected token stops here, with the reason — not once per file.
+        $probe = cmsGhProbe($repo, $token);
+        if (empty($probe['ok'])) { cmsGhSyncStateClear(); echo json_encode(['ok' => false, 'reason' => $probe['reason'], 'error' => $probe['error'], 'repo' => $repo, 'tokenExpires' => $probe['expires'] ?? '']); return; }
+        $head = cmsGhHead($repo, $branch, $token);
+        if (isset($head['error'])) { cmsGhSyncStateClear(); echo json_encode(['ok' => false, 'reason' => 'github', 'error' => $head['error']]); return; }
+        $remote = !empty($head['empty']) ? [] : cmsGhFetchTree($repo, $branch, $token);
+        if ($remote === null) { cmsGhSyncStateClear(); echo json_encode(['ok' => false, 'reason' => cmsGhReason(cmsGhLast()['code']), 'error' => cmsGhExplain('GitHub could not list the repository, so nothing was pushed')]); return; }
+        $state = ['run' => bin2hex(random_bytes(6)), 'repo' => $repo, 'branch' => $branch, 'head' => (string)($head['sha'] ?? ''), 'baseTree' => (string)($head['tree'] ?? ''), 'empty' => !empty($head['empty']),
+                  'remote' => $remote, 'blobs' => [], 'upToDate' => 0, 'skipped' => 0, 'failed' => 0, 'errors' => [], 'started' => time(), 'tokenExpires' => (string)($probe['expires'] ?? '')];
+    } else {
+        $state = cmsGhSyncStateRead();
+        if (!$state || (string)($body['run'] ?? '') !== (string)($state['run'] ?? '') || ($state['repo'] ?? '') !== $repo) {
+            echo json_encode(['ok' => false, 'reason' => 'restart', 'error' => 'This sync run has expired — start it again from the beginning.']); return;
+        }
+    }
+    $max = cmsGhMaxBytes(); $i = $offset; $fatal = null;
+    for (; $i < $total && $i < $offset + $limit; $i++) {
+        if ($i > $offset && (microtime(true) - $t0) > $budget) break;   // the client continues from `next`
+        $rel  = $files[$i];
+        $size = @filesize(PUBLIC_HTML . '/' . $rel);
+        if ($size === false) { $state['skipped']++; continue; }
+        if ($size > $max) { $state['skipped']++; if (count($state['errors']) < 12) $state['errors'][] = $rel . ': too big to mirror (' . round($size / 1048576, 1) . ' MB)'; continue; }
+        $bytes = @file_get_contents(PUBLIC_HTML . '/' . $rel);
+        if ($bytes === false) { $state['skipped']++; continue; }
+        if (($state['remote'][$rel] ?? '') === cmsGhBlobSha($bytes)) { $state['upToDate']++; continue; }
+        $r = cmsGhCreateBlob($repo, $token, $bytes);
+        unset($bytes);
+        if (is_array($r)) {
+            $state['failed']++; if (count($state['errors']) < 12) $state['errors'][] = $rel . ': ' . $r['error'];
+            if (in_array($r['reason'], ['bad_token', 'rate_limit', 'network'], true)) { $fatal = $r; $i++; break; }   // no point trying the next file
+            continue;
+        }
+        $state['blobs'][$rel] = $r;
+    }
+    $next = ($fatal === null && $i < $total) ? $i : null;
+    $commit = null; $pushed = 0;
+    if ($next === null && $fatal === null && $state['blobs']) {
+        $res = cmsGhCommitStaged($repo, $branch, $token, $state, 'Fourge: sync ' . count($state['blobs']) . ' file' . (count($state['blobs']) === 1 ? '' : 's') . ' to GitHub');
+        if (!empty($res['ok'])) { $commit = (string)$res['sha']; $pushed = (int)$res['count']; }
+        else { $state['failed'] += count($state['blobs']); array_unshift($state['errors'], 'Commit: ' . ($res['error'] ?? 'GitHub refused the commit')); $state['errors'] = array_slice($state['errors'], 0, 12); }
+    }
+    if ($next === null) cmsGhSyncStateClear();
+    elseif (!cmsGhSyncStateWrite($state)) {
+        // Without the staged list the next batch cannot continue; say so rather than letting the client restart forever.
+        echo json_encode(['ok' => false, 'reason' => 'state', 'error' => 'The sync could not save its progress (admin/gh-sync-state.php is not writable), so the ' . count($state['blobs']) . ' file(s) staged so far were not committed. Make admin/ writable and run it again.']); return;
+    }
+    echo json_encode(['ok' => true, 'run' => $state['run'], 'repo' => $repo, 'total' => $total, 'done' => $i, 'next' => $next,
+                      'staged' => $commit !== null ? 0 : count($state['blobs']), 'pushed' => $pushed, 'upToDate' => $state['upToDate'], 'failed' => $state['failed'], 'skipped' => $state['skipped'],
+                      'errors' => $state['errors'], 'commit' => $commit, 'tokenExpires' => $state['tokenExpires'] ?? '',
+                      'fatal' => $fatal ? ['reason' => $fatal['reason'], 'error' => $fatal['error']] : null]);
+}
+
+// ── EVERY SAVE MIRRORS ───────────────────────────────────────────────────────
+// Server-side writers (the .htaccess blocks, the page gate, synced blog media,
+// reviews, SEO stamps, robots/llms, package data) used to write straight to
+// disk and reach GitHub only through the daily backfill. They go through here
+// now: write, then mirror when the bytes actually changed — within a 20 s
+// budget per request, so a slow GitHub can never stall a sign-in or a save;
+// whatever is left over is picked up by the next backfill. Returns exactly what
+// file_put_contents would (bytes written, or false), and a mirror problem never
+// fails the write.
+function fourgeSitePut($abs, $bytes, $msg = '') {
+    $bytes = (string)$bytes;
+    $prev = is_file($abs) ? @file_get_contents($abs) : null;
+    $r = @file_put_contents($abs, $bytes);
+    if ($r === false) return false;
+    if ($prev === $bytes) return $r;
+    fourgeMirrorLater($abs, $bytes, $msg);
+    return $r;
+}
+function fourgeMirrorLater($abs, $bytes, $msg = '') {
+    static $spent = 0.0;
+    if ($spent > 20.0) return ['ok' => false, 'reason' => 'deferred'];
+    $t = microtime(true);
+    try {
+        $rel = cmsGhRelPath($abs);
+        if (!cmsGhShouldMirror($rel)) return ['ok' => false, 'reason' => 'excluded'];
+        $res = cmsGhMirrorBytes($rel, $bytes, $msg !== '' ? $msg . ' (' . $rel . ')' : 'Fourge: update ' . $rel);
+    } catch (Throwable $e) { $res = ['ok' => false, 'reason' => 'error', 'error' => $e->getMessage()]; }
+    $spent += microtime(true) - $t;
+    return $res;
+}
+
+// Validate token + location with a lightweight read. Returns [bool ok, string message].
+function cmsGhlTest($token, $locationId) {
+    $ch = curl_init(GHL_API_BASE . '/contacts/?locationId=' . rawurlencode($locationId) . '&limit=1');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => ['Authorization: Bearer ' . $token, 'Version: ' . GHL_API_VERSION, 'Accept: application/json'],
+        CURLOPT_SSL_VERIFYPEER => true, CURLOPT_TIMEOUT => 12,
+    ]);
+    $res = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); $err = curl_error($ch); fourgeCurlClose($ch);
+    if ($err)        return [false, 'Could not reach the lead connection: ' . $err];
+    if ($code === 200) return [true, 'Connected — leads will flow in.'];
+    if ($code === 401) return [false, 'Token rejected (401) — double-check the Private Integration Token.'];
+    if ($code === 403) return [false, 'Access denied (403) — the token likely needs the Contacts scope, or the Location ID is wrong.'];
+    if ($code === 404) return [false, 'Not found (404) — check the Location ID.'];
+    return [false, 'The lead connection returned HTTP ' . $code];
+}
+
+function fourgeApiGhlTest($me, $body) {
+    if (fourgeLevel($me) < 3) { http_response_code(403); echo json_encode(['error' => 'Super Admin access required']); return; }
+    $token = trim((string)($body['token'] ?? ''));
+    if ($token === '') { try { $token = (string)fourgeGetSecret(fourgeDb(), 'ghl_token'); } catch (Throwable $e) {} }
+    $loc = trim((string)($body['locationId'] ?? ''));
+    if ($token === '' || $loc === '') { echo json_encode(['ok' => false, 'message' => 'Enter the token and Location ID first.']); return; }
+    list($ok, $msg) = cmsGhlTest($token, $loc);
+    echo json_encode(['ok' => $ok, 'message' => $msg]);
+}
+
+// Fetch recent leads + conversations for the Lead Generation dashboard. Normalizes
+// GHL's fields defensively so a shape change degrades gracefully rather than breaking.
+function cmsGhlDashboard($token, $locationId) {
+    $hdr = ['Authorization: Bearer ' . $token, 'Version: ' . GHL_API_VERSION, 'Accept: application/json'];
+    $get = function ($url) use ($hdr) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_HTTPHEADER => $hdr, CURLOPT_SSL_VERIFYPEER => true, CURLOPT_TIMEOUT => 15]);
+        $res = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); fourgeCurlClose($ch);
+        if ($code < 200 || $code >= 300 || !$res) return null;
+        return json_decode($res, true);
+    };
+    $out = ['contacts' => [], 'conversations' => [], 'total' => 0, 'error' => ''];
+    $cd = $get(GHL_API_BASE . '/contacts/?locationId=' . rawurlencode($locationId) . '&limit=25');
+    if ($cd === null) { $out['error'] = 'Could not load leads — check the connection in Plugins.'; return $out; }
+    foreach (($cd['contacts'] ?? []) as $c) {
+        $name = trim(($c['firstName'] ?? '') . ' ' . ($c['lastName'] ?? ''));
+        if ($name === '') $name = $c['contactName'] ?? ($c['name'] ?? '');
+        $out['contacts'][] = [
+            'id' => $c['id'] ?? '', 'name' => $name, 'email' => $c['email'] ?? '', 'phone' => $c['phone'] ?? '',
+            'source' => $c['source'] ?? '', 'tags' => $c['tags'] ?? [], 'date' => $c['dateAdded'] ?? ($c['dateUpdated'] ?? ''),
+        ];
+    }
+    $out['total'] = $cd['meta']['total'] ?? ($cd['total'] ?? count($out['contacts']));
+    $vd = $get(GHL_API_BASE . '/conversations/search?locationId=' . rawurlencode($locationId) . '&limit=25');   // best-effort
+    if (is_array($vd)) {
+        foreach (($vd['conversations'] ?? []) as $v) {
+            $out['conversations'][] = [
+                'id' => $v['id'] ?? '', 'name' => $v['fullName'] ?? ($v['contactName'] ?? ($v['email'] ?? '')),
+                'last' => $v['lastMessageBody'] ?? ($v['lastMessage'] ?? ''), 'type' => $v['lastMessageType'] ?? ($v['type'] ?? ''),
+                'date' => $v['lastMessageDate'] ?? ($v['dateUpdated'] ?? ''),
+                'contactId' => $v['contactId'] ?? '',
+            ];
+        }
+    }
+    return $out;
+}
+
+// Dashboard data — any signed-in user may view, but only when GHL is enabled.
+function fourgeApiGhlDashboard($me, $body) {
+    $cfg = cmsGhlConfig();
+    if (!$cfg) { echo json_encode(['ok' => false, 'error' => 'Lead Generation isn\'t set up yet.']); return; }
+    $d = cmsGhlDashboard($cfg['token'], $cfg['locationId']);
+    echo json_encode(['ok' => empty($d['error']), 'contacts' => $d['contacts'], 'conversations' => $d['conversations'], 'total' => $d['total'], 'error' => $d['error']]);
+}
+
+// Map a conversation's raw channel/type to the send-message API's `type` enum.
+function cmsGhlSendType($raw) {
+    $t = strtoupper((string)$raw);
+    if (strpos($t, 'LIVE') !== false || strpos($t, 'CHAT') !== false || strpos($t, 'WEBCHAT') !== false) return 'Live_Chat';
+    if (strpos($t, 'EMAIL') !== false) return 'Email';
+    if (strpos($t, 'WHATSAPP') !== false) return 'WhatsApp';
+    if (strpos($t, 'INSTAGRAM') !== false || strpos($t, '_IG') !== false) return 'IG';
+    if (strpos($t, 'FACEBOOK') !== false || strpos($t, '_FB') !== false || strpos($t, 'MESSENGER') !== false) return 'FB';
+    return 'SMS';   // safe default for phone-based threads
+}
+
+// Fetch the message thread for one conversation, normalized into a flat list
+// (oldest-first) the chat UI can render. GHL nests messages one level deep and
+// returns newest-first, both handled here.
+function cmsGhlMessages($token, $conversationId) {
+    $hdr = ['Authorization: Bearer ' . $token, 'Version: ' . GHL_API_VERSION, 'Accept: application/json'];
+    $ch = curl_init(GHL_API_BASE . '/conversations/' . rawurlencode($conversationId) . '/messages?limit=100');
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_HTTPHEADER => $hdr, CURLOPT_SSL_VERIFYPEER => true, CURLOPT_TIMEOUT => 15]);
+    $res = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); $err = curl_error($ch); fourgeCurlClose($ch);
+    if ($err) return [null, 'Could not reach the lead connection: ' . $err];
+    $j = json_decode($res, true);
+    if ($code < 200 || $code >= 300) {
+        $m = is_array($j) ? ($j['message'] ?? ($j['msg'] ?? '')) : '';
+        if (is_array($m)) $m = implode('; ', $m);
+        return [null, 'The lead connection returned HTTP ' . $code . ($m ? ': ' . $m : '')];
+    }
+    return [cmsGhlParseMessages($j), ''];
+}
+
+// PURE (no network): normalize a GHL messages response into a flat, oldest-first
+// list. Handles the nested { messages: { messages: [...] } } and flat
+// { messages: [...] } shapes, and GHL's newest-first ordering.
+function cmsGhlParseMessages($j) {
+    $rawList = [];
+    if (isset($j['messages']['messages']) && is_array($j['messages']['messages'])) $rawList = $j['messages']['messages'];
+    elseif (isset($j['messages']) && is_array($j['messages'])) $rawList = $j['messages'];
+    $msgs = [];
+    foreach ($rawList as $m) {
+        if (!is_array($m)) continue;
+        $dir = strtolower((string)($m['direction'] ?? ''));
+        $att = (isset($m['attachments']) && is_array($m['attachments'])) ? array_values(array_filter(array_map('strval', $m['attachments']), 'strlen')) : [];
+        $msgs[] = [
+            'id'      => $m['id'] ?? '',
+            'body'    => (string)($m['body'] ?? ($m['message'] ?? '')),
+            'inbound' => ($dir === 'inbound'),
+            'type'    => $m['messageType'] ?? ($m['type'] ?? ''),
+            'date'    => $m['dateAdded'] ?? ($m['dateUpdated'] ?? ''),
+            'attachments' => $att,
+        ];
+    }
+    usort($msgs, function ($a, $b) { return strcmp((string)$a['date'], (string)$b['date']); });   // oldest → newest
+    return $msgs;
+}
+
+// Send an outbound reply. Best-effort; returns GHL's error verbatim so a
+// channel/permission problem is visible in the UI. Sends to the contact on the
+// conversation's channel (GHL routes it into the existing thread).
+function cmsGhlSendMessage($token, $contactId, $rawType, $text) {
+    $type = cmsGhlSendType($rawType);
+    $payload = json_encode(['type' => $type, 'contactId' => $contactId, 'message' => $text]);
+    $hdr = ['Authorization: Bearer ' . $token, 'Version: ' . GHL_API_VERSION, 'Content-Type: application/json', 'Accept: application/json'];
+    $ch = curl_init(GHL_API_BASE . '/conversations/messages');
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_POSTFIELDS => $payload, CURLOPT_HTTPHEADER => $hdr, CURLOPT_SSL_VERIFYPEER => true, CURLOPT_TIMEOUT => 15]);
+    $res = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); $err = curl_error($ch); fourgeCurlClose($ch);
+    if ($err) return [false, 'Could not reach the lead connection: ' . $err, $type];
+    if ($code >= 200 && $code < 300) return [true, '', $type];
+    $j = json_decode($res, true);
+    $m = is_array($j) ? ($j['message'] ?? ($j['msg'] ?? '')) : '';
+    if (is_array($m)) $m = implode('; ', $m);
+    return [false, 'Message not sent (' . $code . ')' . ($m ? ': ' . $m : ''), $type];
+}
+
+// Conversation thread + reply — any signed-in user (the module is team-facing),
+// but only when Lead Generation is enabled. The token stays on the server.
+function fourgeApiGhlMessages($me, $body) {
+    $cfg = cmsGhlConfig();
+    if (!$cfg) { echo json_encode(['ok' => false, 'error' => 'Lead Generation isn\'t set up yet.']); return; }
+    $cid = trim((string)($body['conversationId'] ?? ''));
+    if ($cid === '') { echo json_encode(['ok' => false, 'error' => 'Missing conversation id.']); return; }
+    list($msgs, $err) = cmsGhlMessages($cfg['token'], $cid);
+    if ($msgs === null) { echo json_encode(['ok' => false, 'error' => $err]); return; }
+    echo json_encode(['ok' => true, 'messages' => $msgs]);
+}
+
+function fourgeApiGhlSend($me, $body) {
+    $cfg = cmsGhlConfig();
+    if (!$cfg) { echo json_encode(['ok' => false, 'error' => 'Lead Generation isn\'t set up yet.']); return; }
+    $contactId = trim((string)($body['contactId'] ?? ''));
+    $text      = trim((string)($body['message'] ?? ''));
+    if ($contactId === '' || $text === '') { echo json_encode(['ok' => false, 'error' => 'Nothing to send.']); return; }
+    list($ok, $err, $type) = cmsGhlSendMessage($cfg['token'], $contactId, (string)($body['type'] ?? ''), $text);
+    echo json_encode(['ok' => $ok, 'error' => $err, 'channel' => $type]);
+}
+
+// ── FOURGE CHAT ──────────────────────────────────────────────────────────────
+// The site's own chat widget (/fourge-chat.js), answered by the CRM's
+// Conversation AI bot. Visitors only ever talk to this file; this file talks
+// to GoHighLevel with the Private Integration Token from Plugins → Lead
+// Generation, so the token never reaches a browser and GoHighLevel sees an
+// ordinary contact with an ordinary Live Chat conversation that its bot
+// answers and the team can take over. The widget's look, texts and on/off
+// switch live in data/chat.json (public — the widget reads it); a visitor's
+// chat is a random id handed out by chat_start and kept here only as a hash,
+// next to the contact and conversation it belongs to. Spam and AI cost are
+// held off by limits per chat, per address and per site, a hidden honeypot
+// field, and reCAPTCHA when the page already carries it.
+
+// Where GoHighLevel lives. FOURGE_GHL_API_BASE points the tests at a stub.
+function cmsGhlBase() { $b = getenv('FOURGE_GHL_API_BASE'); return ($b && preg_match('~^https?://~', $b)) ? rtrim($b, '/') : GHL_API_BASE; }
+
+// One request to GoHighLevel. Returns [HTTP status (0 = unreachable), decoded JSON or null, transport error].
+function cmsGhlReq($token, $method, $path, $payload = null, $version = '2021-04-15', $timeout = 15) {
+    $hdr = ['Authorization: Bearer ' . $token, 'Version: ' . $version, 'Accept: application/json'];
+    $opts = [CURLOPT_RETURNTRANSFER => true, CURLOPT_CUSTOMREQUEST => $method, CURLOPT_SSL_VERIFYPEER => true, CURLOPT_TIMEOUT => $timeout, CURLOPT_CONNECTTIMEOUT => 8];
+    if ($payload !== null) { $hdr[] = 'Content-Type: application/json'; $opts[CURLOPT_POSTFIELDS] = json_encode($payload); }
+    $opts[CURLOPT_HTTPHEADER] = $hdr;
+    $ch = curl_init(cmsGhlBase() . $path);
+    curl_setopt_array($ch, $opts);
+    $res = curl_exec($ch); $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE); $err = (string)curl_error($ch); fourgeCurlClose($ch);
+    if ($res === false || $err !== '') return [0, null, $err !== '' ? $err : 'no response'];
+    $j = json_decode((string)$res, true);
+    return [$code, is_array($j) ? $j : null, ''];
+}
+// GoHighLevel's own words for a failed call — shown to admins, never to visitors.
+function cmsGhlErrText($code, $j, $err = '') {
+    if ((int)$code === 0) return 'could not reach the CRM' . ($err !== '' ? ' (' . $err . ')' : '');
+    $m = is_array($j) ? ($j['message'] ?? ($j['msg'] ?? ($j['error'] ?? ''))) : '';
+    if (is_array($m)) $m = implode('; ', array_map('strval', $m));
+    return 'HTTP ' . (int)$code . ($m !== '' ? ': ' . $m : '');
+}
+// Conversation AI is documented under Version 2021-04-15 and under v3: ask with
+// the first and fall back to v3 when GoHighLevel objects to the version.
+function cmsGhlAiReq($token, $method, $path, $payload = null) {
+    $r = cmsGhlReq($token, $method, $path, $payload, '2021-04-15');
+    if ($r[0] === 404 || (in_array($r[0], [400, 401, 422], true) && stripos((string)json_encode($r[1]), 'version') !== false)) {
+        $r = cmsGhlReq($token, $method, $path, $payload, 'v3');
+    }
+    return $r;
+}
+// A token without the right scopes fails with 401/403 — say which scope.
+function cmsChatScopeHint($errText) {
+    return preg_match('~^HTTP 40[13]~', (string)$errText) ? ' — the token probably needs more scopes (Contacts, Conversations, Conversation Messages and Conversation AI, view + edit).' : '';
+}
+
+function cmsChatSettings() {
+    $j = json_decode((string)@file_get_contents(__DIR__ . '/../data/chat.json'), true);
+    return is_array($j) ? $j : [];
+}
+// The server owns a few keys of data/chat.json (agentId, providerId): merge them in.
+function cmsChatSaveSettings($patch) {
+    $cur = cmsChatSettings();
+    foreach ($patch as $k => $v) $cur[$k] = $v;
+    return fourgeSitePut(__DIR__ . '/../data/chat.json', json_encode($cur, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), 'Fourge: chat settings') !== false;
+}
+// The CRM token + Location ID from Plugins → Lead Generation. Chat needs the
+// connection, not the "send form leads" switch, so that switch isn't checked.
+function cmsChatGhl() {
+    $site = json_decode((string)@file_get_contents(__DIR__ . '/../data/site.json'), true);
+    $loc = is_array($site) ? trim((string)($site['ghl']['locationId'] ?? '')) : '';
+    $token = '';
+    try { $token = (string)fourgeGetSecret(fourgeDb(), 'ghl_token'); } catch (Throwable $e) { $token = ''; }
+    if ($loc === '' || $token === '') return null;
+    return ['token' => $token, 'locationId' => $loc];
+}
+
+// Chat sessions, rate-limit counters and a short cache of each thread, next to
+// the users and secrets (the database file is never served over HTTP).
+function fourgeChatDb() {
+    static $ready = false;
+    $pdo = fourgeDb();
+    if (!$ready) {
+        $pdo->exec("CREATE TABLE IF NOT EXISTS chat_sessions (sid_hash TEXT PRIMARY KEY, contact_id TEXT NOT NULL, conversation_id TEXT NOT NULL, created_at INTEGER NOT NULL, last_active INTEGER NOT NULL, sent INTEGER NOT NULL DEFAULT 0, hidden TEXT)");
+        $pdo->exec("CREATE TABLE IF NOT EXISTS chat_limits (k TEXT PRIMARY KEY, exp INTEGER NOT NULL, n INTEGER NOT NULL)");
+        $pdo->exec("CREATE TABLE IF NOT EXISTS chat_cache (conversation_id TEXT PRIMARY KEY, at REAL NOT NULL, body TEXT NOT NULL)");
+        $ready = true;
+        if (mt_rand(1, 50) === 1) {   // now and then, clear out what has expired
+            $now = time();
+            $pdo->prepare("DELETE FROM chat_limits WHERE exp < ?")->execute([$now]);
+            $pdo->prepare("DELETE FROM chat_sessions WHERE last_active < ?")->execute([$now - 30 * 86400]);
+            $pdo->prepare("DELETE FROM chat_cache WHERE at < ?")->execute([$now - 600]);
+        }
+    }
+    return $pdo;
+}
+// Counts one hit against $key and says whether it is still within $max for the
+// current $secs window. No UPSERT, so it runs on the old SQLite some hosts ship.
+function fourgeChatAllow($pdo, $key, $max, $secs) {
+    $now = time(); $k = $key . '/' . (int)$secs;
+    $pdo->prepare("INSERT OR IGNORE INTO chat_limits (k, exp, n) VALUES (?, ?, 0)")->execute([$k, $now + $secs]);
+    $pdo->prepare("UPDATE chat_limits SET n = CASE WHEN exp > ? THEN n + 1 ELSE 1 END, exp = CASE WHEN exp > ? THEN exp ELSE ? END WHERE k = ?")->execute([$now, $now, $now + $secs, $k]);
+    $st = $pdo->prepare("SELECT n FROM chat_limits WHERE k = ?"); $st->execute([$k]);
+    return (int)$st->fetchColumn() <= $max;
+}
+function fourgeChatClientKey() { return substr(hash('sha256', 'chat-ip|' . (string)($_SERVER['REMOTE_ADDR'] ?? '')), 0, 32); }
+function fourgeChatSession($pdo, $sid) {
+    $sid = (string)$sid;
+    if (!preg_match('/^[a-f0-9]{32}$/', $sid)) return null;
+    $st = $pdo->prepare("SELECT * FROM chat_sessions WHERE sid_hash = ?");
+    $st->execute([hash('sha256', $sid)]);
+    $row = $st->fetch();
+    if (!$row || (int)$row['last_active'] < time() - 7 * 86400) return null;   // a week of silence ends a chat
+    return $row;
+}
+// Visitor text: valid UTF-8, no control characters (newlines and tabs stay), trimmed, capped.
+function fourgeChatText($s, $max) {
+    $s = is_scalar($s) ? (string)$s : '';
+    if (function_exists('mb_check_encoding') && !mb_check_encoding($s, 'UTF-8')) return '';
+    $s = trim((string)preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', '', $s));
+    return function_exists('mb_substr') ? mb_substr($s, 0, $max, 'UTF-8') : substr($s, 0, $max);
+}
+function fourgeChatOut($code, $arr) { if ((int)$code !== 200) http_response_code((int)$code); echo json_encode($arr); }
+// Public chat calls need the chat switched on and the CRM connected.
+function fourgeChatReady() {
+    $cfg = cmsChatSettings();
+    if (empty($cfg['enabled'])) { fourgeChatOut(404, ['ok' => false, 'error' => 'Chat is not available on this site.']); return null; }
+    $ghl = cmsChatGhl();
+    if (!$ghl) { fourgeChatOut(503, ['ok' => false, 'error' => 'Chat is not available right now. Please try again later.']); return null; }
+    return [$cfg, $ghl];
+}
+
+// Find or create the visitor's contact (by email), tagged "website chat".
+function cmsChatContact($ghl, $name, $email, $phone) {
+    $parts = preg_split('/\s+/', trim((string)$name), 2);
+    $c = ['locationId' => $ghl['locationId'], 'firstName' => (string)($parts[0] ?? ''), 'lastName' => (string)($parts[1] ?? ''), 'email' => $email, 'source' => 'Website chat'];
+    if ($phone !== '') $c['phone'] = $phone;
+    list($code, $j, $err) = cmsGhlReq($ghl['token'], 'POST', '/contacts/upsert', $c, GHL_API_VERSION);
+    $id = is_array($j) ? (string)($j['contact']['id'] ?? ($j['id'] ?? '')) : '';
+    if ($code < 200 || $code >= 300 || $id === '') return [null, cmsGhlErrText($code, $j, $err)];
+    // Added separately: tags sent with an upsert can replace the contact's existing ones.
+    cmsGhlReq($ghl['token'], 'POST', '/contacts/' . rawurlencode($id) . '/tags', ['tags' => ['website chat']], GHL_API_VERSION, 6);
+    return [$id, ''];
+}
+// The contact's conversation — found, or created. A search hit is used only
+// when it really is this contact's: a message must never land in someone else's.
+function cmsChatConversation($ghl, $contactId) {
+    list($code, $j) = cmsGhlReq($ghl['token'], 'GET', '/conversations/search?locationId=' . rawurlencode($ghl['locationId']) . '&contactId=' . rawurlencode($contactId) . '&limit=5');
+    if ($code >= 200 && $code < 300 && is_array($j)) {
+        foreach ((array)($j['conversations'] ?? []) as $c) {
+            if (is_array($c) && !empty($c['id']) && (string)($c['contactId'] ?? '') === (string)$contactId) return [(string)$c['id'], ''];
+        }
+    }
+    list($code, $j, $err) = cmsGhlReq($ghl['token'], 'POST', '/conversations/', ['locationId' => $ghl['locationId'], 'contactId' => $contactId]);
+    $id = is_array($j) ? (string)($j['conversation']['id'] ?? ($j['id'] ?? ($j['conversationId'] ?? ''))) : '';
+    if ($id !== '' && (($code >= 200 && $code < 300) || isset($j['conversationId']))) return [$id, ''];
+    return [null, cmsGhlErrText($code, $j, $err)];
+}
+// Hand one visitor message to GoHighLevel as an inbound chat message — the
+// same thing its own chat widget produces, so its bot and team can answer it.
+function cmsChatPostInbound($ghl, $cfg, $conversationId, $contactId, $text) {
+    $custom = (($cfg['route'] ?? '') === 'custom');
+    $p = ['type' => $custom ? 'Custom' : 'Live_Chat', 'conversationId' => $conversationId, 'contactId' => $contactId, 'message' => $text, 'direction' => 'inbound'];
+    $prov = trim((string)($cfg['providerId'] ?? ''));
+    if ($prov !== '') $p['conversationProviderId'] = $prov;
+    list($code, $j, $err) = cmsGhlReq($ghl['token'], 'POST', '/conversations/messages/inbound', $p);
+    if ($code >= 200 && $code < 300) return [true, is_array($j) ? (string)($j['messageId'] ?? '') : '', ''];
+    return [false, '', cmsGhlErrText($code, $j, $err)];
+}
+// PURE: the messages a visitor may see, shaped for the widget — chat messages
+// only (never the contact's texts or emails on other channels), and only what
+// arrived after this chat began, so typing in someone else's email address
+// shows nothing of that person's history. "After" is decided by the message
+// ids the conversation already held when the chat started ($hidden), not by
+// comparing this server's clock with the CRM's; the time check is only a
+// backstop (tight when no snapshot could be taken).
+function cmsChatVisible($list, $since, $custom = false, $hidden = null) {
+    $out = [];
+    $skip = is_array($hidden) ? array_flip(array_map('strval', $hidden)) : null;
+    $grace = is_array($hidden) ? 600 : 10;
+    foreach ((array)$list as $m) {
+        if (!is_array($m)) continue;
+        if ($skip !== null && isset($skip[(string)($m['id'] ?? '')])) continue;
+        $type = strtoupper((string)($m['type'] ?? ''));
+        $isChat = $custom ? (strpos($type, 'CUSTOM') !== false) : (strpos($type, 'CHAT') !== false);
+        if (!$isChat || strpos($type, 'INFO') !== false || strpos($type, 'ACTIVITY') !== false) continue;
+        $ts = strtotime((string)($m['date'] ?? ''));
+        if ($ts === false || $ts < (int)$since - $grace) continue;
+        $text = trim((string)($m['body'] ?? ''));
+        $files = array_values(array_filter((array)($m['attachments'] ?? []), function ($u) { return is_string($u) && preg_match('~^https://~i', $u); }));
+        if ($text === '' && !$files) continue;
+        $out[] = ['id' => (string)($m['id'] ?? ''), 'from' => !empty($m['inbound']) ? 'visitor' : 'agent', 'text' => $text, 'files' => $files, 'at' => gmdate('c', $ts)];
+    }
+    return $out;
+}
+// The visitor's thread, read through a 3-second cache so a page of open chats
+// polling at once can't run the CRM's rate limit dry.
+function cmsChatThread($pdo, $ghl, $cfg, $sess) {
+    $cid = (string)$sess['conversation_id'];
+    $list = null;
+    $st = $pdo->prepare("SELECT at, body FROM chat_cache WHERE conversation_id = ?"); $st->execute([$cid]);
+    $row = $st->fetch();
+    if ($row && (float)$row['at'] > microtime(true) - 3.0) $list = json_decode((string)$row['body'], true);
+    if (!is_array($list)) {
+        list($code, $j, $err) = cmsGhlReq($ghl['token'], 'GET', '/conversations/' . rawurlencode($cid) . '/messages?limit=50');
+        if ($code < 200 || $code >= 300 || !is_array($j)) return [null, cmsGhlErrText($code, $j, $err)];
+        $list = cmsGhlParseMessages($j);
+        $pdo->prepare("INSERT OR REPLACE INTO chat_cache (conversation_id, at, body) VALUES (?, ?, ?)")->execute([$cid, microtime(true), json_encode($list)]);
+    }
+    $hidden = isset($sess['hidden']) && $sess['hidden'] !== null ? json_decode((string)$sess['hidden'], true) : null;
+    return [cmsChatVisible($list, (int)$sess['created_at'], ($cfg['route'] ?? '') === 'custom', is_array($hidden) ? $hidden : null), ''];
+}
+
+// Public: start a chat — name and email in, a chat id out.
+function fourgeApiChatStart($body) {
+    $r = fourgeChatReady(); if (!$r) return; list($cfg, $ghl) = $r;
+    $pdo = fourgeChatDb();
+    $ip = fourgeChatClientKey();
+    if (!fourgeChatAllow($pdo, 'start:ip:' . $ip, 6, 600) || !fourgeChatAllow($pdo, 'start:ip:' . $ip, 20, 86400) || !fourgeChatAllow($pdo, 'start:site', 120, 3600)) {
+        fourgeChatOut(429, ['ok' => false, 'error' => 'Too many new chats from here. Please try again in a little while.']); return;
+    }
+    if (trim((string)($body['website'] ?? '')) !== '') { fourgeChatOut(400, ['ok' => false, 'error' => 'The chat could not start.']); return; }   // honeypot: a field people never see
+    $name  = fourgeChatText($body['name'] ?? '', 80);
+    $email = strtolower(fourgeChatText($body['email'] ?? '', 160));
+    $phone = fourgeChatText($body['phone'] ?? '', 32);
+    if ($name === '') { fourgeChatOut(400, ['ok' => false, 'error' => 'Please enter your name.', 'field' => 'name']); return; }
+    if (!filter_var($email, FILTER_VALIDATE_EMAIL)) { fourgeChatOut(400, ['ok' => false, 'error' => 'Please enter a valid email address.', 'field' => 'email']); return; }
+    if ($phone !== '' && !preg_match('/^[+()0-9 .\-]{7,32}$/', $phone)) { fourgeChatOut(400, ['ok' => false, 'error' => 'Please check the phone number.', 'field' => 'phone']); return; }
+    // reCAPTCHA when the page had it — and, like the forms, only a verdict of "bot" blocks.
+    $rc = (string)($body['recaptcha'] ?? '');
+    if ($rc !== '') {
+        $secret = cmsRecaptchaSecret();
+        if ($secret !== '') {
+            $v = cmsVerifyRecaptcha($secret, $rc, cmsRecaptchaThreshold());
+            if (($v['outcome'] ?? '') === 'blocked') { fourgeChatOut(403, ['ok' => false, 'error' => 'The chat could not start. Please call or email us instead.']); return; }
+        }
+    }
+    list($contactId, $err) = cmsChatContact($ghl, $name, $email, $phone);
+    if (!$contactId) { error_log('Fourge chat: contact not saved — ' . $err); fourgeChatOut(502, ['ok' => false, 'error' => 'Chat is unavailable right now. Please try again shortly.']); return; }
+    list($conversationId, $err) = cmsChatConversation($ghl, $contactId);
+    if (!$conversationId) { error_log('Fourge chat: conversation not opened — ' . $err); fourgeChatOut(502, ['ok' => false, 'error' => 'Chat is unavailable right now. Please try again shortly.']); return; }
+    // What the conversation already holds stays out of this chat (see cmsChatVisible).
+    $hidden = null;
+    list($code, $j) = cmsGhlReq($ghl['token'], 'GET', '/conversations/' . rawurlencode($conversationId) . '/messages?limit=100', null, '2021-04-15', 10);
+    if ($code >= 200 && $code < 300 && is_array($j)) { $hidden = []; foreach (cmsGhlParseMessages($j) as $m) if (($m['id'] ?? '') !== '') $hidden[] = (string)$m['id']; }
+    $sid = bin2hex(random_bytes(16)); $now = time();
+    $pdo->prepare("INSERT INTO chat_sessions (sid_hash, contact_id, conversation_id, created_at, last_active, sent, hidden) VALUES (?, ?, ?, ?, ?, 0, ?)")
+        ->execute([hash('sha256', $sid), $contactId, $conversationId, $now, $now, $hidden === null ? null : json_encode($hidden)]);
+    fourgeChatOut(200, ['ok' => true, 'sid' => $sid]);
+}
+
+// Public: one visitor message.
+function fourgeApiChatSend($body) {
+    $r = fourgeChatReady(); if (!$r) return; list($cfg, $ghl) = $r;
+    $pdo = fourgeChatDb();
+    $sess = fourgeChatSession($pdo, $body['sid'] ?? '');
+    if (!$sess) { fourgeChatOut(401, ['ok' => false, 'error' => 'This chat has ended. Start a new one to keep talking.', 'expired' => true]); return; }
+    $text = fourgeChatText($body['message'] ?? '', 1000);
+    if ($text === '') { fourgeChatOut(400, ['ok' => false, 'error' => 'Type a message first.']); return; }
+    $sk = substr((string)$sess['sid_hash'], 0, 32); $ip = fourgeChatClientKey();
+    if (!fourgeChatAllow($pdo, 'send:s:' . $sk, 8, 60) || !fourgeChatAllow($pdo, 'send:s:' . $sk, 80, 3600)
+        || !fourgeChatAllow($pdo, 'send:ip:' . $ip, 40, 600) || !fourgeChatAllow($pdo, 'send:site', 600, 3600)) {
+        fourgeChatOut(429, ['ok' => false, 'error' => 'You\'re sending messages very quickly. Please wait a moment and try again.']); return;
+    }
+    list($ok, $mid, $err) = cmsChatPostInbound($ghl, $cfg, (string)$sess['conversation_id'], (string)$sess['contact_id'], $text);
+    if (!$ok) { error_log('Fourge chat: message not delivered — ' . $err); fourgeChatOut(502, ['ok' => false, 'error' => 'Your message didn\'t go through. Please try again.']); return; }
+    $pdo->prepare("UPDATE chat_sessions SET sent = sent + 1, last_active = ? WHERE sid_hash = ?")->execute([time(), $sess['sid_hash']]);
+    $pdo->prepare("DELETE FROM chat_cache WHERE conversation_id = ?")->execute([(string)$sess['conversation_id']]);
+    fourgeChatOut(200, ['ok' => true, 'id' => $mid, 'at' => gmdate('c')]);
+}
+
+// Public: the visitor's side of the conversation so far (bot and team replies included).
+function fourgeApiChatPoll($body) {
+    $r = fourgeChatReady(); if (!$r) return; list($cfg, $ghl) = $r;
+    $pdo = fourgeChatDb();
+    $sess = fourgeChatSession($pdo, $body['sid'] ?? '');
+    if (!$sess) { fourgeChatOut(401, ['ok' => false, 'error' => 'This chat has ended.', 'expired' => true]); return; }
+    $sk = substr((string)$sess['sid_hash'], 0, 32);
+    if (!fourgeChatAllow($pdo, 'poll:s:' . $sk, 45, 60)) { fourgeChatOut(200, ['ok' => true, 'messages' => null, 'wait' => 15]); return; }
+    if ((int)$sess['last_active'] < time() - 600) $pdo->prepare("UPDATE chat_sessions SET last_active = ? WHERE sid_hash = ?")->execute([time(), $sess['sid_hash']]);
+    list($msgs, $err) = cmsChatThread($pdo, $ghl, $cfg, $sess);
+    if ($msgs === null) { error_log('Fourge chat: thread not read — ' . $err); fourgeChatOut(200, ['ok' => true, 'messages' => null, 'wait' => 10]); return; }   // the widget keeps what it has and asks again
+    fourgeChatOut(200, ['ok' => true, 'messages' => $msgs]);
+}
+
+// ── Chat admin (Super Admin: these use the CRM token and its AI costs money) ──
+function fourgeChatAdminGate($me) {
+    if (fourgeLevel($me) < 3) { fourgeChatOut(403, ['ok' => false, 'error' => 'Super Admin access required']); return null; }
+    $ghl = cmsChatGhl();
+    if (!$ghl) { fourgeChatOut(200, ['ok' => false, 'needsConnection' => true, 'error' => 'Connect the CRM first: Plugins → Lead Generation → token and Location ID.']); return null; }
+    return $ghl;
+}
+// The sub-account's Conversation AI bots ("agents" in the API).
+function cmsChatAgents($ghl) {
+    list($code, $j, $err) = cmsGhlAiReq($ghl['token'], 'GET', '/conversation-ai/agents/search?limit=50');
+    if ($code < 200 || $code >= 300 || !is_array($j)) return [null, cmsGhlErrText($code, $j, $err)];
+    $out = [];
+    foreach ((array)($j['agents'] ?? []) as $a) { if (is_array($a) && !empty($a['id'])) $out[] = $a; }
+    return [$out, ''];
+}
+function cmsChatAgentBrief($a, $withPrompt = true) {
+    $b = ['id' => (string)($a['id'] ?? ''), 'name' => (string)($a['name'] ?? ''), 'mode' => (string)($a['mode'] ?? ''),
+          'channels' => array_values(array_map('strval', (array)($a['channels'] ?? []))), 'isPrimary' => !empty($a['isPrimary'])];
+    if ($withPrompt) {
+        $b += ['businessName' => (string)($a['businessName'] ?? ''), 'personality' => (string)($a['personality'] ?? ''), 'goal' => (string)($a['goal'] ?? ''),
+               'instructions' => (string)($a['instructions'] ?? ''), 'usesFullPrompt' => trim((string)($a['fullPrompt'] ?? '')) !== ''];
+    }
+    return $b;
+}
+// The bot that answers this site's chat: the one Fourge recorded, else the
+// sub-account's main bot on Live Chat (only the main bot answers on its own;
+// the others answer only inside workflows).
+function cmsChatPickAgent($agents, $agentId) {
+    $agentId = (string)$agentId;
+    if ($agentId !== '') foreach ($agents as $a) if ((string)$a['id'] === $agentId && !empty($a['isPrimary']) && in_array('Live_Chat', (array)($a['channels'] ?? []), true)) return $a;
+    foreach ($agents as $a) if (!empty($a['isPrimary']) && in_array('Live_Chat', (array)($a['channels'] ?? []), true)) return $a;
+    return null;
+}
+function cmsChatMainAgent($agents) { foreach ($agents as $a) if (!empty($a['isPrimary'])) return $a; return null; }
+
+function fourgeApiChatBotStatus($me, $body) {
+    $ghl = fourgeChatAdminGate($me); if (!$ghl) return;
+    list($agents, $err) = cmsChatAgents($ghl);
+    if ($agents === null) { fourgeChatOut(200, ['ok' => false, 'error' => 'Could not read the CRM\'s bots: ' . $err . cmsChatScopeHint($err)]); return; }
+    $bot = cmsChatPickAgent($agents, (string)(cmsChatSettings()['agentId'] ?? ''));
+    $main = $bot ? null : cmsChatMainAgent($agents);
+    fourgeChatOut(200, ['ok' => true, 'bot' => $bot ? cmsChatAgentBrief($bot) : null, 'main' => $main ? cmsChatAgentBrief($main, false) : null, 'count' => count($agents)]);
+}
+
+// Create the site's bot, put an existing main bot on Live Chat, or save edits
+// to the bot. An existing main bot is reused, never demoted, and keeps
+// everything Fourge doesn't edit: each change starts from what the CRM has.
+//   op 'create' — a new main bot on Live Chat, answering on its own.
+//   op 'use'    — add Live Chat to the sub-account's existing main bot.
+//   op 'update' — save the edited name/business/personality/goal/instructions;
+//                 autoPilot:true also switches it to answering on its own.
+function fourgeApiChatBotSave($me, $body) {
+    $ghl = fourgeChatAdminGate($me); if (!$ghl) return;
+    $op = (string)($body['op'] ?? '');
+    $fields = [];
+    foreach (['name' => 80, 'businessName' => 120, 'personality' => 2000, 'goal' => 2000, 'instructions' => 8000] as $k => $max) {
+        if (array_key_exists($k, $body)) $fields[$k] = fourgeChatText($body[$k], $max);
+    }
+    list($agents, $err) = cmsChatAgents($ghl);
+    if ($agents === null) { fourgeChatOut(200, ['ok' => false, 'error' => 'Could not read the CRM\'s bots: ' . $err . cmsChatScopeHint($err)]); return; }
+    if ($op === 'create') {
+        if (cmsChatMainAgent($agents)) { fourgeChatOut(200, ['ok' => false, 'error' => 'This CRM already has a main bot. Use it for website chat instead, so neither bot gets in the other\'s way.']); return; }
+        foreach (['name', 'personality', 'goal', 'instructions'] as $k) {
+            if (($fields[$k] ?? '') === '') { fourgeChatOut(200, ['ok' => false, 'error' => 'Fill in the bot\'s name, personality, goal and instructions first.']); return; }
+        }
+        $p = $fields + ['mode' => 'auto-pilot', 'channels' => ['Live_Chat'], 'isPrimary' => true, 'waitTime' => 3, 'waitTimeUnit' => 'seconds', 'autoPilotMaxMessages' => 50, 'sleepOnManualMessage' => true];
+        list($code, $j, $e2) = cmsGhlAiReq($ghl['token'], 'POST', '/conversation-ai/agents', $p);
+        $made = is_array($j) ? ($j['agent'] ?? $j) : [];
+        $id = (string)($made['id'] ?? '');
+        if ($code < 200 || $code >= 300 || $id === '') { $t = cmsGhlErrText($code, $j, $e2); fourgeChatOut(200, ['ok' => false, 'error' => 'The CRM did not create the bot: ' . $t . cmsChatScopeHint($t)]); return; }
+        cmsChatSaveSettings(['agentId' => $id]);
+        fourgeChatOut(200, ['ok' => true, 'done' => 'created', 'bot' => cmsChatAgentBrief($made + $p)]);
+        return;
+    }
+    if ($op !== 'use' && $op !== 'update') { fourgeChatOut(400, ['ok' => false, 'error' => 'Unknown bot action.']); return; }
+    $target = ($op === 'use') ? cmsChatMainAgent($agents) : cmsChatPickAgent($agents, (string)($body['agentId'] ?? (cmsChatSettings()['agentId'] ?? '')));
+    if (!$target) { fourgeChatOut(200, ['ok' => false, 'error' => $op === 'use' ? 'This CRM has no main bot yet. Create one instead.' : 'No bot answers website chat yet.']); return; }
+    list($code, $full) = cmsGhlAiReq($ghl['token'], 'GET', '/conversation-ai/agents/' . rawurlencode((string)$target['id']));
+    $cur = $target;
+    if ($code >= 200 && $code < 300 && is_array($full)) { $cur = array_merge($target, (array)($full['agent'] ?? $full)); }
+    $p = [];
+    foreach (['name', 'businessName', 'mode', 'channels', 'isPrimary', 'waitTime', 'waitTimeUnit', 'sleepEnabled', 'sleepOnManualMessage', 'sleepOnWorkflowMessage', 'sleepTime', 'sleepTimeUnit',
+              'personality', 'goal', 'instructions', 'fullPrompt', 'autoPilotMaxMessages', 'knowledgeBaseIds', 'respondToImages', 'respondToAudio'] as $k) {
+        if (array_key_exists($k, $cur) && $cur[$k] !== null) $p[$k] = $cur[$k];
+    }
+    $channels = array_values(array_map('strval', (array)($p['channels'] ?? [])));
+    if (!in_array('Live_Chat', $channels, true)) $channels[] = 'Live_Chat';
+    $p['channels'] = $channels;
+    $p['isPrimary'] = true;
+    if (empty($p['mode'])) $p['mode'] = 'auto-pilot';
+    if (empty($p['autoPilotMaxMessages'])) $p['autoPilotMaxMessages'] = 50;
+    if ($op === 'update') {
+        $edits = array_filter($fields, function ($v) { return $v !== ''; });
+        if ($edits && trim((string)($cur['fullPrompt'] ?? '')) !== '') { fourgeChatOut(200, ['ok' => false, 'error' => 'This bot runs on a full custom prompt set in the CRM, which overrides these fields. Edit it in the CRM instead.']); return; }
+        foreach ($edits as $k => $v) $p[$k] = $v;
+        if (!empty($body['autoPilot'])) $p['mode'] = 'auto-pilot';
+    }
+    list($code, $j, $e3) = cmsGhlAiReq($ghl['token'], 'PUT', '/conversation-ai/agents/' . rawurlencode((string)$target['id']), $p);
+    if ($code < 200 || $code >= 300) { $t = cmsGhlErrText($code, $j, $e3); fourgeChatOut(200, ['ok' => false, 'error' => 'The CRM did not save the bot: ' . $t . cmsChatScopeHint($t)]); return; }
+    cmsChatSaveSettings(['agentId' => (string)$target['id']]);
+    $saved = is_array($j) ? array_merge($p, (array)($j['agent'] ?? $j)) : $p;
+    $saved['id'] = (string)$target['id'];
+    fourgeChatOut(200, ['ok' => true, 'done' => $op === 'use' ? 'adopted' : 'updated', 'bot' => cmsChatAgentBrief($saved)]);
+}
+
+// The Live Chat route rests on one thing GoHighLevel doesn't document: that its
+// bot answers chat messages added through the API. This test sends one as a
+// test contact and (with chat_ai_test_poll) watches for the bot's reply.
+// GoHighLevel may also insist on a "conversation provider" id for chat
+// messages: if it does, look for one on the sub-account's earlier chats.
+function cmsChatFindProvider($ghl) {
+    list($code, $j) = cmsGhlReq($ghl['token'], 'GET', '/conversations/search?locationId=' . rawurlencode($ghl['locationId']) . '&lastMessageType=TYPE_LIVE_CHAT&limit=5', null, '2021-04-15', 10);
+    if ($code < 200 || $code >= 300 || !is_array($j)) return '';
+    foreach (array_slice((array)($j['conversations'] ?? []), 0, 3) as $c) {
+        if (!is_array($c) || empty($c['id'])) continue;
+        list($c2, $mj) = cmsGhlReq($ghl['token'], 'GET', '/conversations/' . rawurlencode((string)$c['id']) . '/messages?limit=20', null, '2021-04-15', 10);
+        if (!is_array($mj)) continue;
+        $raw = $mj['messages']['messages'] ?? ($mj['messages'] ?? []);
+        foreach ((array)$raw as $m) {
+            if (!is_array($m)) continue;
+            $p = (string)($m['conversationProviderId'] ?? ($m['providerId'] ?? ''));
+            if (strpos(strtoupper((string)($m['messageType'] ?? '')), 'LIVE_CHAT') !== false && $p !== '') return $p;
+        }
+    }
+    return '';
+}
+function fourgeApiChatAiTest($me, $body) {
+    $ghl = fourgeChatAdminGate($me); if (!$ghl) return;
+    $cfg = cmsChatSettings();
+    $steps = [];
+    $add = function ($label, $ok, $detail = '') use (&$steps) { $steps[] = ['label' => $label, 'ok' => (bool)$ok, 'detail' => (string)$detail]; };
+    $stop = function () use (&$steps) { fourgeChatOut(200, ['ok' => false, 'steps' => $steps]); };
+    list($agents, $err) = cmsChatAgents($ghl);
+    if ($agents === null) { $add('Read the CRM\'s bots', false, $err . cmsChatScopeHint($err)); $stop(); return; }
+    $bot = cmsChatPickAgent($agents, (string)($cfg['agentId'] ?? ''));
+    if (!$bot) { $add('Find the bot that answers website chat', false, 'No main bot has Live Chat switched on yet. Set up the bot first.'); $stop(); return; }
+    $mode = (string)($bot['mode'] ?? '');
+    $add('Find the bot that answers website chat', true, (string)($bot['name'] ?? 'Bot') . ($mode !== '' ? ' (' . $mode . ')' : ''));
+    if ($mode !== '' && $mode !== 'auto-pilot') $add('The bot answers on its own', false, 'It is in "' . $mode . '" mode, so it only drafts replies for your team. Switch it to auto-pilot, then test again.');
+    list($contactId, $err) = cmsChatContact($ghl, 'Fourge Chat Test', 'fourge-chat-test@example.com', '');
+    if (!$contactId) { $add('Create a test contact', false, $err . cmsChatScopeHint($err)); $stop(); return; }
+    $add('Create a test contact', true, 'Fourge Chat Test · fourge-chat-test@example.com');
+    list($conversationId, $err) = cmsChatConversation($ghl, $contactId);
+    if (!$conversationId) { $add('Open a conversation', false, $err . cmsChatScopeHint($err)); $stop(); return; }
+    $add('Open a conversation', true);
+    $since = time();
+    $text = 'Hi! This is an automatic test from the website chat. What can you help me with?';
+    list($ok, $mid, $err) = cmsChatPostInbound($ghl, $cfg, $conversationId, $contactId, $text);
+    if (!$ok && trim((string)($cfg['providerId'] ?? '')) === '') {
+        $prov = cmsChatFindProvider($ghl);
+        if ($prov !== '') {
+            list($ok2, $mid2, $err2) = cmsChatPostInbound($ghl, ['providerId' => $prov] + $cfg, $conversationId, $contactId, $text);
+            if ($ok2) { cmsChatSaveSettings(['providerId' => $prov]); $ok = true; $mid = $mid2; $add('Find the CRM\'s Live Chat channel id', true, 'Found on an earlier chat and saved: ' . $prov); }
+            else $err .= ' — and with the channel id found on an earlier chat (' . $prov . '): ' . $err2;
+        }
+    }
+    if (!$ok) { $add('Send a visitor message into the CRM as Live Chat', false, $err . cmsChatScopeHint($err)); fourgeChatOut(200, ['ok' => false, 'routeBlocked' => true, 'steps' => $steps]); return; }
+    $add('Send a visitor message into the CRM as Live Chat', true, '“' . $text . '”');
+    fourgeChatOut(200, ['ok' => true, 'steps' => $steps, 'conversationId' => $conversationId, 'since' => $since, 'messageId' => $mid]);
+}
+function fourgeApiChatAiTestPoll($me, $body) {
+    $ghl = fourgeChatAdminGate($me); if (!$ghl) return;
+    $cid = trim((string)($body['conversationId'] ?? '')); $since = (int)($body['since'] ?? 0);
+    if ($cid === '' || $since <= 0) { fourgeChatOut(400, ['ok' => false, 'error' => 'Missing test details.']); return; }
+    list($code, $j, $err) = cmsGhlReq($ghl['token'], 'GET', '/conversations/' . rawurlencode($cid) . '/messages?limit=20');
+    if ($code < 200 || $code >= 300 || !is_array($j)) { fourgeChatOut(200, ['ok' => false, 'error' => 'Could not read the test conversation: ' . cmsGhlErrText($code, $j, $err)]); return; }
+    $seen = false; $reply = null; $replyTs = 0;
+    foreach (cmsGhlParseMessages($j) as $m) {
+        $ts = strtotime((string)$m['date']);
+        if ($ts === false || $ts < $since - 5) continue;
+        if (!empty($m['inbound'])) { $seen = true; continue; }
+        if (trim((string)$m['body']) !== '') { $reply = $m; $replyTs = $ts; }
+    }
+    fourgeChatOut(200, ['ok' => true, 'seenInbound' => $seen, 'done' => $reply !== null,
+        'reply' => $reply ? (string)$reply['body'] : '', 'replyType' => $reply ? (string)$reply['type'] : '', 'seconds' => $reply ? max(0, $replyTs - $since) : null]);
+}
+
+// Resolve Mailgun config from the encrypted DB secrets first (server-side,
+// editable in Settings), falling back to the config.secret.php constants.
+function cmsMailgun() {
+    $get = function ($name, $fallback) {
+        try { $v = fourgeGetSecret(fourgeDb(), $name); return ($v !== null && $v !== '') ? $v : $fallback; }
+        catch (Throwable $e) { return $fallback; }
+    };
+    return [
+        'domain' => $get('mg_domain',    MG_DOMAIN),
+        'key'    => $get('mg_api_key',   MG_API_KEY),
+        'from'   => $get('mg_from',      MG_FROM),
+        'notify' => $get('mg_notify_to', MG_NOTIFY_TO),
+    ];
+}
+
+// Who form emails are copied to (CC): 'mg_notify_cc' in config.secret.php when
+// it is set, otherwise the 'cc_email' of a legacy send.php — whichever of them
+// the rest of the mail settings come from, since that is who the site's old
+// handler copied. Read only when mail is sent. Returns ['list' => …, 'source' => …].
+function cmsMailCc() {
+    $own = fourgeEmailList((string)(foundrySecret()['mg_notify_cc'] ?? ''));
+    if ($own !== '') return ['list' => $own, 'source' => 'config.secret.php'];
+    $legacy = fourgeLegacySendCc(PUBLIC_HTML);
+    return ['list' => $legacy, 'source' => $legacy !== '' ? 'send.php' : ''];
+}
+// Who a form email may be sent to. send_form is public, and it used to send to
+// whatever "to" a request named, so anyone could post a message to any address
+// through this site's mail account — the way an account gets suspended or a
+// domain blacklisted. The site's own forms only ever name its own addresses:
+// page-block forms send Site Info's Notify Email (data/site.json notifyEmail),
+// Form Builder forms send none. So:
+//   no "to"      → the mail settings' recipient (mg_notify_to), as before;
+//   an empty one → nobody (the entry is stored, not emailed), as before;
+//   a "to" whose every address is the site's own (Site Info's Notify Email or
+//   mg_notify_to) → as given; any other → the site's own recipient instead
+//   (Notify Email, else mg_notify_to), never the address the request named.
+function cmsFormRecipient($hasTo, $requested, $mgNotify) {
+    if (!$hasTo) return (string)$mgNotify;
+    $req = is_scalar($requested) ? trim((string)$requested) : '-';
+    if ($req === '') return '';
+    $site = json_decode((string)@file_get_contents(PUBLIC_HTML . '/data/site.json'), true);
+    $siteNotify = is_array($site) ? fourgeEmailList((string)($site['notifyEmail'] ?? '')) : '';
+    $mailNotify = fourgeEmailList((string)$mgNotify);
+    $own = array_map('strtolower', array_filter(array_merge(explode(', ', $siteNotify), explode(', ', $mailNotify))));
+    $list = fourgeEmailList($req);
+    if ($list !== '' && !array_diff(array_map('strtolower', explode(', ', $list)), $own)) return $list;
+    return $siteNotify !== '' ? $siteNotify : $mailNotify;
+}
+// The CC list for one message: without the address it is already going to.
+function cmsCcFor($ccList, $to) {
+    $to = strtolower(trim((string)$to));
+    return implode(', ', array_filter(explode(', ', (string)$ccList), function ($a) use ($to) { return $a !== '' && strtolower($a) !== $to; }));
+}
+
+function cmsSmtpEnabled() {
+    return SMTP_HOST !== '' && SMTP_USER !== '' && SMTP_PASS !== '';
+}
+
+// Minimal dependency-free SMTP sender (no PHPMailer needed). Speaks enough of
+// ESMTP to authenticate and deliver a multipart/alternative message. $opt keys:
+// host, port, secure(auto|tls|ssl|none), user, pass, from, fromName, to, toName,
+// cc (comma-separated, optional), replyTo, replyName, subject, html, text.
+// Returns true, or false with $err set. A CC address the server refuses is left
+// out (and logged) rather than failing the message to the main recipient.
+function cmsSmtpSend($opt, &$err) {
+    $host = (string)$opt['host']; $port = (int)$opt['port'];
+    $secure = $opt['secure'] ?? 'auto';
+    if ($secure === 'auto') $secure = ($port === 465) ? 'ssl' : 'tls';
+    // Strip CR/LF/NUL from anything that lands in an SMTP command or a raw header
+    // (Reply-To comes from the visitor) to prevent command / header injection.
+    $strip = function ($s) { return str_replace(["\r", "\n", "\0"], '', (string)$s); };
+    $from = $strip($opt['from']); $to = $strip($opt['to']); $rt = $strip($opt['replyTo'] ?? '');
+    $cc = array_values(array_filter(explode(', ', fourgeEmailList(cmsCcFor($strip($opt['cc'] ?? ''), $to)))));
+
+    $remote = ($secure === 'ssl' ? 'ssl://' : 'tcp://') . $host . ':' . $port;
+    $ctx = stream_context_create(['ssl' => ['verify_peer' => true, 'verify_peer_name' => true, 'SNI_enabled' => true]]);
+    $fp = @stream_socket_client($remote, $errno, $errstr, 20, STREAM_CLIENT_CONNECT, $ctx);
+    if (!$fp) { $err = "connect failed: $errstr ($errno)"; return false; }
+    stream_set_timeout($fp, 20);
+
+    $read = function () use ($fp) {
+        $d = '';
+        while (($l = fgets($fp, 600)) !== false) {
+            $d .= $l;
+            if (strlen($l) < 4 || $l[3] === ' ') break;   // last line of a (possibly multiline) reply
+        }
+        return $d;
+    };
+    $put  = function ($s) use ($fp) { fwrite($fp, $s . "\r\n"); };
+    $code = function ($r) { return (int)substr($r, 0, 3); };
+    $bail = function ($m) use (&$err, $fp) { $err = $m; @fclose($fp); return false; };
+
+    $r = $read(); if ($code($r) !== 220) return $bail('greeting: ' . trim($r));
+    $ehlo = preg_replace('/[^A-Za-z0-9.\-]/', '', ($_SERVER['SERVER_NAME'] ?? 'localhost')) ?: 'localhost';
+    $put("EHLO $ehlo"); $r = $read();
+    if ($code($r) !== 250) { $put("HELO $ehlo"); $r = $read(); if ($code($r) !== 250) return $bail('EHLO: ' . trim($r)); }
+
+    if ($secure === 'tls') {
+        $put("STARTTLS"); $r = $read(); if ($code($r) !== 220) return $bail('STARTTLS: ' . trim($r));
+        $crypto = STREAM_CRYPTO_METHOD_TLS_CLIENT;
+        if (defined('STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT')) $crypto |= STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_1_CLIENT;
+        if (!@stream_socket_enable_crypto($fp, true, $crypto)) return $bail('TLS handshake failed');
+        $put("EHLO $ehlo"); $r = $read(); if ($code($r) !== 250) return $bail('EHLO(TLS): ' . trim($r));
+    }
+
+    $put("AUTH LOGIN"); $r = $read(); if ($code($r) !== 334) return $bail('AUTH not accepted: ' . trim($r));
+    $put(base64_encode((string)$opt['user'])); $r = $read(); if ($code($r) !== 334) return $bail('username stage: ' . trim($r));
+    $put(base64_encode((string)$opt['pass'])); $r = $read(); if ($code($r) !== 235) return $bail('login rejected: ' . trim($r));
+
+    $put("MAIL FROM:<$from>"); $r = $read(); if ($code($r) !== 250) return $bail('MAIL FROM: ' . trim($r));
+    $put("RCPT TO:<$to>");     $r = $read(); if ($code($r) !== 250 && $code($r) !== 251) return $bail('RCPT TO: ' . trim($r));
+    $ccOk = [];
+    foreach ($cc as $a) {
+        $put("RCPT TO:<$a>"); $r = $read();
+        if ($code($r) === 250 || $code($r) === 251) $ccOk[] = $a;
+        else error_log('Fourge SMTP: CC ' . $a . ' refused, sent without it: ' . trim($r));
+    }
+    $put("DATA");              $r = $read(); if ($code($r) !== 354) return $bail('DATA: ' . trim($r));
+
+    $enc = function ($s) { return '=?UTF-8?B?' . base64_encode((string)$s) . '?='; };   // RFC2047 for names/subject
+    $b = 'fge' . bin2hex(random_bytes(10));
+    $H = [];
+    $H[] = 'Date: ' . date('r');
+    $H[] = 'Message-ID: <' . bin2hex(random_bytes(12)) . '@' . $host . '>';
+    $H[] = 'From: ' . (($opt['fromName'] ?? '') !== '' ? $enc($opt['fromName']) . ' ' : '') . "<$from>";
+    $H[] = 'To: '   . (($opt['toName'] ?? '')   !== '' ? $enc($opt['toName'])   . ' ' : '') . "<$to>";
+    if ($ccOk) $H[] = 'Cc: ' . implode(', ', array_map(function ($a) { return "<$a>"; }, $ccOk));
+    if ($rt !== '') $H[] = 'Reply-To: ' . (!empty($opt['replyName']) ? $enc($opt['replyName']) . ' ' : '') . "<$rt>";
+    $H[] = 'Subject: ' . $enc($opt['subject']);
+    $H[] = 'MIME-Version: 1.0';
+    $H[] = 'Content-Type: multipart/alternative; boundary="' . $b . '"';
+    $M  = implode("\r\n", $H) . "\r\n\r\n";
+    $M .= '--' . $b . "\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n" . chunk_split(base64_encode((string)$opt['text'])) . "\r\n";
+    $M .= '--' . $b . "\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n" . chunk_split(base64_encode((string)$opt['html'])) . "\r\n";
+    $M .= '--' . $b . "--\r\n";
+    $M = preg_replace('/^\./m', '..', $M);   // dot-stuff (defensive; base64 has no leading dots)
+    fwrite($fp, $M . "\r\n.\r\n");
+    $r = $read(); if ($code($r) !== 250) return $bail('message rejected: ' . trim($r));
+    $put("QUIT"); @fclose($fp);
+    return true;
+}
+
+// Resolve the SMTP envelope-From the same way for the live form and the test
+// diagnostic: use the configured mg_from, but ignore the built-in example
+// placeholder and fall back to the SMTP login — always a valid sender on the
+// relay's own domain — so a missing or placeholder mg_from can never make the
+// relay reject the message. Returns [email, displayName].
+function cmsSmtpFrom($mgFrom) {
+    $fromRaw = trim((string)$mgFrom);
+    if ($fromRaw === '' || stripos($fromRaw, 'example.com') !== false) $fromRaw = SMTP_USER;
+    $fromEmail = $fromRaw; $fromName = '';
+    if (preg_match('/^\s*(.*?)\s*<([^>]+)>\s*$/', $fromRaw, $mm)) { $fromName = trim($mm[1], " \"'"); $fromEmail = trim($mm[2]); }
+    if (!filter_var($fromEmail, FILTER_VALIDATE_EMAIL)) $fromEmail = SMTP_USER;
+    return [$fromEmail, $fromName];
+}
+
+// data/uploads/ holds files visitors attach to a form submission. Never
+// execute anything in it (a renamed/disguised script must stay inert even if
+// a hosting config ignores php_flag) and never let it be browsed/listed —
+// each file's URL is an unguessable token, not something to enumerate.
+function fourgeWriteUploadsHtaccess() {
+    $dir = PUBLIC_HTML . '/data/uploads';
+    if (!is_dir($dir)) { @mkdir($dir, 0755, true); }
+    $htPath   = $dir . '/.htaccess';
+    $existing = is_file($htPath) ? (string)file_get_contents($htPath) : '';
+    $begin = '# BEGIN Fourge Uploads Guard';
+    $end   = '# END Fourge Uploads Guard';
+    $rules = <<<'HT'
+<IfModule mod_php.c>
+  php_flag engine off
+</IfModule>
+<FilesMatch "\.(php\d?|phtml|phar|cgi|pl|py|sh|exe)$">
+  <IfModule mod_authz_core.c>
+    Require all denied
+  </IfModule>
+  <IfModule !mod_authz_core.c>
+    Order allow,deny
+    Deny from all
+  </IfModule>
+</FilesMatch>
+Options -Indexes
+HT;
+    $block = $begin . "\n" . $rules . "\n" . $end;
+    $s = strpos($existing, $begin);
+    $e = strpos($existing, $end);
+    if ($s !== false && $e !== false && $e >= $s) {
+        $existing = substr($existing, 0, $s) . $block . substr($existing, $e + strlen($end));
+    } else {
+        $existing = ($existing === '' ? '' : rtrim($existing) . "\n\n") . $block . "\n";
+    }
+    return fourgeSitePut($htPath, $existing, 'Fourge: server rules') !== false;
+}
+// data/entries.json holds every submitted lead (name/email/phone/message, and
+// now file-upload paths) — unlike pages/posts/site.json, no legitimate visitor
+// page ever fetches it, so (like users.json) it has no business being
+// publicly readable. Same managed-marker splice as fourgeWriteAdminHtaccess.
+function fourgeWriteEntriesHtaccess() {
+    $dir = PUBLIC_HTML . '/data';
+    if (!is_dir($dir)) { @mkdir($dir, 0755, true); }
+    $htPath   = $dir . '/.htaccess';
+    $existing = is_file($htPath) ? (string)file_get_contents($htPath) : '';
+    $begin = '# BEGIN Fourge Entries Guard';
+    $end   = '# END Fourge Entries Guard';
+    $rules = <<<'HT'
+<FilesMatch "^entries\.json$">
+  <IfModule mod_authz_core.c>
+    Require all denied
+  </IfModule>
+  <IfModule !mod_authz_core.c>
+    Order allow,deny
+    Deny from all
+  </IfModule>
+</FilesMatch>
+HT;
+    $block = $begin . "\n" . $rules . "\n" . $end;
+    $s = strpos($existing, $begin);
+    $e = strpos($existing, $end);
+    if ($s !== false && $e !== false && $e >= $s) {
+        $existing = substr($existing, 0, $s) . $block . substr($existing, $e + strlen($end));
+    } else {
+        $existing = ($existing === '' ? '' : rtrim($existing) . "\n\n") . $block . "\n";
+    }
+    return fourgeSitePut($htPath, $existing, 'Fourge: server rules') !== false;
+}
+// Earlier copies of pages the CMS keeps: data/bak/ (the copy before each edit —
+// the editor, Find & Replace, SEO packages, the AI auto-fix) and data/rev_*.html
+// (revision snapshots). The CMS reads them only through its own API (read_file),
+// so nobody needs them over the web, and search engines must not find them: a
+// whole page at a second address is duplicate content, and an old copy can show
+// text the live page no longer has. Both are closed to the web — data/bak/ by an
+// .htaccess of its own, the snapshots by a managed block in data/.htaccess (the
+// same marker splice as the other guards, so the rest of that file is kept).
+function fourgeBackupsDenyRules() {
+    return "<IfModule mod_authz_core.c>\n  Require all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\n  Order allow,deny\n  Deny from all\n</IfModule>";
+}
+function fourgeSpliceHtaccessFile($htPath, $begin, $end, $rules) {
+    $existing = is_file($htPath) ? (string)file_get_contents($htPath) : '';
+    $block = $begin . "\n" . $rules . "\n" . $end;
+    $s = strpos($existing, $begin);
+    $e = strpos($existing, $end);
+    if ($s !== false && $e !== false && $e >= $s) $out = substr($existing, 0, $s) . $block . substr($existing, $e + strlen($end));
+    else $out = ($existing === '' ? '' : rtrim($existing) . "\n\n") . $block . "\n";
+    if ($out === $existing) return true;
+    return fourgeSitePut($htPath, $out, 'Fourge: server rules') !== false;
+}
+function fourgeWriteBackupsHtaccess() {
+    $data = PUBLIC_HTML . '/data';
+    $bak  = $data . '/bak';
+    if (!is_dir($bak)) @mkdir($bak, 0755, true);
+    if (!is_dir($bak)) return false;
+    $deny = fourgeBackupsDenyRules();
+    $snap = "<FilesMatch \"^rev_.*\\.html?$\">\n  " . str_replace("\n", "\n  ", $deny) . "\n</FilesMatch>";
+    $a = fourgeSpliceHtaccessFile($data . '/.htaccess', '# BEGIN Fourge Backups Guard', '# END Fourge Backups Guard', $snap);
+    $b = fourgeSpliceHtaccessFile($bak . '/.htaccess', '# BEGIN Fourge Backups Guard', '# END Fourge Backups Guard', $deny);
+    return $a && $b;
+}
+// Extensions allowed through a form's File Upload field — common document/
+// image types a lead-gen form realistically needs (resumes, photos, quotes).
+// Anything else (scripts, executables, disguised extensions) is refused.
+// Moves one $_FILES entry into data/uploads/<formId>/, validated and safely
+// renamed (random token + sanitized basename — never the caller's own
+// filename verbatim). Returns a site-relative URL on success, or null on any
+// failure (bad extension, too large, upload error); the caller just omits the
+// field rather than failing the whole submission over one bad attachment.
+function fourgeStoreFormUpload($formId, $file) {
+    if (!is_array($file) || ($file['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) return null;
+    if (!is_uploaded_file($file['tmp_name'] ?? '')) return null;
+    $size = (int)($file['size'] ?? 0);
+    if ($size <= 0 || $size > FOURGE_UPLOAD_MAX_BYTES) return null;
+    $orig = (string)($file['name'] ?? 'file');
+    $ext  = strtolower(pathinfo($orig, PATHINFO_EXTENSION));
+    if (!in_array($ext, FOURGE_UPLOAD_ALLOWED_EXT, true)) return null;
+    $base = trim((string)preg_replace('~[^A-Za-z0-9_-]+~', '-', pathinfo($orig, PATHINFO_FILENAME)), '-');
+    if ($base === '') $base = 'file';
+    $base = substr($base, 0, 60);
+    $formSlug = trim((string)preg_replace('~[^A-Za-z0-9_-]+~', '-', (string)$formId), '-');
+    if ($formSlug === '') $formSlug = 'form';
+    $dir = PUBLIC_HTML . '/data/uploads/' . $formSlug;
+    if (!is_dir($dir)) @mkdir($dir, 0755, true);
+    $name = bin2hex(random_bytes(8)) . '-' . $base . '.' . $ext;
+    if (!move_uploaded_file($file['tmp_name'], $dir . '/' . $name)) return null;
+    return 'data/uploads/' . $formSlug . '/' . $name;
+}
+function cmsSendForm($body) {
+    $mg = cmsMailgun();
+    // A submission carrying a file upload arrives as multipart/form-data (see
+    // ffSubmit's hasFile branch) instead of JSON, so $body is empty here —
+    // fall back to $_POST/$_FILES, the same way $action already does above
+    // when there's no JSON body to read.
+    if (empty($body) && (!empty($_POST) || !empty($_FILES))) {
+        $formId  = (string)($_POST['formId']  ?? '');
+        $subject = (string)($_POST['subject'] ?? 'New Form Submission');
+        $toEmail = cmsFormRecipient(isset($_POST['to']), $_POST['to'] ?? '', $mg['notify']);   // only this site's own addresses
+        $siteUrl = (string)($_POST['siteUrl'] ?? '');
+        $rcToken = (string)($_POST['recaptcha'] ?? '');
+        $hcToken = (string)($_POST['hcaptcha'] ?? '');
+        $formPassword = (string)($_POST['formPassword'] ?? '');
+        $metaKeys = ['action', 'formId', 'subject', 'to', 'siteUrl', 'recaptcha', 'hcaptcha', 'formPassword'];
+        $fields = [];
+        foreach ($_POST as $k => $v) {
+            if (in_array($k, $metaKeys, true)) continue;
+            $fields[$k] = is_array($v) ? implode(', ', $v) : $v;
+        }
+        foreach ($_FILES as $k => $file) {
+            $url = fourgeStoreFormUpload($formId, $file);
+            if ($url) $fields[$k] = $url;
+        }
+    } else {
+    $fields  = $body['fields']  ?? [];
+    $subject = $body['subject'] ?? 'New Form Submission';
+    $toEmail = cmsFormRecipient(isset($body['to']), $body['to'] ?? '', $mg['notify']);   // only this site's own addresses
+    $siteUrl = $body['siteUrl'] ?? '';
+    $formId  = $body['formId']  ?? '';
+    $rcToken = $body['recaptcha'] ?? '';
+    $hcToken = $body['hcaptcha'] ?? '';
+    $formPassword = $body['formPassword'] ?? '';
+    }
+
+    // Response limit / close date / password protection — checked first, since
+    // there's no point verifying a captcha (below) for a submission that can't
+    // be accepted anyway. $formDef is looked up again later by
+    // cmsFormWebhookConfig()/cmsGhlFormMapping(); that's an accepted small
+    // redundancy rather than threading one more parameter through both.
+    $formDef = cmsFormById($formId);
+    if ($formDef) {
+        $closedReason = cmsFormClosedReason($formDef);
+        if ($closedReason !== '') {
+            http_response_code(403);
+            echo json_encode(['error' => $closedReason]); return;
+        }
+        if (!cmsFormPasswordOk($formDef, $formPassword)) {
+            http_response_code(403);
+            echo json_encode(['error' => 'Incorrect password.']); return;
+        }
+    }
+
+    // reCAPTCHA (only when a secret is configured in site.json). The check ALWAYS
+    // runs so its outcome is recorded for the diagnostic, but a submission is blocked
+    // ONLY when Google actively scores it as a bot ('blocked'). A misconfiguration
+    // (no token / wrong keys / Google unreachable) returns 'allowed_unverified' and
+    // the lead is let through, so a broken setup never silently loses real leads.
+    $rcSecret = cmsRecaptchaSecret();
+    $rcVerdict = null;
+    if ($rcSecret) {
+        $rcVerdict = cmsVerifyRecaptcha($rcSecret, $rcToken, cmsRecaptchaThreshold());
+        if (($rcVerdict['outcome'] ?? '') === 'blocked') {
+            http_response_code(400);
+            echo json_encode(['error' => 'Your submission looked automated and was blocked. Please try again.']); return;
+        }
+    }
+    // hCaptcha: an alternative to reCAPTCHA, same non-losing philosophy — but it
+    // has no score to threshold against, so (like reCAPTCHA v2) it never actively
+    // blocks, only verifies-and-logs. If reCAPTCHA already produced a verdict above,
+    // that one stays authoritative on the stored entry; hCaptcha's only fills in
+    // when reCAPTCHA isn't configured.
+    $hcSecret = cmsHcaptchaSecret();
+    if ($hcSecret) {
+        $hcVerdict = cmsVerifyHcaptcha($hcSecret, $hcToken);
+        if (!$rcVerdict) $rcVerdict = $hcVerdict;
+    }
+
+    // Store the submission in data/entries.json (best-effort, non-fatal). The
+    // verdict rides along so the score is on the entry itself, not just a
+    // separate log an admin has to cross-reference by timestamp.
+    cmsStoreEntry($formId, $fields, $siteUrl, $rcVerdict);
+
+    // Push into GoHighLevel as a lead (best-effort; never blocks the form or email)
+    $ghl = cmsGhlConfig();
+    if ($ghl) { try { cmsGhlPushLead($ghl['token'], $ghl['locationId'], $fields, $subject, $siteUrl, $formId); } catch (Throwable $e) { /* non-fatal */ } }
+
+    // Generic outbound webhook: a per-form URL (Settings → this form → Outbound
+    // Webhook) gets the raw submission as signed JSON — Zapier/Make/Slack/your own
+    // endpoint, the operator's choice. Best-effort; never blocks the form or email.
+    try {
+        $webhook = cmsFormWebhookConfig($formId);
+        if ($webhook && $webhook['url']) {
+            cmsSendWebhook($webhook['url'], $webhook['secret'], [
+                'formId' => $formId, 'subject' => $subject, 'siteUrl' => $siteUrl,
+                'fields' => $fields, 'date' => date('c'),
+            ]);
+        }
+    } catch (Throwable $e) { /* non-fatal */ }
+
+    if (!$toEmail) {
+        // Entry already stored; report success even without email config
+        echo json_encode(['ok' => true, 'stored' => true, 'note' => 'Saved (no email configured)']); return;
+    }
+
+    $textLines = []; $htmlRows = '';
+    foreach ($fields as $label => $value) {
+        $textLines[] = "$label: $value";
+        $htmlRows .= '<tr><td style="padding:6px 12px;font-weight:600;width:140px;border-bottom:1px solid #eee">' . htmlspecialchars($label) . '</td><td style="padding:6px 12px;border-bottom:1px solid #eee">' . nl2br(htmlspecialchars($value)) . '</td></tr>';
+    }
+
+    $text = implode("\n", $textLines) . "\n\n---\nSent from: $siteUrl";
+    $html = '<!DOCTYPE html><html><body style="font-family:Inter,Arial,sans-serif;color:#1A1917;max-width:600px;margin:0 auto;padding:24px">
+      <h2 style="font-size:18px">' . htmlspecialchars($subject) . '</h2>
+      <p style="color:#857F6E;font-size:13px">From: ' . htmlspecialchars($siteUrl) . '</p>
+      <table style="width:100%;border-collapse:collapse;border:1px solid #eee">' . $htmlRows . '</table>
+      <p style="font-size:11px;color:#A09882;margin-top:16px">Sent via Fourge CMS · ' . date('Y-m-d H:i') . '</p>
+    </body></html>';
+
+    // Reply-To = the first submitted value that looks like an email address.
+    $replyTo = ''; foreach ($fields as $val) { $v = trim((string)$val); if (filter_var($v, FILTER_VALIDATE_EMAIL)) { $replyTo = $v; break; } }
+
+    // Copied (CC) to the site's CC list — config.secret.php's, or a legacy send.php's cc_email.
+    $cc = cmsCcFor(cmsMailCc()['list'], $toEmail);
+
+    // Prefer SMTP when configured (a migrated site's existing SMTP creds work
+    // as-is); otherwise fall through to the Mailgun HTTP API below.
+    if (cmsSmtpEnabled()) {
+        list($fromEmail, $fromName) = cmsSmtpFrom($mg['from']);
+        $err = '';
+        $sent = cmsSmtpSend([
+            'host' => SMTP_HOST, 'port' => SMTP_PORT, 'secure' => SMTP_SECURE, 'user' => SMTP_USER, 'pass' => SMTP_PASS,
+            'from' => $fromEmail, 'fromName' => $fromName, 'to' => $toEmail, 'toName' => '', 'cc' => $cc,
+            'replyTo' => $replyTo, 'replyName' => '', 'subject' => $subject, 'html' => $html, 'text' => $text,
+        ], $err);
+        if ($sent) { echo json_encode(['ok' => true]); }
+        else { error_log('Fourge SMTP send failed: ' . $err); http_response_code(500); echo json_encode(['error' => 'Email could not be sent right now. Please try again, or contact us directly.']); }
+        return;
+    }
+
+    $ch = curl_init('https://api.mailgun.net/v3/' . $mg['domain'] . '/messages');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_USERPWD        => 'api:' . $mg['key'],
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => ['from'=>$mg['from'],'to'=>$toEmail,'subject'=>$subject,'text'=>$text,'html'=>$html] + ($cc !== '' ? ['cc' => $cc] : []),
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_TIMEOUT        => 15,
+    ]);
+    $result = curl_exec($ch);
+    $code   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlErr= curl_error($ch);
+    fourgeCurlClose($ch);
+
+    if ($curlErr) { http_response_code(500); echo json_encode(['error' => 'Mail failed: '.$curlErr]); return; }
+    if ($code === 200) { echo json_encode(['ok' => true]); }
+    else { $d = json_decode($result, true); http_response_code(500); echo json_encode(['error' => 'Mailgun '.$code.': '.($d['message']??$result)]); }
+}
+
+// Send a diagnostic test email down the SAME path a real form submission uses
+// (SMTP when configured, otherwise the Mailgun HTTP API) and report back exactly
+// what happened — method, host, From, config source, and the precise failure
+// stage from cmsSmtpSend (e.g. "login rejected: 535 …", "MAIL FROM: 550 …",
+// "connect failed"). Populates $info with the resolved config for the UI.
+// Returns [bool success, string humanMessage].
+function cmsSendTestEmail($to, &$info) {
+    $mg   = cmsMailgun();
+    $info = [
+        'to'     => $to,
+        'source' => $GLOBALS['__mail_source'] ?? 'config.secret.php',
+        'method' => 'none',
+    ];
+    // Shown, not used: a test goes only to the address typed, but the form emails are copied to these.
+    $ccInfo = cmsMailCc();
+    if ($ccInfo['list'] !== '') { $info['cc'] = $ccInfo['list']; $info['ccSource'] = $ccInfo['source']; }
+    $subject = 'Fourge CMS test email';
+    $text = "This is a test email sent from your Fourge CMS mail settings.\n"
+          . "If you received it, outbound email from your site is working.\n\n"
+          . 'Sent: ' . date('Y-m-d H:i:s');
+    $html = '<!DOCTYPE html><html><body style="font-family:Inter,Arial,sans-serif;color:#1A1917;max-width:560px;margin:0 auto;padding:24px">'
+          . '<h2 style="font-size:18px;margin:0 0 8px">Fourge CMS test email ✓</h2>'
+          . '<p style="color:#555;font-size:14px">If you\'re reading this, your site\'s outbound email is working — form notifications will be delivered.</p>'
+          . '<p style="font-size:11px;color:#A09882;margin-top:16px">Sent via Fourge CMS · ' . date('Y-m-d H:i') . '</p>'
+          . '</body></html>';
+
+    // Prefer SMTP when configured — mirrors cmsSendForm's method choice exactly.
+    if (cmsSmtpEnabled()) {
+        list($fromEmail, $fromName) = cmsSmtpFrom($mg['from']);
+        $secure = SMTP_SECURE;
+        if ($secure === 'auto') $secure = (SMTP_PORT === 465) ? 'auto → ssl (implicit TLS)' : 'auto → STARTTLS';
+        $info['method'] = 'SMTP';
+        $info['host']   = SMTP_HOST . ':' . SMTP_PORT;
+        $info['secure'] = $secure;
+        $info['user']   = SMTP_USER;
+        $info['from']   = ($fromName !== '' ? $fromName . ' <' . $fromEmail . '>' : $fromEmail);
+        $err = '';
+        $sent = cmsSmtpSend([
+            'host' => SMTP_HOST, 'port' => SMTP_PORT, 'secure' => SMTP_SECURE, 'user' => SMTP_USER, 'pass' => SMTP_PASS,
+            'from' => $fromEmail, 'fromName' => $fromName, 'to' => $to, 'toName' => '',
+            'replyTo' => '', 'replyName' => '', 'subject' => $subject, 'html' => $html, 'text' => $text,
+        ], $err);
+        if ($sent) return [true, 'Test email sent over SMTP to ' . $to . '. Check that inbox (and the spam folder).'];
+        return [false, 'SMTP send failed at stage — ' . $err];
+    }
+
+    // Otherwise the Mailgun HTTP API (only if a real key + domain are configured).
+    if ($mg['key'] !== '' && $mg['domain'] !== '' && stripos($mg['domain'], 'example.com') === false) {
+        $info['method'] = 'Mailgun API';
+        $info['host']   = 'api.mailgun.net (' . $mg['domain'] . ')';
+        $info['from']   = $mg['from'];
+        $ch = curl_init('https://api.mailgun.net/v3/' . $mg['domain'] . '/messages');
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_USERPWD        => 'api:' . $mg['key'],
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => ['from'=>$mg['from'],'to'=>$to,'subject'=>$subject,'text'=>$text,'html'=>$html],
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_TIMEOUT        => 15,
+        ]);
+        $res = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); $ce = curl_error($ch); fourgeCurlClose($ch);
+        if ($ce) return [false, 'Mailgun connection error: ' . $ce];
+        if ($code === 200) return [true, 'Test email sent over the Mailgun API to ' . $to . '. Check that inbox (and the spam folder).'];
+        $d = json_decode($res, true);
+        return [false, 'Mailgun rejected the message (' . $code . '): ' . ($d['message'] ?? $res)];
+    }
+
+    return [false, 'No mail method is configured. Add SMTP settings (in send.php or config.secret.php) or a Mailgun API key.'];
+}
+
+// Admin diagnostic endpoint: run cmsSendTestEmail and return the structured
+// result to the CMS so mail failures are self-explaining instead of a generic
+// "could not be sent". Level 2+ (admin) — surfaces host/From but never secrets.
+function fourgeApiSendTestEmail($me, $body) {
+    if (fourgeLevel($me) < 2) { http_response_code(403); echo json_encode(['error' => 'Admin access required']); return; }
+    $mg = cmsMailgun();
+    $to = trim((string)($body['to'] ?? ''));
+    if ($to === '') $to = trim((string)($me['email'] ?? ''));
+    if ($to === '') $to = trim((string)$mg['notify']);
+    if (!filter_var($to, FILTER_VALIDATE_EMAIL)) {
+        echo json_encode(['ok' => false, 'error' => 'Enter a valid recipient email address to send the test to.']); return;
+    }
+    $info = [];
+    list($ok, $msg) = cmsSendTestEmail($to, $info);
+    echo json_encode(array_merge(['ok' => $ok, 'message' => $msg], $info));
+}
+
+// ── GOOGLE ANALYTICS (GA4 Data API proxy) ───────────────────────────────────
+// Credentials: a Google Cloud service-account JSON stored in the admin folder
+// (never in public data/). Add the service account email as a Viewer on the
+// GA4 property: Admin → Property Access Management.
+
+// GA_CRED_FILE / GA_TOKEN_CACHE are define()d at the top of this file, with the
+// GHL constants: down here they did not exist yet when the dispatcher called these
+// functions, so every Analytics call ended in "Undefined constant" on PHP 8.
+
+function gaSaveCredentials($body) {
+    $json = $body['credentials'] ?? '';
+    if (!$json) { http_response_code(400); echo json_encode(['error' => 'No credentials provided']); return; }
+    $cred = json_decode($json, true);
+    if (!$cred || empty($cred['client_email']) || empty($cred['private_key']) || ($cred['type'] ?? '') !== 'service_account') {
+        http_response_code(400);
+        echo json_encode(['error' => 'Invalid service account JSON — expected keys: type=service_account, client_email, private_key']);
+        return;
+    }
+    if (file_put_contents(GA_CRED_FILE, json_encode($cred)) === false) {
+        http_response_code(500); echo json_encode(['error' => 'Could not write credentials file']); return;
+    }
+    @chmod(GA_CRED_FILE, 0600);
+    @unlink(GA_TOKEN_CACHE); // force new token with new creds
+    echo json_encode(['ok' => true, 'client_email' => $cred['client_email']]);
+}
+
+function gaStatus() {
+    if (!file_exists(GA_CRED_FILE)) { echo json_encode(['configured' => false]); return; }
+    $cred = json_decode(file_get_contents(GA_CRED_FILE), true);
+    echo json_encode(['configured' => true, 'client_email' => $cred['client_email'] ?? '']);
+}
+
+function gaAccessToken() {
+    if (!file_exists(GA_CRED_FILE)) throw new Exception('No Google service account uploaded yet (Analytics → Setup)');
+    $cred = json_decode(file_get_contents(GA_CRED_FILE), true);
+    if (!$cred) throw new Exception('Credentials file is corrupt');
+
+    // Cached token still valid?
+    if (file_exists(GA_TOKEN_CACHE)) {
+        $c = json_decode(file_get_contents(GA_TOKEN_CACHE), true);
+        if ($c && ($c['exp'] ?? 0) > time() + 60) return $c['token'];
+    }
+
+    $b64 = function ($d) { return rtrim(strtr(base64_encode($d), '+/', '-_'), '='); };
+    $now = time();
+    $header = $b64(json_encode(['alg' => 'RS256', 'typ' => 'JWT']));
+    $claims = $b64(json_encode([
+        'iss'   => $cred['client_email'],
+        'scope' => 'https://www.googleapis.com/auth/analytics.readonly',
+        'aud'   => 'https://oauth2.googleapis.com/token',
+        'iat'   => $now,
+        'exp'   => $now + 3600,
+    ]));
+    $ok = openssl_sign($header . '.' . $claims, $sig, $cred['private_key'], 'sha256WithRSAEncryption');
+    if (!$ok) throw new Exception('JWT signing failed — check the private_key in the service account JSON');
+    $jwt = $header . '.' . $claims . '.' . $b64($sig);
+
+    $ch = curl_init('https://oauth2.googleapis.com/token');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => http_build_query([
+            'grant_type' => 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+            'assertion'  => $jwt,
+        ]),
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_TIMEOUT        => 15,
+    ]);
+    $res  = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err  = curl_error($ch);
+    fourgeCurlClose($ch);
+    if ($err)  throw new Exception('Token request failed: ' . $err);
+    $d = json_decode($res, true);
+    if ($code !== 200 || empty($d['access_token'])) {
+        throw new Exception('Google token error: ' . ($d['error_description'] ?? $d['error'] ?? ('HTTP ' . $code)));
+    }
+    file_put_contents(GA_TOKEN_CACHE, json_encode(['token' => $d['access_token'], 'exp' => $now + (int)($d['expires_in'] ?? 3600)]));
+    @chmod(GA_TOKEN_CACHE, 0600);
+    return $d['access_token'];
+}
+
+function gaReport($body) {
+    $property = preg_replace('/[^0-9]/', '', $body['propertyId'] ?? '');
+    $kind     = ($body['kind'] ?? 'report') === 'realtime' ? 'runRealtimeReport' : 'runReport';
+    $request  = $body['request'] ?? null;
+    if (!$property) { http_response_code(400); echo json_encode(['error' => 'Missing or invalid GA4 numeric property ID']); return; }
+    if (!is_array($request)) { http_response_code(400); echo json_encode(['error' => 'Missing report request body']); return; }
+    try {
+        $token = gaAccessToken();
+    } catch (Exception $e) {
+        http_response_code(500); echo json_encode(['error' => $e->getMessage()]); return;
+    }
+    $url = 'https://analyticsdata.googleapis.com/v1beta/properties/' . $property . ':' . $kind;
+    $ch  = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_HTTPHEADER     => ['Authorization: Bearer ' . $token, 'Content-Type: application/json'],
+        CURLOPT_POSTFIELDS     => json_encode($request),
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_TIMEOUT        => 25,
+    ]);
+    $res  = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err  = curl_error($ch);
+    fourgeCurlClose($ch);
+    if ($err) { http_response_code(500); echo json_encode(['error' => 'GA API request failed: ' . $err]); return; }
+    if ($code !== 200) {
+        $d = json_decode($res, true);
+        $msg = $d['error']['message'] ?? ('HTTP ' . $code);
+        if (strpos($msg, 'permission') !== false || $code === 403) {
+            $cred = json_decode(@file_get_contents(GA_CRED_FILE), true);
+            $msg .= ' — add ' . ($cred['client_email'] ?? 'the service account email') . ' as a Viewer in GA Admin → Property Access Management';
+        }
+        http_response_code(502); echo json_encode(['error' => 'GA API: ' . $msg]); return;
+    }
+    echo $res; // pass through Google's JSON
+}
+
+
+// ── CLAUDE AI PROXY ─────────────────────────────────────────────────────────
+// Server-side proxy so the Anthropic API key never reaches the browser.
+// The browser sends {model, messages, system, tools, max_tokens, thinking, user}
+// and this function makes the actual Anthropic call using the key stored in
+// admin/config.secret.php (never exposed to the client).
+//
+// Enforces, in order: AI must be configured, the requesting user must have the
+// 'aiEdit' permission, and a per-user hourly rate limit.
+
+function foundrySecret() {
+    static $cfg = null;
+    if ($cfg === null) {
+        $f = __DIR__ . '/config.secret.php';
+        $cfg = file_exists($f) ? (include $f) : [];
+        if (!is_array($cfg)) $cfg = [];
+    }
+    return $cfg;
+}
+
+// Mirror of the client's getEffectivePerms(): role defaults + per-user overrides.
+// Reads from the SQLite DB (the source of truth for accounts).
+function foundryUserCanAI($username) {
+    $roleDefaults = ['superadmin' => true, 'admin' => true, 'editor' => false];
+    try { $rec = fourgeGetUser(fourgeDb(), $username); } catch (Throwable $e) { $rec = null; }
+    if (!$rec) return false;
+    // Explicit per-user override wins (permissions.aiEdit), else role default
+    if (!empty($rec['permissions'])) {
+        $perms = json_decode($rec['permissions'], true);
+        if (is_array($perms) && array_key_exists('aiEdit', $perms)) return (bool)$perms['aiEdit'];
+    }
+    return !empty($roleDefaults[$rec['role'] ?? 'editor']);
+}
+
+// One module switch, as the admin's getEffectivePerms() sees it, for modules an
+// editor has by default (Analytics): Architects, Super Admins and Admins always
+// have it; an editor has it unless an Admin switched it off for them in Users.
+function fourgeEditorModuleOn($user, $key) {
+    if (!is_array($user)) return false;
+    if (!empty($user['is_architect']) || ($user['role'] ?? 'editor') !== 'editor') return true;
+    $perms = json_decode((string)($user['permissions'] ?? ''), true);
+    return !(is_array($perms) && array_key_exists($key, $perms) && !$perms[$key]);
+}
+
+// Per-user hourly AI allowance, tracked in data/ai_usage.json (best-effort).
+// Only answers Anthropic actually gave count: an attempt it turned away
+// (overloaded, its own rate limit) costs nothing, and the browser retries those,
+// so counting them used up the hour on a busy day — a batch of landing pages
+// could hit the limit after a handful of pages.
+function foundryAiUsage($username, $add = false) {
+    $dir = __DIR__ . '/../data';
+    if (!is_dir($dir)) @mkdir($dir, 0755, true);
+    $file = $dir . '/ai_usage.json';
+    $hour = (int)floor(time() / 3600);
+    $data = file_exists($file) ? (json_decode((string)file_get_contents($file), true) ?: []) : [];
+    foreach ($data as $u => $rec) { if (($rec['hour'] ?? 0) !== $hour) unset($data[$u]); }   // last hour's counts are gone
+    $key = (string)$username ?: 'anon';
+    $cur = (($data[$key]['hour'] ?? 0) === $hour) ? (int)($data[$key]['count'] ?? 0) : 0;
+    if ($add) { $data[$key] = ['hour' => $hour, 'count' => ++$cur]; @file_put_contents($file, json_encode($data)); }
+    return $cur;
+}
+// The per-user hourly limit: 'ai_rate_per_hour' in config.secret.php, else 300
+// (it was 40). 0 means unlimited.
+function foundryAiLimit() {
+    $cfg = foundrySecret();
+    return isset($cfg['ai_rate_per_hour']) ? (int)$cfg['ai_rate_per_hour'] : 300;
+}
+// Where Anthropic's API lives. FOURGE_ANTHROPIC_API_BASE points the tests at a stub.
+function foundryAnthropicBase() { $b = getenv('FOURGE_ANTHROPIC_API_BASE'); return ($b && preg_match('~^https?://~', $b)) ? rtrim($b, '/') : 'https://api.anthropic.com'; }
+
+function claudeProxy($body) {
+    $secretPath = __DIR__ . '/config.secret.php';
+    $cfg = foundrySecret();
+    // Prefer the Architect-managed key stored (encrypted) in the DB; fall back
+    // to the static anthropic_key in config.secret.php.
+    $key = '';
+    try { $key = (string)fourgeGetSecret(fourgeDb(), 'claude_key'); } catch (Throwable $e) { $key = ''; }
+    if ($key === '') $key = trim($cfg['anthropic_key'] ?? '');
+    if (!$key || strpos($key, 'REPLACE') !== false) {
+        http_response_code(500);
+        // Diagnostic: report exactly which condition failed so setup is unambiguous.
+        // Deep diagnostic: report exactly what the server actually loaded.
+        $diag = [];
+        $diag['expected_path'] = $secretPath;
+        $diag['file_exists']   = file_exists($secretPath);
+        // Also probe a capitalized variant in case of a stray duplicate
+        $altPath = __DIR__ . '/Config.secret.php';
+        $diag['capital_C_variant_exists'] = file_exists($altPath);
+        $diag['returned_type'] = gettype($cfg);
+        $diag['is_array']      = is_array($cfg);
+        $diag['array_keys']    = is_array($cfg) ? array_keys($cfg) : null;
+        $diag['key_present']   = is_array($cfg) && array_key_exists('anthropic_key', $cfg);
+        $diag['key_length']    = is_string($key) ? strlen($key) : 0;
+        // Masked preview so we can see if it read a real key without exposing it
+        if (is_string($key) && strlen($key) > 12) {
+            $diag['key_preview'] = substr($key, 0, 8) . '...' . substr($key, -4);
+        } else {
+            $diag['key_preview'] = $key;
+        }
+        $diag['has_REPLACE']   = (is_string($key) && strpos($key, 'REPLACE') !== false);
+
+        if (!file_exists($secretPath)) {
+            $reason = 'config.secret.php NOT FOUND at expected path.';
+        } elseif (!is_array($cfg)) {
+            $reason = 'config.secret.php was found but did NOT return an array (likely a PHP parse error in the file — check for smart-quotes or a stray character).';
+        } elseif (!array_key_exists('anthropic_key', $cfg)) {
+            $reason = 'File returned an array but has no "anthropic_key" entry. Keys found: ' . implode(', ', array_keys($cfg));
+        } elseif (!$key) {
+            $reason = 'anthropic_key is present but EMPTY.';
+        } else {
+            $reason = 'anthropic_key still contains placeholder text "REPLACE".';
+        }
+        echo json_encode(['error' => 'AI not configured: ' . $reason, 'diag' => $diag]);
+        return;
+    }
+
+    // Identify the requesting user (sent by the client from its session)
+    $username = $body['user'] ?? '';
+    if (!foundryUserCanAI($username)) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Your account does not have AI editing enabled. Ask an admin to grant the AI Edit module.']);
+        return;
+    }
+
+    $limit = foundryAiLimit();
+    if ($limit > 0 && foundryAiUsage($username) >= $limit) {
+        $mins = max(1, (int)ceil((3600 - time() % 3600) / 60));
+        http_response_code(429);
+        echo json_encode(['error' => 'AI usage limit reached for this hour (' . $limit . ' requests). It resets in ' . $mins . ' minute' . ($mins === 1 ? '' : 's') . '.']);
+        return;
+    }
+
+    // Build the Anthropic request from the client-provided fields (allow-listed)
+    $payload = [
+        'model'      => $body['model']      ?? 'claude-opus-4-8',
+        'max_tokens' => (int)($body['max_tokens'] ?? 4096),
+        'messages'   => $body['messages']   ?? [],
+    ];
+    if (!empty($body['system']))   $payload['system']   = $body['system'];
+    if (!empty($body['tools']))    $payload['tools']    = $body['tools'];
+    if (!empty($body['thinking'])) $payload['thinking'] = $body['thinking'];
+
+    if (!is_array($payload['messages']) || !count($payload['messages'])) {
+        http_response_code(400);
+        echo json_encode(['error' => 'No messages provided']);
+        return;
+    }
+
+    $ch = curl_init(foundryAnthropicBase() . '/v1/messages');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_HTTPHEADER     => [
+            'Content-Type: application/json',
+            'x-api-key: ' . $key,
+            'anthropic-version: 2023-06-01',
+        ],
+        CURLOPT_POSTFIELDS     => json_encode($payload),
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_TIMEOUT        => 60,
+    ]);
+    $res  = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err  = curl_error($ch);
+    fourgeCurlClose($ch);
+
+    if ($err) { http_response_code(502); echo json_encode(['error' => 'AI request failed: ' . $err]); return; }
+    if ($code >= 200 && $code < 300) foundryAiUsage($username, true);   // only an answer counts toward the hour
+    // Pass Anthropic's JSON straight through (success or structured error),
+    // preserving the upstream status code so the client's retry logic works.
+    http_response_code($code ?: 200);
+    echo $res;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTH + ACCOUNTS + SECRETS  (SQLite-backed — see db.php)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── ARCHITECT ACCOUNTS ───────────────────────────────────────────────────────
+// The agency's Architect accounts: level 4 on every Fourge site — every panel,
+// every secret, invisible to lower levels, and never deletable. A new site gets
+// them from its seed (data/users.json marks them architect:true); this list
+// keeps them that way on every site, including ones seeded before an address
+// was added to it: on each sign-in and signed-in request, an account whose
+// username or email is on the list is put back to Architect + Super Admin with
+// the full module set if anything changed it. Because of that, the addresses
+// are reserved: only an Architect can create an account with one or move an
+// account onto one, and team onboarding never provisions one — otherwise the
+// restore would hand Architect access to whoever made the account.
+// Kept in step with ARCHITECT_EMAILS in admin/index.html. A function, not a
+// const: a top-level const only exists once execution reaches its line, and
+// the dispatcher near the top of this file runs long before this point.
+function fourgeArchitectEmails() { return ['scott@44interactive.com', 'kellar@44interactive.com']; }
+function fourgeIsArchitectAddress($s) {
+    $s = strtolower(trim((string)$s));
+    return $s !== '' && in_array($s, fourgeArchitectEmails(), true);
+}
+// Restore every listed account that is not exactly Architect + Super Admin with
+// the full module set. A read first and a write only when something is off, so
+// the usual request costs one small SELECT and never takes a write lock.
+function fourgeEnsureArchitects($pdo) {
+    $list = fourgeArchitectEmails();
+    $in = implode(',', array_fill(0, count($list), '?'));
+    $st = $pdo->prepare("SELECT id FROM users WHERE (is_architect<>1 OR role<>'superadmin' OR permissions IS NOT NULL) AND (lower(username) IN ($in) OR lower(email) IN ($in))");
+    $st->execute(array_merge($list, $list));
+    $ids = $st->fetchAll(PDO::FETCH_COLUMN);
+    if (!$ids) return 0;
+    $up = $pdo->prepare("UPDATE users SET is_architect=1, role='superadmin', permissions=NULL, updated_at=? WHERE id=?");
+    foreach ($ids as $id) $up->execute([date('c'), (int)$id]);
+    return count($ids);
+}
+
+// ── SHARED AGENCY ACCOUNTS: PASSWORD CHANGES ACROSS EVERY SITE ─────────────
+// Each site keeps its accounts in its own database, so a password the agency
+// changes for a shared account (editor44i) has to travel with the engine. Each
+// entry is [change id, password hash] — the hash only, never the password. A
+// site applies a change once, on the first sign-in or signed-in request after
+// it updates: the account gets that hash, any forced password change is
+// cleared, and its open sessions on that site end, so the old password stops
+// working everywhere the new engine runs. users.pw_rotation records the change
+// id, so it is not applied again: a password set later on one site (Users)
+// stays until the next change here. A site without the account is untouched.
+// To change it again: a new bcrypt hash (cost 12, so every host can check it)
+// under a new change id, and the same hash in data/users.json for new sites.
+function fourgeManagedPasswords() {
+    return [
+        'editor44i' => ['2026-11-09', '$2y$12$19rbWdqG8UTgo5mRCbCI9.1G9d7gkz4a2U7dTbDKq3FHIOsUsI0i6'],
+    ];
+}
+function fourgeApplyManagedPasswords($pdo) {
+    $applied = 0;
+    foreach (fourgeManagedPasswords() as $username => $spec) {
+        [$changeId, $hash] = $spec;
+        $find = function () use ($pdo, $username, $changeId) {
+            $st = $pdo->prepare("SELECT id FROM users WHERE username=? AND (pw_rotation IS NULL OR pw_rotation<>?)");
+            $st->execute([$username, $changeId]);
+            return $st->fetchColumn();
+        };
+        try { $id = $find(); }
+        catch (Throwable $e) {
+            // users.pw_rotation arrives with this release (fourgeMigrate in db.php adds it too);
+            // add it here if this site's db.php is older than its api.php.
+            $pdo->exec("ALTER TABLE users ADD COLUMN pw_rotation TEXT");
+            $id = $find();
+        }
+        if (!$id) continue;
+        $pdo->prepare("UPDATE users SET password_hash=?, must_change_password=0, pw_rotation=?, updated_at=? WHERE id=?")
+            ->execute([$hash, $changeId, date('c'), (int)$id]);
+        $pdo->prepare("DELETE FROM sessions WHERE username=?")->execute([$username]);
+        $applied++;
+    }
+    return $applied;
+}
+
+function fourgeApiLogin($body) {
+    $pdo = fourgeDb();
+    // The 'username' field may carry a username OR an email address.
+    $identifier = trim($body['username'] ?? '');
+    $password   = (string)($body['password'] ?? '');
+    if ($identifier === '' || $password === '') {
+        http_response_code(400); echo json_encode(['error' => 'Enter your username or email and password']); return;
+    }
+    $user = fourgeGetUserByLogin($pdo, $identifier);
+    if (!$user || !fourgeVerifyPassword($pdo, $user, $password)) {
+        // Team onboarding: a NEW email on the agency domain + the shared onboard
+        // password self-provisions an editor account (forced password change on
+        // first login). Only when no account exists for that email — never an
+        // override of an existing login. See the ONBOARD_* config above.
+        $user = fourgeTryOnboard($pdo, $identifier, $password);
+        if (!$user) { http_response_code(401); echo json_encode(['error' => 'Invalid login or password']); return; }
+    }
+    $token = fourgeCreateSession($pdo, $user['username']);
+    $user  = fourgeGetUser($pdo, $user['username']); // reload — verify may have upgraded the hash
+    echo json_encode(['ok' => true, 'token' => $token, 'user' => fourgePublicUser($user)]);
+}
+
+// Self-provision an editor account for a NEW email on the agency domain when the
+// shared onboard password is supplied. Returns the freshly-created user row, or
+// null when onboarding doesn't apply: feature off, wrong password, not an email
+// on ONBOARD_EMAIL_DOMAIN, or an account already exists for that email (we never
+// override an existing login). must_change_password=1 forces a new password on
+// first login; until then this same onboard password authenticates the account.
+function fourgeTryOnboard($pdo, $identifier, $password) {
+    if (ONBOARD_PASSWORD === '') return null;                            // feature off
+    if (!hash_equals(ONBOARD_PASSWORD, (string)$password)) return null;  // constant-time
+    $email = strtolower(trim((string)$identifier));
+    if (!filter_var($email, FILTER_VALIDATE_EMAIL)) return null;         // must be an email
+    $at     = strrpos($email, '@');
+    $domain = $at === false ? '' : substr($email, $at + 1);
+    if ($domain === '' || $domain !== ONBOARD_EMAIL_DOMAIN) return null; // exact domain match
+    if (fourgeIsArchitectAddress($email)) return null;                   // an Architect address is never self-provisioned
+    if (fourgeLoginTaken($pdo, $email, $email, 0)) return null;          // never override an existing account
+    $now  = date('c');
+    $hash = password_hash($password, fourgePwAlgo());
+    $pdo->prepare("INSERT INTO users (username, display_name, email, first_name, last_name, role, is_architect, password_hash, must_change_password, permissions, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+        ->execute([$email, $email, $email, '', '', 'editor', 0, $hash, 1, null, $now, $now]);
+    return fourgeGetUser($pdo, $email);
+}
+
+function fourgeApiLogout($token) {
+    fourgeDeleteSession(fourgeDb(), $token);
+    echo json_encode(['ok' => true]);
+}
+
+function fourgeApiListUsers($me) {
+    $pdo = fourgeDb();
+    $myLevel = fourgeLevel($me);
+    $rows = $pdo->query("SELECT * FROM users")->fetchAll();
+    $out = [];
+    foreach ($rows as $u) {
+        if (strtolower($u['username']) === strtolower($me['username'])) continue; // hide self
+        if (fourgeLevel($u) > $myLevel) continue;                                  // never show higher access
+        $out[] = fourgePublicUser($u);
+    }
+    usort($out, function ($a, $b) { return [$b['role'], $a['username']] <=> [$a['role'], $b['username']]; });
+    echo json_encode(['ok' => true, 'users' => $out, 'me' => fourgePublicUser($me)]);
+}
+
+function fourgeApiSaveUser($me, $body) {
+    $pdo = fourgeDb();
+    $myLevel = fourgeLevel($me);
+    $id = (isset($body['id']) && $body['id'] !== '' && $body['id'] !== null) ? (int)$body['id'] : 0;
+
+    $role = $body['role'] ?? 'editor';
+    if (!in_array($role, ['editor', 'admin', 'superadmin'], true)) $role = 'editor';
+    $roleLevel = $role === 'superadmin' ? 3 : ($role === 'admin' ? 2 : 1);
+    if ($roleLevel > $myLevel) { http_response_code(403); echo json_encode(['error' => 'You cannot assign a role above your own']); return; }
+
+    $username = strtolower(trim($body['username'] ?? ''));
+    $email    = trim($body['email'] ?? '');
+    $first    = trim($body['firstName'] ?? '');
+    $last     = trim($body['lastName'] ?? '');
+    if ($username === '' && $email !== '') $username = strtolower($email);   // default username to the email
+    if ($username === '') { http_response_code(400); echo json_encode(['error' => 'A username or email is required']); return; }
+
+    $pw          = (string)($body['password'] ?? '');
+    $permissions = array_key_exists('permissions', $body) ? json_encode($body['permissions']) : null;
+    if ($role !== 'editor') $permissions = null;  // admin/superadmin inherit all modules
+    // null = caller didn't send this field at all (as opposed to an explicit
+    // false) — resolved below into "preserve the existing value" for an edit,
+    // or "off by default" for a brand-new account. Never just default it to 0
+    // unconditionally: the admin UI now sends this explicitly on every save,
+    // but a caller that doesn't know about the field yet must not silently
+    // CLEAR an existing user's pending forced password change out from under
+    // them just by saving an unrelated edit.
+    $mustChange  = array_key_exists('mustChangePassword', $body) ? (!empty($body['mustChangePassword']) ? 1 : 0) : null;
+    $display     = trim("$first $last");
+    $now = date('c');
+    // An Architect address is reserved (see fourgeArchitectEmails).
+    $reserved = fourgeIsArchitectAddress($username) || fourgeIsArchitectAddress($email);
+    $reservedMsg = 'That address belongs to a Fourge Architect account. Only an Architect can add it or move an account onto it.';
+
+    if ($id) {
+        // ── EDIT ──
+        $st = $pdo->prepare("SELECT * FROM users WHERE id=?"); $st->execute([$id]);
+        $existing = $st->fetch();
+        if (!$existing) { http_response_code(404); echo json_encode(['error' => 'User not found']); return; }
+        if (!empty($existing['is_architect']) && empty($me['is_architect'])) {
+            http_response_code(403); echo json_encode(['error' => 'Only an Architect can modify an Architect account']); return;
+        }
+        if ($reserved && empty($me['is_architect'])) { http_response_code(403); echo json_encode(['error' => $reservedMsg]); return; }
+        if (fourgeLevel($existing) > $myLevel) {
+            http_response_code(403); echo json_encode(['error' => 'You cannot manage that account']); return;
+        }
+        if (fourgeLoginTaken($pdo, $username, $email, $id)) {
+            http_response_code(409); echo json_encode(['error' => 'That username or email is already in use']); return;
+        }
+        if ($permissions === null) $permissions = $existing['permissions'] ?? null;
+        if ($role !== 'editor') $permissions = null;
+        if ($display === '') $display = $existing['display_name'] ?? $username;
+        if ($pw !== '') {
+            if (strlen($pw) < 8) { http_response_code(400); echo json_encode(['error' => 'Password must be at least 8 characters']); return; }
+            fourgeSetPassword($pdo, $existing['username'], $pw);
+        }
+        if ($mustChange === null) $mustChange = (int)!empty($existing['must_change_password']); // not sent → leave as-is
+        $pdo->prepare("UPDATE users SET username=?, email=?, first_name=?, last_name=?, display_name=?, role=?, permissions=?, must_change_password=?, updated_at=? WHERE id=?")
+            ->execute([$username, $email, $first, $last, $display, $role, $permissions, $mustChange, $now, $id]);
+        if (strtolower($existing['username']) !== $username) {          // keep sessions valid across a username change
+            $pdo->prepare("UPDATE sessions SET username=? WHERE username=?")->execute([$username, $existing['username']]);
+        }
+    } else {
+        // ── CREATE ──
+        if ($reserved && empty($me['is_architect'])) { http_response_code(403); echo json_encode(['error' => $reservedMsg]); return; }
+        if (strlen($pw) < 8) { http_response_code(400); echo json_encode(['error' => 'New accounts need a password of at least 8 characters']); return; }
+        if (fourgeLoginTaken($pdo, $username, $email, 0)) {
+            http_response_code(409); echo json_encode(['error' => 'That username or email is already in use']); return;
+        }
+        if ($display === '') $display = $username;
+        if ($mustChange === null) $mustChange = 0; // not sent → off by default, same as before this field existed
+        $hash = password_hash($pw, fourgePwAlgo());
+        $pdo->prepare("INSERT INTO users (username, display_name, email, first_name, last_name, role, is_architect, password_hash, must_change_password, permissions, created_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+            ->execute([$username, $display, $email, $first, $last, $role, 0, $hash, $mustChange, $permissions, $now, $now]);
+    }
+    // An Architect address saved by an Architect becomes, or stays, an Architect account.
+    try { fourgeEnsureArchitects($pdo); } catch (Throwable $e) {}
+    echo json_encode(['ok' => true]);
+}
+
+function fourgeApiDeleteUser($me, $body) {
+    $pdo = fourgeDb();
+    $username = strtolower(trim($body['username'] ?? ''));
+    if ($username === '') { http_response_code(400); echo json_encode(['error' => 'username required']); return; }
+    if ($username === strtolower($me['username'])) { http_response_code(400); echo json_encode(['error' => "You can't delete your own account"]); return; }
+    $u = fourgeGetUser($pdo, $username);
+    if (!$u) { http_response_code(404); echo json_encode(['error' => 'User not found']); return; }
+    if (!empty($u['is_architect'])) { http_response_code(403); echo json_encode(['error' => 'An Architect account cannot be deleted']); return; }
+    if (fourgeLevel($u) > fourgeLevel($me)) { http_response_code(403); echo json_encode(['error' => 'You cannot delete that account']); return; }
+    $pdo->prepare("DELETE FROM users WHERE username=?")->execute([$username]);
+    $pdo->prepare("DELETE FROM sessions WHERE username=?")->execute([$username]);
+    echo json_encode(['ok' => true]);
+}
+
+function fourgeApiChangePassword($me, $body) {
+    $pdo = fourgeDb();
+    $new = (string)($body['new'] ?? '');
+    if (strlen($new) < 8) { http_response_code(400); echo json_encode(['error' => 'Password must be at least 8 characters']); return; }
+    $u = fourgeGetUser($pdo, $me['username']);
+    if (!$u) { http_response_code(404); echo json_encode(['error' => 'Account not found']); return; }
+    // Normal change requires the current password. A forced first-login change
+    // (must_change flag set) is authorized by the valid session alone.
+    if (empty($u['must_change_password'])) {
+        if (!fourgeVerifyPassword($pdo, $u, (string)($body['old'] ?? ''))) {
+            http_response_code(403); echo json_encode(['error' => 'Current password is incorrect']); return;
+        }
+    }
+    fourgeSetPassword($pdo, $u['username'], $new);
+    $pdo->prepare("UPDATE users SET must_change_password=0, updated_at=? WHERE username=?")->execute([date('c'), $u['username']]);
+    echo json_encode(['ok' => true]);
+}
+
+// Secrets whose cleartext the browser legitimately needs (the Architect's
+// browser publishes to GitHub directly; the Mailgun routing fields are shown so
+// they can be edited). The Mailgun API KEY stays status-only — never sent back.
+// Names in this list have their VALUE (not just saved/not-saved status)
+// returned to the browser — fleet_url was documented in fourgeSecretPolicy's
+// own comment as belonging here ("handed back to the browser so it can be
+// seen and edited") but was never actually added, so the Dashboard address
+// field silently rendered blank on every reload despite saving correctly.
+function fourgeClientFullSecrets() { return ['github_pat', 'repo_override', 'mg_domain', 'mg_from', 'mg_notify_to', 'tlp_url', 'fleet_url', 'ai_endpoint_url', 'ai_endpoint_model']; }
+
+function fourgeApiGetSecrets($me) {
+    $pdo = fourgeDb();
+    $myLevel = fourgeLevel($me);
+    $full = fourgeClientFullSecrets();
+    $secrets = []; $status = [];
+    foreach (fourgeSecretPolicy() as $name => $lvl) {
+        if ($myLevel < $lvl) continue;
+        $val = fourgeGetSecret($pdo, $name);
+        $status[$name] = ($val !== null && $val !== '');
+        if (in_array($name, $full, true) && $val !== null) $secrets[$name] = $val;
+    }
+    // Cast to objects so empty maps serialize as {} (not []) for the client.
+    echo json_encode(['ok' => true, 'secrets' => (object)$secrets, 'status' => (object)$status, 'level' => $myLevel]);
+}
+
+function fourgeApiSetSecret($me, $body) {
+    $pdo   = fourgeDb();
+    $name  = (string)($body['name'] ?? '');
+    $value = (string)($body['value'] ?? '');
+    if (!array_key_exists($name, fourgeSecretPolicy())) {
+        http_response_code(400); echo json_encode(['error' => 'Unknown setting: ' . htmlspecialchars($name)]); return;
+    }
+    if (fourgeLevel($me) < fourgeSecretLevel($name)) {
+        http_response_code(403); echo json_encode(['error' => 'You do not have access to that setting']); return;
+    }
+    if ($value === '') {
+        $pdo->prepare("DELETE FROM secrets WHERE name=?")->execute([$name]); // empty = clear
+    } else {
+        fourgeSetSecret($pdo, $name, $value, $me['username']);
+    }
+    echo json_encode(['ok' => true]);
+}
+
+// ── PER-PAGE PASSWORD PROTECTION (PHP session gate) ─────────────────────────────
+// Stores a bcrypt hash per protected page in admin/protect.secret.php (a .php file,
+// never served as source), (re)writes the public _fourge_gate.php, and maintains a
+// managed RewriteRule block in the root .htaccess so protected pages route through
+// the gate. The gate shows a branded password form and serves the page only after
+// the visitor unlocks it (PHP session).
+function fourgeProtectStorePath() { return __DIR__ . '/protect.secret.php'; }
+function fourgeLoadProtectMap() {
+    $f = fourgeProtectStorePath();
+    if (is_file($f)) { $m = include $f; if (is_array($m)) return $m; }
+    return [];
+}
+function fourgeSaveProtectMap($map) {
+    $out = "<?php\n// Fourge per-page password hashes — NEVER served as source (PHP executes this).\n// Managed by the CMS; do not edit by hand.\nreturn " . var_export($map, true) . ";\n";
+    return file_put_contents(fourgeProtectStorePath(), $out) !== false;
+}
+function fourgeWriteGateFile() {
+    $src = <<<'GATE'
+<?php
+// Fourge page gate — protects the pages listed in admin/protect.secret.php.
+// Managed by the CMS; do not edit by hand.
+$store = __DIR__ . '/admin/protect.secret.php';
+$map = is_file($store) ? (include $store) : array();
+if (!is_array($map)) $map = array();
+$p = isset($_GET['p']) ? (string)$_GET['p'] : '';
+$p = ltrim(str_replace('\\', '/', $p), '/');
+if ($p === '' || strpos($p, '..') !== false || !array_key_exists($p, $map)) { http_response_code(404); echo 'Not found'; exit; }
+$file = realpath(__DIR__ . '/' . $p);
+$root = realpath(__DIR__);
+if (!$file || strpos($file, $root) !== 0 || !is_file($file)) { http_response_code(404); echo 'Not found'; exit; }
+$secure = (!empty($_SERVER['HTTPS']) && strtolower($_SERVER['HTTPS']) !== 'off') || ((isset($_SERVER['HTTP_X_FORWARDED_PROTO']) ? $_SERVER['HTTP_X_FORWARDED_PROTO'] : '') === 'https');
+if (PHP_VERSION_ID >= 70300) {
+    session_set_cookie_params(array('lifetime'=>0,'path'=>'/','httponly'=>true,'samesite'=>'Lax','secure'=>$secure));
+} else {
+    session_set_cookie_params(0, '/; samesite=Lax', '', $secure, true);
+}
+session_name('fourge_gate');
+session_start();
+if (!empty($_SESSION['fourge_unlocked'][$p])) {
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: private, no-store');
+    readfile($file); exit;
+}
+$err = '';
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $pw = isset($_POST['fourge_pw']) ? (string)$_POST['fourge_pw'] : '';
+    if ($pw !== '' && password_verify($pw, $map[$p])) {
+        session_regenerate_id(true);
+        $_SESSION['fourge_unlocked'][$p] = true;
+        header('Location: /' . $p); exit;
+    }
+    usleep(400000);
+    $err = 'Incorrect password. Please try again.';
+}
+// 401 for every form render (visitor is not unlocked). No WWW-Authenticate header,
+// so browsers show this HTML form rather than the native Basic-Auth popup.
+http_response_code(401);
+$e = function($s){ return htmlspecialchars($s, ENT_QUOTES, 'UTF-8'); };
+?><!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>Protected page</title>
+<style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f4f2ee;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:#1a1814;padding:20px}
+.card{background:#fff;border:1px solid #e6e1d8;border-radius:16px;box-shadow:0 10px 40px rgba(0,0,0,.08);padding:34px 30px;width:100%;max-width:380px;text-align:center}
+.lock{width:46px;height:46px;border-radius:12px;background:#fdf0e8;color:#c8531e;display:flex;align-items:center;justify-content:center;margin:0 auto 16px}
+h1{font-size:18px;margin:0 0 6px}p.sub{font-size:13px;color:#6b6557;margin:0 0 20px}
+input[type=password]{width:100%;padding:11px 13px;border:1px solid #d9d3c8;border-radius:10px;font-size:14px;margin-bottom:12px}
+input[type=password]:focus{outline:none;border-color:#c8531e;box-shadow:0 0 0 3px rgba(200,83,30,.12)}
+button{width:100%;padding:11px;background:#c8531e;color:#fff;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer}
+button:hover{background:#b0481a}.err{background:#fceae6;color:#b3261e;border:1px solid #f3c0bb;border-radius:8px;padding:8px 10px;font-size:12px;margin-bottom:12px}
+</style></head>
+<body><div class="card">
+<div class="lock"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg></div>
+<h1>This page is protected</h1><p class="sub">Enter the password to continue.</p>
+<?php if ($err) echo '<div class="err">' . $e($err) . '</div>'; ?>
+<form method="post" action="/<?php echo $e($p); ?>">
+<input type="password" name="fourge_pw" placeholder="Password" autofocus autocomplete="current-password">
+<button type="submit">Unlock</button>
+</form>
+</div></body></html>
+GATE;
+    return fourgeSitePut(PUBLIC_HTML . '/_fourge_gate.php', $src, 'Fourge: page gate') !== false;
+}
+function fourgeWriteProtectHtaccess($paths) {
+    $htPath  = PUBLIC_HTML . '/.htaccess';
+    $existing = is_file($htPath) ? file_get_contents($htPath) : '';
+    $begin = '# BEGIN Fourge Protected Pages';
+    $end   = '# END Fourge Protected Pages';
+    $rules = '';
+    if ($paths) {
+        $rules = "<IfModule mod_rewrite.c>\nRewriteEngine On\n";
+        foreach ($paths as $p) {
+            $pat = str_replace('.', '\\.', $p);
+            $rules .= 'RewriteRule ^' . $pat . '$ /_fourge_gate.php?p=' . $p . ' [L,QSA]' . "\n";
+        }
+        $rules .= "</IfModule>\n";
+    }
+    $block = $begin . "\n" . $rules . $end;
+    if (strpos($existing, $begin) !== false && strpos($existing, $end) !== false) {
+        $existing = preg_replace('/' . preg_quote($begin, '/') . '.*?' . preg_quote($end, '/') . '/s', $block, $existing);
+    } else {
+        $existing = ($existing === '' ? '' : rtrim($existing) . "\n\n") . $block . "\n";
+    }
+    return fourgeSitePut($htPath, $existing, 'Fourge: server rules') !== false;
+}
+// Clean URLs: serve /page from /page.html and 301 the .html form away, so each
+// page has one extensionless address. Managed as its own delimited block so it
+// coexists with the HTTPS redirect and the password-gate block. The CMS calls
+// this (via install_clean_urls) whenever it applies SEO — and once per session
+// on load — so the server rule and the extensionless links the CMS writes into
+// pages always ship together and a site can't advertise URLs it can't serve.
+function fourgeWriteCleanUrlHtaccess() {
+    $htPath   = PUBLIC_HTML . '/.htaccess';
+    $existing = is_file($htPath) ? file_get_contents($htPath) : '';
+    $begin = '# BEGIN Fourge Clean URLs';
+    $end   = '# END Fourge Clean URLs';
+    // Nowdoc (single-quoted) so \s \. $1 %1 are all taken literally, and the
+    // closing marker sits at column 0 for pre-7.3 PHP compatibility.
+    $rules = <<<'HT'
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  # /index.html -> the site root (one canonical home URL)
+  RewriteCond %{REQUEST_URI} !^/(admin|data)/ [NC]
+  RewriteCond %{THE_REQUEST} \s/+index\.html?[\s?] [NC]
+  RewriteRule ^ / [R=301,L]
+  # Any explicit .html request -> its extensionless URL (301)
+  RewriteCond %{REQUEST_URI} !^/(admin|data)/ [NC]
+  RewriteCond %{THE_REQUEST} \s/+(.+?)\.html[\s?] [NC]
+  RewriteRule ^ /%1 [R=301,L]
+  # Extensionless request -> serve the matching .html file when it exists
+  RewriteCond %{REQUEST_URI} !^/(admin|data)/ [NC]
+  RewriteCond %{REQUEST_FILENAME} !-d
+  RewriteCond %{REQUEST_FILENAME}\.html -f
+  RewriteRule ^(.+?)/?$ $1.html [L]
+</IfModule>
+HT;
+    $block = $begin . "\n" . $rules . "\n" . $end;
+    $s = strpos($existing, $begin);
+    $e = strpos($existing, $end);
+    if ($s !== false && $e !== false && $e >= $s) {
+        // Replace the existing managed block in place (substr splice, NOT
+        // preg_replace: the block contains $1, which preg would treat as a
+        // backreference).
+        $existing = substr($existing, 0, $s) . $block . substr($existing, $e + strlen($end));
+    } else {
+        $existing = ($existing === '' ? '' : rtrim($existing) . "\n\n") . $block . "\n";
+    }
+    return fourgeSitePut($htPath, $existing, 'Fourge: server rules') !== false;
+}
+// ── BROWSER CACHING, MANAGED ──────────────────────────────────────────────────
+// Without an explicit policy Apache sends only Last-Modified, and browsers then
+// GUESS how long to keep a file (roughly 10% of its age). A site.js last changed
+// months ago could be served from cache for weeks, so deploys and CMS edits
+// looked like they "didn't take" until a hard refresh (dev.renewalsf.fourge.com,
+// Oct 2026). Pages, styles, scripts and data carry no version in their file
+// names, so browsers must revalidate them on every load — Apache answers 304
+// Not Modified when nothing changed, so this stays fast; images and fonts are
+// kept for a day. Marker-spliced like every other managed block, and wrapped in
+// <IfModule mod_headers.c> so a host without mod_headers simply skips it. A
+// hand-written, unmarked block that already sets Cache-Control for these file
+// types (renewalsf had one) is swapped for the marked version, never duplicated.
+// Runs on every sign-in with the clean-URL self-heal, so existing sites pick it
+// up at their next login; new sites carry it in the template .htaccess.
+function fourgeCacheHtMarkers() {
+    return ['# BEGIN Fourge cache headers — managed by Fourge, do not edit by hand', '# END Fourge cache headers'];
+}
+function fourgeCacheHtaccessBlock() {
+    list($begin, $end) = fourgeCacheHtMarkers();
+    $rules = <<<'HT'
+# Pages, styles, scripts and data aren't versioned in their filenames, so browsers revalidate them on every
+# load. When nothing changed, Apache answers 304 Not Modified, so this stays fast. Images and fonts are
+# kept for a day.
+<IfModule mod_headers.c>
+  <FilesMatch "\.(html?|css|js|json)$">
+    Header set Cache-Control "no-cache"
+  </FilesMatch>
+  <FilesMatch "\.(jpe?g|png|gif|webp|svg|ico|woff2?)$">
+    Header set Cache-Control "public, max-age=86400"
+  </FilesMatch>
+</IfModule>
+HT;
+    return $begin . "\n" . $rules . "\n" . $end;
+}
+// [from, to] offsets of a hand-written cache block — outside every Fourge marker
+// pair — that sets Cache-Control for these file types, or null. The comment lines
+// directly above it come along, so the swap leaves no orphaned heading behind.
+function fourgeCacheHtaccessFindUnmarked($text) {
+    $text = (string)$text;
+    // Blank out every managed block (same length, so offsets still point into $text).
+    $masked = preg_replace_callback('~# BEGIN Fourge[^\n]*\n.*?# END Fourge[^\n]*~s', function ($m) { return str_repeat(' ', strlen($m[0])); }, $text);
+    if ($masked === null) $masked = $text;
+    $isCache = function ($inner) {
+        return stripos($inner, 'Cache-Control') !== false
+            && stripos($inner, '<FilesMatch') !== false
+            && preg_match('~\b(html?|css|js|json|jpe?g|png|gif|webp|svg|ico|woff2?)\b~i', $inner);
+    };
+    $from = null; $to = null; $mm = [];
+    if (preg_match_all('~<IfModule\s+mod_headers\.c>.*?</IfModule>~is', $masked, $mm, PREG_OFFSET_CAPTURE)) {
+        foreach ($mm[0] as $hit) { if ($isCache($hit[0])) { $from = $hit[1]; $to = $hit[1] + strlen($hit[0]); break; } }
+    }
+    if ($from === null && preg_match_all('~<FilesMatch\b[^>]*>.*?</FilesMatch>~is', $masked, $mm, PREG_OFFSET_CAPTURE)) {
+        // Bare blocks (no IfModule): the run of consecutive cache blocks, comments allowed between them.
+        $run = [];
+        foreach ($mm[0] as $hit) {
+            if (!$isCache($hit[0])) { if ($run) break; continue; }
+            if ($run) {
+                $prevEnd = $run[count($run) - 1][1];
+                $gap = preg_replace('~^[ \t]*#[^\n]*$~m', '', substr($masked, $prevEnd, $hit[1] - $prevEnd));
+                if (trim((string)$gap) !== '') break;
+            }
+            $run[] = [$hit[1], $hit[1] + strlen($hit[0])];
+        }
+        if ($run) { $from = $run[0][0]; $to = $run[count($run) - 1][1]; }
+    }
+    if ($from === null) return null;
+    $before = substr($text, 0, $from);
+    if (preg_match('~(?:^|\n)((?:[ \t]*#[^\n]*\n)+)[ \t]*$~', $before, $cm, PREG_OFFSET_CAPTURE)) $from = $cm[1][1];
+    return [$from, $to];
+}
+// Pure: the .htaccess text with the managed block in place — or null when it is
+// already there, byte for byte (so the writer leaves the file untouched).
+function fourgeCacheHtaccessApply($existing) {
+    $existing = (string)$existing;
+    list($begin, $end) = fourgeCacheHtMarkers();
+    $block = fourgeCacheHtaccessBlock();
+    $s = strpos($existing, $begin);
+    $e = strpos($existing, $end);
+    if ($s !== false && $e !== false && $e >= $s) {
+        $out = substr($existing, 0, $s) . $block . substr($existing, $e + strlen($end));
+        return $out === $existing ? null : $out;
+    }
+    $span = fourgeCacheHtaccessFindUnmarked($existing);
+    if ($span) return substr($existing, 0, $span[0]) . $block . substr($existing, $span[1]);
+    // New block: right after the clean-URL block when there is one (the template
+    // keeps the two together); headers do not care about rewrite order.
+    $cuEnd = strpos($existing, '# END Fourge Clean URLs');
+    if ($cuEnd !== false) {
+        $at = $cuEnd + strlen('# END Fourge Clean URLs');
+        return substr($existing, 0, $at) . "\n\n" . $block . substr($existing, $at);
+    }
+    return ($existing === '' ? '' : rtrim($existing) . "\n\n") . $block . "\n";
+}
+function fourgeWriteCacheHtaccess() {
+    $htPath   = PUBLIC_HTML . '/.htaccess';
+    $existing = is_file($htPath) ? file_get_contents($htPath) : '';
+    $out = fourgeCacheHtaccessApply($existing);
+    if ($out === null) return true;   // already exactly in place — nothing to write
+    return fourgeSitePut($htPath, $out, 'Fourge: server rules') !== false;
+}
+// data/posts.json is the site's public blog feed (the same file every blog
+// page already fetches). This opens it to CROSS-ORIGIN reads so other sites —
+// e.g. white-label group sites syndicating the flagship blog — can render it
+// with the post-list block's data-src option. Scope is deliberately tight:
+// GET-only CORS on exactly posts.json; nothing else in data/ is affected.
+// Managed-marker splice, so any existing data/.htaccess content is preserved.
+function fourgeWritePostsCorsHtaccess() {
+    $dir = PUBLIC_HTML . '/data';
+    if (!is_dir($dir)) { @mkdir($dir, 0755, true); }
+    if (!is_dir($dir)) return false;
+    $htPath   = $dir . '/.htaccess';
+    $existing = is_file($htPath) ? file_get_contents($htPath) : '';
+    $begin = '# BEGIN Fourge Posts CORS';
+    $end   = '# END Fourge Posts CORS';
+    $rules = <<<'HT'
+<IfModule mod_headers.c>
+  <FilesMatch "^(posts|reviews|map|events)\.json$">
+    Header set Access-Control-Allow-Origin "*"
+    Header set Access-Control-Allow-Methods "GET"
+  </FilesMatch>
+</IfModule>
+HT;
+    $block = $begin . "\n" . $rules . "\n" . $end;
+    $s = strpos($existing, $begin);
+    $e = strpos($existing, $end);
+    if ($s !== false && $e !== false && $e >= $s) {
+        $existing = substr($existing, 0, $s) . $block . substr($existing, $e + strlen($end));
+    } else {
+        $existing = ($existing === '' ? '' : rtrim($existing) . "\n\n") . $block . "\n";
+    }
+    return fourgeSitePut($htPath, $existing, 'Fourge: server rules') !== false;
+}
+// The 44i SEO platform posts deploy packages to the documented pretty paths
+// /api/seo-platform/package and /api/seo-platform/tick. Apache rewrites them
+// onto this file with the action in the query string, so the platform's POST
+// body stays the raw package JSON. Written by the same login self-heal that
+// installs clean URLs; marker-spliced, IfModule-guarded, best-effort.
+function fourgeWriteSeoApiHtaccess() {
+    $htPath   = PUBLIC_HTML . '/.htaccess';
+    $existing = is_file($htPath) ? file_get_contents($htPath) : '';
+    $begin = '# BEGIN Fourge SEO Platform API';
+    $end   = '# END Fourge SEO Platform API';
+    $rules = <<<'HT'
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteRule ^api/seo-platform/package/?$ admin/api.php?action=seo_package [L,QSA]
+  RewriteRule ^api/seo-platform/tick/?$ admin/api.php?action=seo_pkg_tick [L,QSA]
+</IfModule>
+HT;
+    $block = $begin . "\n" . $rules . "\n" . $end;
+    $s = strpos($existing, $begin);
+    $e = strpos($existing, $end);
+    if ($s !== false && $e !== false && $e >= $s) {
+        $existing = substr($existing, 0, $s) . $block . substr($existing, $e + strlen($end));
+    } else {
+        // Must sit ABOVE the clean-URL block: that block rewrites any
+        // extensionless request to <path>.html, which would swallow these.
+        $cu = strpos($existing, '# BEGIN Fourge Clean URLs');
+        if ($cu !== false) $existing = substr($existing, 0, $cu) . $block . "\n\n" . substr($existing, $cu);
+        else $existing = ($existing === '' ? '' : rtrim($existing) . "\n\n") . $block . "\n";
+    }
+    return fourgeSitePut($htPath, $existing, 'Fourge: server rules') !== false;
+}
+// ── BLOG SYNC: partner-site syndication ─────────────────────────────────────
+// Copies every post from a source Fourge site (e.g. 44idigital.com blogging
+// for its partner network) into THIS site's own posts.json, so this site's
+// blog page renders them like any other local post. Split into a network
+// half (fetch) and a pure half (apply) so the merge/dedupe logic is
+// unit-testable without ever calling out to a real site.
+//
+// Whole-object copy is deliberate: 44i's posts carry extra fields (authorRole,
+// authorBio, topic, category, readMins) this CMS's own post editor doesn't
+// know about. Re-mapping field-by-field would silently drop them; copying the
+// object and only overriding what MUST be site-local (id, slug, plus the
+// bookkeeping fields below) keeps them intact for any partner theme that
+// wants to render them.
+//
+// MEDIA IS LOCALIZED, not hotlinked: a synced post's featured image and its
+// image/video block files are downloaded from the source site into this
+// site's own media library (images/blog-sync/, which the Media panel already
+// lists) and the post is rewritten to those local paths. Hotlinking would
+// leave every partner page's images pointing at the source domain — wrong
+// branding story, broken pages the day the source reorganizes its files, and
+// a per-pageview dependency on someone else's server. Only files ON the sync
+// source's own host are fetched (same trust boundary as posts.json itself;
+// a third-party CDN URL inside a post is left alone), the download itself never
+// follows a redirect — it runs on the origin the feed fetch already resolved, so
+// a www-canonical source works — and a failed download degrades to
+// the absolute source URL so the post still renders.
+function fourgeWriteBlogSyncApiHtaccess() {
+    $htPath   = PUBLIC_HTML . '/.htaccess';
+    $existing = is_file($htPath) ? file_get_contents($htPath) : '';
+    $begin = '# BEGIN Fourge Blog Sync API';
+    $end   = '# END Fourge Blog Sync API';
+    $rules = <<<'HT'
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteRule ^api/blog-sync/tick/?$ admin/api.php?action=blog_sync_tick [L,QSA]
+</IfModule>
+HT;
+    $block = $begin . "\n" . $rules . "\n" . $end;
+    $s = strpos($existing, $begin);
+    $e = strpos($existing, $end);
+    if ($s !== false && $e !== false && $e >= $s) {
+        $existing = substr($existing, 0, $s) . $block . substr($existing, $e + strlen($end));
+    } else {
+        // Must sit ABOVE the clean-URL block: that block rewrites any
+        // extensionless request to <path>.html, which would swallow this.
+        $cu = strpos($existing, '# BEGIN Fourge Clean URLs');
+        if ($cu !== false) $existing = substr($existing, 0, $cu) . $block . "\n\n" . substr($existing, $cu);
+        else $existing = ($existing === '' ? '' : rtrim($existing) . "\n\n") . $block . "\n";
+    }
+    return fourgeSitePut($htPath, $existing, 'Fourge: server rules') !== false;
+}
+function fourgeBlogSyncUid() {
+    // Mirrors the client's uid(): Math.random().toString(36).slice(2,9) — a
+    // 7-char base36 id. Only needs to be locally unique, not cryptographic.
+    $chars = '0123456789abcdefghijklmnopqrstuvwxyz';
+    $s = '';
+    for ($i = 0; $i < 7; $i++) $s .= $chars[random_int(0, 35)];
+    return $s;
+}
+function fourgeBlogSyncAuthorized($me, $body) {
+    if ($me && fourgeLevel($me) >= 2) return true;
+    $tok = '';
+    $hdr = trim((string)($_SERVER['HTTP_AUTHORIZATION'] ?? ''));
+    if ($hdr !== '' && preg_match('~^Bearer\s+(.+)$~i', $hdr, $m)) $tok = trim($m[1]);
+    if ($tok === '') $tok = trim((string)($_SERVER['HTTP_X_BLOG_SYNC_TOKEN'] ?? ''));
+    if ($tok === '') $tok = trim((string)($body['sync_token'] ?? ''));
+    if ($tok === '') return false;
+    $stored = '';
+    try { $stored = (string)fourgeGetSecret(fourgeDb(), 'blog_sync_token'); } catch (Throwable $e) { $stored = ''; }
+    if ($stored === '') return false;
+    return hash_equals($stored, $tok);
+}
+// Same site? The source is configured as an origin (https://44idigital.com), and
+// many sites 301 their apex to www. (or back). Following that one hop is the
+// difference between a working sync and "could not reach the source blog" — but a
+// redirect to any OTHER host is refused: the SSRF guard only vetted the configured
+// one, and a look-alike suffix (44idigital.com.evil.example) is not the same site.
+function fourgeBlogSyncSameSite($hostA, $hostB) {
+    $a = strtolower(preg_replace('~^www\.~i', '', trim((string)$hostA)));
+    $b = strtolower(preg_replace('~^www\.~i', '', trim((string)$hostB)));
+    return $a !== '' && $a === $b;
+}
+// Network half: fetch <source>/data/posts.json, following up to 4 same-site https
+// redirects (apex ↔ www), and keep only what the source's own blog runtime would
+// show right now (published, or scheduled with a publishAt that has passed — the
+// exact rule loadBlog() uses). Returns
+//   ['ok'=>true,  'posts'=>[…], 'base'=>'https://www.example.com']   the origin that actually served the list
+//   ['ok'=>false, 'error'=>'why, in plain words', 'base'=>…]          for lastResult / "Check now"
+function fourgeBlogSyncFetchRemote($sourceUrl) {
+    $sourceUrl = rtrim(trim((string)$sourceUrl), '/');
+    $p = @parse_url($sourceUrl);
+    if ($sourceUrl === '' || !$p || empty($p['host'])) return ['ok' => false, 'error' => 'no source address is configured', 'base' => ''];
+    if (($p['scheme'] ?? '') !== 'https') return ['ok' => false, 'error' => 'the source address must start with https://', 'base' => $sourceUrl];
+    if (!fourgeTlpUrlOk($sourceUrl)) return ['ok' => false, 'error' => 'the source address is not one this server is allowed to fetch', 'base' => $sourceUrl];
+    $origHost = (string)$p['host'];
+    $base = $sourceUrl;
+    $url  = $sourceUrl . '/data/posts.json';
+    for ($hop = 0; $hop <= 4; $hop++) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 20, CURLOPT_CONNECTTIMEOUT => 10, CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_FOLLOWLOCATION => false,   // every hop is vetted by hand below
+            CURLOPT_HTTPHEADER => ['Accept: application/json'],
+            CURLOPT_USERAGENT => 'FourgeCMS Blog Sync',
+        ]);
+        $raw  = curl_exec($ch);
+        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $loc  = (string)curl_getinfo($ch, CURLINFO_REDIRECT_URL);
+        $err  = (string)curl_error($ch);
+        fourgeCurlClose($ch);
+        if ($code >= 300 && $code < 400) {
+            if ($loc === '') return ['ok' => false, 'error' => 'the source redirected (HTTP ' . $code . ') without saying where', 'base' => $base];
+            $lp = @parse_url($loc);
+            if ($lp && empty($lp['host'])) {   // a relative Location — resolve against the address just fetched
+                $cur = @parse_url($url);
+                $loc = ($cur['scheme'] ?? 'https') . '://' . ($cur['host'] ?? $origHost) . (isset($cur['port']) ? ':' . $cur['port'] : '') . (substr($loc, 0, 1) === '/' ? $loc : '/' . $loc);
+                $lp  = @parse_url($loc);
+            }
+            if (!$lp || empty($lp['host'])) return ['ok' => false, 'error' => 'the source redirected to an address that could not be understood (' . $loc . ')', 'base' => $base];
+            if (($lp['scheme'] ?? '') !== 'https') return ['ok' => false, 'error' => 'the source redirected to a non-https address (' . $loc . ')', 'base' => $base];
+            if (!fourgeBlogSyncSameSite($origHost, $lp['host'])) return ['ok' => false, 'error' => 'the source redirected to a different site (https://' . $lp['host'] . ') — if that is the right address, use it as the source', 'base' => $base];
+            if (!fourgeTlpUrlOk($loc)) return ['ok' => false, 'error' => 'the source redirected to an address this server is not allowed to fetch', 'base' => $base];
+            $url  = $loc;
+            $base = 'https://' . $lp['host'] . (isset($lp['port']) ? ':' . $lp['port'] : '');
+            continue;
+        }
+        if ($code === 200 && $raw !== false) {
+            $data = json_decode((string)$raw, true);
+            if (is_array($data) && isset($data['posts']) && is_array($data['posts'])) $data = $data['posts'];   // a {posts:[…]} wrapper is fine too
+            $isList = is_array($data) && ($data === [] || array_keys($data) === range(0, count($data) - 1));
+            if (!$isList) return ['ok' => false, 'error' => $base . '/data/posts.json is not a list of posts', 'base' => $base];
+            $now = time(); $live = [];
+            foreach ($data as $post) {
+                if (!is_array($post) || empty($post['id'])) continue;
+                if (!empty($post['published'])) { $live[] = $post; continue; }
+                $publishAt = $post['publishAt'] ?? null;
+                if ($publishAt) {
+                    $t = strtotime((string)$publishAt);
+                    if ($t !== false && $t <= $now) $live[] = $post;
+                }
+            }
+            return ['ok' => true, 'posts' => $live, 'base' => $base];
+        }
+        if ($code === 0) return ['ok' => false, 'error' => 'could not connect to ' . $base . ($err !== '' ? ' (' . $err . ')' : ''), 'base' => $base];
+        return ['ok' => false, 'error' => 'HTTP ' . $code . ' for ' . $base . '/data/posts.json' . ($code === 404 ? ' — is the source a Fourge site with a blog?' : ''), 'base' => $base];
+    }
+    return ['ok' => false, 'error' => 'the source redirected too many times', 'base' => $base];
+}
+// The older shape (the live post list, or null): kept for callers and tests.
+function fourgeBlogSyncFetchRemotePosts($sourceUrl) {
+    $r = fourgeBlogSyncFetchRemote($sourceUrl);
+    return !empty($r['ok']) ? $r['posts'] : null;
+}
+// Media on the source is usually stored as a relative path (assets/blog/x.jpg —
+// 40 of 44idigital's 49 posts). Copied to another domain that would 404, so every
+// relative URL is rewritten against the source: the featured image, image/video
+// block URLs, and src/href attributes inside HTML-carrying blocks.
+function fourgeBlogSyncAbsUrl($u, $base) {
+    $u = (string)$u; $base = rtrim((string)$base, '/');
+    if ($u === '' || $base === '') return $u;
+    if (preg_match('~^(?:[a-z][a-z0-9+.-]*:|//|#)~i', $u)) return $u;   // absolute, protocol-relative, data:/mailto:/tel:, fragment
+    return $base . (substr($u, 0, 1) === '/' ? '' : '/') . $u;
+}
+function fourgeBlogSyncAbsolutize($post, $base) {
+    $base = rtrim((string)$base, '/');
+    if (!is_array($post) || $base === '') return $post;
+    if (!empty($post['featured']) && is_string($post['featured'])) $post['featured'] = fourgeBlogSyncAbsUrl($post['featured'], $base);
+    if (!empty($post['blocks']) && is_array($post['blocks'])) {
+        foreach ($post['blocks'] as $i => $b) {
+            if (!is_array($b)) continue;
+            $type = (string)($b['type'] ?? '');
+            if (($type === 'image' || $type === 'video') && !empty($b['url']) && is_string($b['url'])) $b['url'] = fourgeBlogSyncAbsUrl($b['url'], $base);
+            if (!empty($b['poster']) && is_string($b['poster'])) $b['poster'] = fourgeBlogSyncAbsUrl($b['poster'], $base);
+            if (!empty($b['html']) && is_string($b['html']) && strpos($b['html'], '<') !== false) {
+                $b['html'] = preg_replace_callback('~\b(src|href)=(["\'])([^"\']*)\2~i', function ($m) use ($base) {
+                    return $m[1] . '=' . $m[2] . fourgeBlogSyncAbsUrl($m[3], $base) . $m[2];
+                }, $b['html']);
+            }
+            $post['blocks'][$i] = $b;
+        }
+    }
+    return $post;
+}
+// ── media localization ──────────────────────────────────────────────────────
+// Resolve a post-media reference to the absolute source-site URL it should be
+// downloaded from — or null when it is not ours to localize (empty, data:,
+// or hosted somewhere other than the sync source). Pure; unit-testable.
+// Percent-encode what the source left raw in a media path — spaces, quotes,
+// non-ASCII ("/uploads/44iD Full/x.png" is refused by curl outright, so such a
+// file never localized and stayed a hotlink) — without double-encoding
+// sequences that are already encoded. Slashes and RFC 3986 path characters stay.
+function fourgeBlogSyncEncodePath($path) {
+    return preg_replace_callback('#%[0-9A-Fa-f]{2}|[^A-Za-z0-9\-._~!$&\'()*+,;=:@/]#', function ($m) {
+        return strlen($m[0]) === 3 ? $m[0] : rawurlencode($m[0]);
+    }, (string)$path);
+}
+
+function fourgeBlogSyncMediaSourceUrl($raw, $sourceUrl) {
+    $raw = trim((string)$raw);
+    $sourceUrl = rtrim(trim((string)$sourceUrl), '/');
+    if ($raw === '' || $sourceUrl === '' || strpos($raw, 'data:') === 0) return null;
+    $srcHost = strtolower((string)parse_url($sourceUrl, PHP_URL_HOST));
+    if ($srcHost === '') return null;
+    $bare = preg_replace('~^www\.~', '', $srcHost);
+    if (preg_match('~^https?://~i', $raw) || strpos($raw, '//') === 0) {
+        $abs  = (strpos($raw, '//') === 0) ? 'https:' . $raw : $raw;
+        $host = strtolower((string)parse_url($abs, PHP_URL_HOST));
+        // Same-site check tolerates the www/bare spelling difference, but the
+        // DOWNLOAD always uses the operator-validated $sourceUrl origin — the
+        // fetch below never follows redirects, and a bare-domain URL on a
+        // www-canonical site (or vice versa) would 301 and yield nothing.
+        if ($host === '' || preg_replace('~^www\.~', '', $host) !== $bare) return null;
+        $path = (string)parse_url($abs, PHP_URL_PATH);
+        if ($path === '' || $path === '/') return null;
+        return $sourceUrl . fourgeBlogSyncEncodePath($path);
+    }
+    $rel = preg_replace('~[?#].*$~s', '', ltrim($raw, '/'));   // path only, like the absolute branch
+    if ($rel === '') return null;
+    return $sourceUrl . '/' . fourgeBlogSyncEncodePath($rel);
+}
+// Deterministic local filename for a source URL: re-syncing (or two posts
+// sharing one image) reuses the already-downloaded file instead of stacking
+// copies. Pure; unit-testable.
+function fourgeBlogSyncMediaLocalPath($absUrl) {
+    $path = (string)parse_url((string)$absUrl, PHP_URL_PATH);
+    $base = strtolower(basename(rawurldecode($path)));   // "My%20Photo.jpg" → my-photo.jpg, not my-20photo.jpg
+    if (!preg_match('~^(?<name>.+)\.(?<ext>jpe?g|png|webp|gif|svg|ico|avif|mp4|m4v|mov|webm|ogv|ogg|mp3|wav|m4a)$~', $base, $m)) return null;
+    $name = preg_replace('~[^a-z0-9._-]+~', '-', $m['name']);
+    $name = trim(preg_replace('~-{2,}~', '-', $name), '-.');
+    if ($name === '') $name = 'media';
+    return 'images/blog-sync/' . substr(sha1((string)$absUrl), 0, 10) . '-' . $name . '.' . $m['ext'];
+}
+// Network half: download one media file from the sync source into the local
+// media library. Returns the root-relative local path ('/images/blog-sync/…')
+// or null. Never follows redirects (same rule as the posts.json fetch), caps
+// the size, and refuses bodies that are obviously not media (an HTML error
+// page saved as .jpg would otherwise poison the library).
+function fourgeBlogSyncDownloadMedia($absUrl) {
+    $rel = fourgeBlogSyncMediaLocalPath($absUrl);
+    if ($rel === null) return null;
+    $dest = PUBLIC_HTML . '/' . $rel;
+    if (is_file($dest) && filesize($dest) > 0) return '/' . $rel;   // already localized
+    $ch = curl_init($absUrl);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 30, CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_MAXFILESIZE    => 52428800,   // 50 MB — bigger than any sane blog asset
+        CURLOPT_USERAGENT      => 'FourgeCMS Blog Sync',
+    ]);
+    $body = curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $type = strtolower((string)curl_getinfo($ch, CURLINFO_CONTENT_TYPE));
+    fourgeCurlClose($ch);
+    if ($code !== 200 || !is_string($body) || $body === '' || strlen($body) > 52428800) return null;
+    $lead = ltrim(substr($body, 0, 64));
+    $isSvg = substr($rel, -4) === '.svg';
+    if (!$isSvg && ($lead === '' || $lead[0] === '<')) return null;              // HTML/XML masquerading as media
+    if ($type !== '' && !preg_match('~^(image|video|audio)/|octet-stream~', $type) && !($isSvg && strpos($type, 'svg') !== false)) return null;
+    $dir = dirname($dest);
+    if (!is_dir($dir) && !@mkdir($dir, 0755, true)) return null;
+    if (fourgeSitePut($dest, $body, 'Fourge: blog sync media') === false) return null;
+    return '/' . $rel;
+}
+// Rewrite one post's media references through $localize(absoluteSourceUrl) →
+// local path|null. Applied to the featured image and to image/video block
+// files; embed blocks are external by nature and are never touched. When a
+// download fails the reference is left as the ABSOLUTE source URL, so the
+// post still renders (hotlinked) rather than breaking. Pure given $localize;
+// unit-testable with a stub. Returns [post, localizedCount].
+//
+// $isBackfill flips how a root-relative path is read. During an initial sync
+// the post just arrived from the remote feed, so '/media/x.jpg' is rooted on
+// the SOURCE site and must be resolved+downloaded. During a backfill the post
+// already lives in this site's posts.json, so a path under the local library
+// prefix is already localized — re-resolving it against the source would
+// re-download it under a new name, or worse, rewrite it back to a source
+// hotlink when the source 404s it.
+function fourgeBlogSyncLocalizePostMedia($post, $sourceUrl, $localize, $isBackfill = false) {
+    $count = 0;
+    $swap = function ($val) use ($sourceUrl, $localize, $isBackfill, &$count) {
+        if ($isBackfill && strpos((string)$val, '/images/blog-sync/') === 0) return $val;
+        $abs = fourgeBlogSyncMediaSourceUrl($val, $sourceUrl);
+        if ($abs === null) return $val;                    // foreign/empty — leave alone
+        $local = $localize($abs);
+        if ($local !== null && $local !== '') { $count++; return $local; }
+        return $abs;                                       // degrade to absolute hotlink
+    };
+    if (!empty($post['featured']) && is_string($post['featured'])) $post['featured'] = $swap($post['featured']);
+    if (!empty($post['blocks']) && is_array($post['blocks'])) {
+        foreach ($post['blocks'] as &$b) {
+            if (!is_array($b) || ($b['type'] ?? '') === 'embed') continue;
+            foreach (['url', 'poster'] as $k) {
+                if (!empty($b[$k]) && is_string($b[$k])) $b[$k] = $swap($b[$k]);
+            }
+        }
+        unset($b);
+    }
+    return [$post, $count];
+}
+// Pure half: given the site record and an already-fetched+filtered remote
+// post list, decide what's new, copy it into local posts.json, and return
+// updated blogSync bookkeeping for the caller to persist into site.json.
+// No network access of its own — media downloads go through the injected
+// $fetchMedia(absUrl) → local-path|null callable (null = don't localize, keep
+// source URLs), so the merge/dedupe/rewrite logic stays fully unit-testable with
+// a stubbed $remotePosts array and a stubbed downloader. $base is the origin the
+// list was really served from (after redirects) — canonical links, absolute
+// media and the downloads all use it; $error is the fetch's plain-words reason
+// when $remotePosts is null, so "Check now" says what actually went wrong.
+function fourgeBlogSyncApplyRemotePosts($site, $remotePosts, $base = '', $error = '', $fetchMedia = null) {
+    $blogSync  = is_array($site['blogSync'] ?? null) ? $site['blogSync'] : [];
+    $syncedIds = is_array($blogSync['syncedIds'] ?? null) ? $blogSync['syncedIds'] : [];
+    $syncedSet = array_flip(array_map('strval', $syncedIds));
+    $sourceUrl = rtrim(trim((string)($blogSync['sourceUrl'] ?? '')), '/');
+    $srcBase   = rtrim(trim((string)$base), '/'); if ($srcBase === '') $srcBase = $sourceUrl;
+
+    if (!is_array($remotePosts)) {
+        $blogSync['lastCheckedAt'] = gmdate('c');
+        $blogSync['lastResult']    = 'Could not reach the source blog — ' . (trim((string)$error) !== '' ? trim((string)$error) : 'check the source address.');
+        return ['blogSync' => $blogSync, 'added' => 0];
+    }
+    if ($srcBase !== '') $blogSync['resolvedBase'] = $srcBase;
+
+    $posts = cmsPkgReadJson('posts.json', []);
+    if (!is_array($posts)) $posts = [];
+    // Self-healing: the synced set is what site.json remembers PLUS what posts.json
+    // already holds from this source (syncedSourceId) — a lost or stale syncedIds can
+    // never make the same posts import again. Copies that already slipped in (the
+    // same source id more than once) are dropped here, keeping the one with the
+    // original slug (duplicates were saved with a -xxxx suffix) so links stay valid.
+    $srcHost = preg_replace('~^www\.~', '', strtolower((string)parse_url($srcBase !== '' ? $srcBase : $sourceUrl, PHP_URL_HOST)));
+    $keeper = []; $dropped = 0;
+    foreach ($posts as $i => $p) {
+        if (!is_array($p) || empty($p['syncedSourceId']) || empty($p['syncedFrom']) || $srcHost === '') continue;
+        if (preg_replace('~^www\.~', '', strtolower((string)parse_url((string)$p['syncedFrom'], PHP_URL_HOST))) !== $srcHost) continue;
+        $sid = (string)$p['syncedSourceId'];
+        $syncedSet[$sid] = true;
+        if (!isset($keeper[$sid]) || strlen((string)$p['slug']) < strlen((string)$posts[$keeper[$sid]]['slug'])) $keeper[$sid] = $i;
+    }
+    if ($keeper) {
+        $keep = array_flip($keeper); $clean = [];
+        foreach ($posts as $i => $p) {
+            $sid = (is_array($p) && !empty($p['syncedSourceId']) && !empty($p['syncedFrom'])) ? (string)$p['syncedSourceId'] : '';
+            if ($sid !== '' && isset($keeper[$sid]) && !isset($keep[$i])) { $dropped++; continue; }
+            $clean[] = $p;
+        }
+        $posts = $clean;
+    }
+    $existingSlugs = [];
+    foreach ($posts as $p) { if (is_array($p) && !empty($p['slug'])) $existingSlugs[$p['slug']] = true; }
+
+    $added = 0; $mediaLocalized = 0;
+    foreach ($remotePosts as $rp) {
+        if (!is_array($rp)) continue;
+        $rid = (string)($rp['id'] ?? '');
+        if ($rid === '' || isset($syncedSet[$rid])) continue;
+
+        // Whole-object copy — see note above — with two passes over its media:
+        // every relative URL is first made absolute on the RESOLVED source origin,
+        // then the localizer downloads what it can from there. The resolved origin
+        // is what makes that download work on a www-canonical source, since the
+        // downloader itself never follows a redirect. Anything it can't fetch — or
+        // inline <img src>/<a href> inside paragraph HTML, which it doesn't handle
+        // — stays an absolute source URL and still renders.
+        $post  = fourgeBlogSyncAbsolutize($rp, $srcBase);
+        if (is_callable($fetchMedia) && $srcBase !== '') {
+            list($post, $n) = fourgeBlogSyncLocalizePostMedia($post, $srcBase, $fetchMedia);
+            $mediaLocalized += $n;
+        }
+        $newId = fourgeBlogSyncUid();
+        $slug  = (string)($rp['slug'] ?? $newId);
+        if (isset($existingSlugs[$slug])) $slug = $slug . '-' . substr($newId, 0, 4);
+
+        $post['id']             = $newId;
+        $post['slug']           = $slug;
+        $post['canonicalUrl']   = $srcBase !== '' ? ($srcBase . '/posts.html?p=' . rawurlencode((string)($rp['slug'] ?? ''))) : null;
+        $post['syncedFrom']     = $sourceUrl;
+        $post['syncedSourceId'] = $rid;
+
+        array_unshift($posts, $post);
+        $existingSlugs[$slug] = true;
+        $syncedSet[$rid] = true;
+        $added++;
+    }
+
+    if ($added > 0 || $dropped > 0) cmsPkgWriteJson('posts.json', $posts);
+
+    $blogSync['syncedIds']     = array_values(array_keys($syncedSet));
+    $blogSync['lastCheckedAt'] = gmdate('c');
+    $blogSync['lastResult']    = ($added > 0
+        ? ($added . ' new post' . ($added === 1 ? '' : 's') . ' synced'
+           . ($mediaLocalized > 0 ? ' (' . $mediaLocalized . ' media file' . ($mediaLocalized === 1 ? '' : 's') . ' copied to the media library)' : ''))
+        : 'Up to date — no new posts')
+        . ($dropped > 0 ? ' — removed ' . $dropped . ' duplicate cop' . ($dropped === 1 ? 'y' : 'ies') : '');
+    return ['blogSync' => $blogSync, 'added' => $added, 'dropped' => $dropped];
+}
+// Combines fetch+apply and persists site.json. Silent, cheap no-op when Blog
+// Sync isn't enabled or has no source configured — safe to call from both the
+// explicit tick endpoint and the opportunistic login rider below.
+// One sync at a time. Two blog visitors arriving together right as the cooldown
+// lapses would otherwise both fetch and both append the same new post.
+// Returns a lock handle, false when another sync holds it, null if no lock file
+// could be made (then the sync simply runs unlocked, as it always did).
+function fourgeBlogSyncLock() {
+    $dir = PUBLIC_HTML . '/data';
+    if (!is_dir($dir)) @mkdir($dir, 0755, true);
+    $fh = @fopen($dir . '/.blog-sync.lock', 'c');
+    if (!$fh) return null;
+    if (!flock($fh, LOCK_EX | LOCK_NB)) { fclose($fh); return false; }
+    return $fh;
+}
+// Backfill: posts synced BEFORE media localization existed (1.14.120) sit in
+// posts.json with their media still hotlinking the source domain, and the
+// normal sync never revisits them (syncedIds skips anything already copied).
+// Walk the local feed and localize any remaining source-host media in synced
+// posts. Idempotent and cheap on every tick: already-local paths resolve to
+// no-ops, and the deterministic filenames mean a re-run downloads nothing
+// that's already on disk. Pure given $fetchMedia; unit-testable with a stub.
+function fourgeBlogSyncBackfillLocalMedia($sourceUrl, $fetchMedia) {
+    $sourceUrl = rtrim(trim((string)$sourceUrl), '/');
+    if ($sourceUrl === '' || !is_callable($fetchMedia)) return 0;
+    $posts = cmsPkgReadJson('posts.json', []);
+    if (!is_array($posts) || !$posts) return 0;
+    $srcBare = preg_replace('~^www\.~', '', strtolower((string)parse_url($sourceUrl, PHP_URL_HOST)));
+    if ($srcBare === '') return 0;
+    $localized = 0; $dirty = false;
+    foreach ($posts as &$p) {
+        if (!is_array($p) || empty($p['syncedFrom'])) continue;   // local posts are the operator's own business
+        $pBare = preg_replace('~^www\.~', '', strtolower((string)parse_url((string)$p['syncedFrom'], PHP_URL_HOST)));
+        if ($pBare !== $srcBare) continue;                        // synced from some other source — not this sync's media
+        list($np, $n) = fourgeBlogSyncLocalizePostMedia($p, $sourceUrl, $fetchMedia, true);
+        if ($n > 0) { $p = $np; $localized += $n; $dirty = true; }
+    }
+    unset($p);
+    if ($dirty) cmsPkgWriteJson('posts.json', $posts);
+    return $localized;
+}
+function fourgeBlogSyncDoSync($site) {
+    $blogSync = is_array($site['blogSync'] ?? null) ? $site['blogSync'] : [];
+    if (empty($blogSync['enabled'])) return ['ok' => true, 'added' => 0, 'skipped' => 'Blog Sync is not enabled.'];
+    $sourceUrl = trim((string)($blogSync['sourceUrl'] ?? ''));
+    if ($sourceUrl === '') return ['ok' => true, 'added' => 0, 'skipped' => 'No source URL configured.'];
+
+    $lock = fourgeBlogSyncLock();
+    if ($lock === false) return ['ok' => true, 'added' => 0, 'skipped' => 'A sync is already running.'];
+    try {
+        $remote = fourgeBlogSyncFetchRemote($sourceUrl);
+        $base   = (string)($remote['base'] ?? '');
+        $result = fourgeBlogSyncApplyRemotePosts($site, !empty($remote['ok']) ? $remote['posts'] : null, $base, (string)($remote['error'] ?? ''), 'fourgeBlogSyncDownloadMedia');
+        $bs = $result['blogSync'];
+        // Media in posts synced before localization existed (main line 1.14.120)
+        // is still hotlinked: walk them while the source is known to be reachable.
+        // Downloads run on the resolved origin, so a www-canonical source works.
+        if (!empty($remote['ok']) && $base !== '') {
+            $backfilled = fourgeBlogSyncBackfillLocalMedia($base, 'fourgeBlogSyncDownloadMedia');
+            if ($backfilled > 0) {
+                $bs['lastResult'] = rtrim((string)$bs['lastResult'], '.')
+                    . ' — localized ' . $backfilled . ' media file' . ($backfilled === 1 ? '' : 's') . ' in previously synced posts';
+            }
+            // The source is reachable: (re)register for pushes so the next publish
+            // there reaches this site within seconds instead of at its next visitor.
+            try { $bs = fourgeBlogSyncMaybeSubscribe($bs, $base); } catch (Throwable $e) {}
+            // Make sure the site actually shows what it syncs (see fourgeBlogSyncAutoPlaceServer).
+            try { $bs = fourgeBlogSyncAutoPlaceServer($bs); } catch (Throwable $e) {}
+            try { $bs = fourgeBlogSyncRefreshRuntimeServer($bs); } catch (Throwable $e) {}
+        }
+        // Persist into a FRESH read of site.json: the record handed in was read a
+        // moment ago, and another save (a settings change, a page's nav update)
+        // may have landed since — only the blogSync bookkeeping is ours to write.
+        $persist = cmsPkgReadJson('site.json', null);
+        if (!is_array($persist)) $persist = is_array($site) ? $site : [];
+        $persist['blogSync'] = $bs;
+        cmsPkgWriteJson('site.json', $persist);
+        return ['ok' => !empty($remote['ok']), 'added' => $result['added'], 'lastResult' => $bs['lastResult']];
+    } finally {
+        if ($lock) { flock($lock, LOCK_UN); fclose($lock); }
+    }
+}
+// The cooldown-gated check. Reached from the login self-heal chain
+// (fourgeApiInstallCleanUrls) and from the public blog_sync_poke that the blog
+// pages fire on every view — so a site stays within ~10 minutes of its source
+// for as long as anyone at all reads its blog, with zero setup. A site nobody
+// visits or logs into can still point an external scheduler at blog_sync_tick.
+function fourgeBlogSyncTickIfDue() {
+    $site = cmsPkgReadJson('site.json', []);
+    if (!is_array($site)) return null;
+    $blogSync = is_array($site['blogSync'] ?? null) ? $site['blogSync'] : [];
+    if (empty($blogSync['enabled'])) return null;
+    $last = strtotime((string)($blogSync['lastCheckedAt'] ?? ''));
+    if ($last !== false && (time() - $last) < 600) return null;   // < 10 minutes — not due yet
+    return fourgeBlogSyncDoSync($site);
+}
+function fourgeApiBlogSyncTick($me, $body) {
+    if (!fourgeBlogSyncAuthorized($me, $body)) { http_response_code(401); echo json_encode(['ok' => false, 'error' => 'Unauthorized']); return; }
+    $site = cmsPkgReadJson('site.json', []);
+    if (!is_array($site)) $site = [];
+    $result = fourgeBlogSyncDoSync($site);
+    echo json_encode($result + ['checked_at' => date('c')]);
+}
+// Public, unauthenticated and deliberately boring: it can only run the sync the
+// admin already configured, and only once TickIfDue's 10-minute cooldown has
+// passed — so the blog pages firing it on every view keep a partner site current
+// within ~10 minutes of a publish, with no cron, and nobody can make it do more
+// than one source fetch per ten minutes. Says nothing but whether posts arrived
+// (the page re-renders its list when they did).
+function fourgeApiBlogSyncPoke($body = []) {
+    $push = is_array($body) && !empty($body['push']);
+    $r = null; $pushed = false;
+    try {
+        if ($push) {
+            // A push from the SOURCE ("I just published"): sync now instead of waiting
+            // for the 10-minute visitor cooldown. Only honoured when the claimed source
+            // is the one this site is configured to sync from (www/apex tolerant), and
+            // at most every 30 seconds — anyone can send the request, but all it can
+            // ever do is make this site re-read the source it already trusts.
+            $site = cmsPkgReadJson('site.json', []);
+            $bs   = is_array($site) && is_array($site['blogSync'] ?? null) ? $site['blogSync'] : [];
+            $srcHost = (string)parse_url((string)($body['source'] ?? ''), PHP_URL_HOST);
+            $cfgHost = (string)parse_url((string)($bs['sourceUrl'] ?? ''), PHP_URL_HOST);
+            $resHost = (string)parse_url((string)($bs['resolvedBase'] ?? ''), PHP_URL_HOST);
+            $lastPush = strtotime((string)($bs['lastPushAt'] ?? ''));
+            $fromSource = $srcHost !== '' && (fourgeBlogSyncSameSite($srcHost, $cfgHost) || ($resHost !== '' && fourgeBlogSyncSameSite($srcHost, $resHost)));
+            if (!empty($bs['enabled']) && $fromSource && ($lastPush === false || (time() - $lastPush) >= 30)) {
+                $site['blogSync'] = $bs; $site['blogSync']['lastPushAt'] = gmdate('c');
+                cmsPkgWriteJson('site.json', $site);               // DoSync re-reads site.json before it persists, so the stamp survives
+                $r = fourgeBlogSyncDoSync($site); $pushed = true;
+            } else {
+                $r = fourgeBlogSyncTickIfDue();                     // not our source, or too soon: behave like an ordinary visitor poke
+            }
+        } else {
+            $r = fourgeBlogSyncTickIfDue();
+        }
+    } catch (Throwable $e) { $r = null; }
+    $out = ['ok' => true, 'checked' => $r !== null, 'added' => (int)($r['added'] ?? 0)];
+    if ($push) $out['pushed'] = $pushed;
+    echo json_encode($out);
+}
+
+// ── Push on publish: "every time a post is published, every partner updates" ──
+// Polling alone leaves a partner site nobody visits or signs into behind until
+// someone does. So: after each successful sync the PARTNER registers itself with
+// its source (blog_sync_subscribe, verified by the source reading the partner's
+// public site.json — it must really say it syncs from that source), and the
+// SOURCE pokes every registered partner the moment its data/posts.json is
+// written (cmsWriteFile hook). Either side being an older engine degrades to the
+// old behaviour: the subscribe call is answered with an error and retried later,
+// and a push poke on an old partner is treated as an ordinary visitor poke.
+
+// This site's own origin (https://host), from the configured Website URL, else the request host.
+function fourgeBlogSyncOwnBase() {
+    $site = cmsPkgReadJson('site.json', []);
+    $w = is_array($site) ? trim((string)($site['website'] ?? '')) : '';
+    if ($w !== '' && !preg_match('~^https?://~i', $w)) $w = 'https://' . $w;
+    if ($w === '' && !empty($_SERVER['HTTP_HOST'])) $w = (fourgeIsHttps() ? 'https://' : 'http://') . $_SERVER['HTTP_HOST'];
+    $p = @parse_url($w);
+    if (!$p || empty($p['host'])) return '';
+    $host = strtolower(preg_replace('/:\d+$/', '', $p['host']));
+    return ($p['scheme'] ?? 'https') . '://' . $host;
+}
+
+// One JSON POST to another Fourge site's api.php. Address is vetted like every
+// other operator-influenced URL (https, public host); redirects are not followed.
+function fourgeBlogSyncPostJson($url, $payload, $timeout = 5) {
+    if (!fourgeTlpUrlOk($url)) return ['ok' => false, 'code' => 0, 'json' => null, 'error' => 'refused address'];
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true, CURLOPT_POSTFIELDS => json_encode($payload),
+        CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => max(1, (int)$timeout), CURLOPT_CONNECTTIMEOUT => min(3, max(1, (int)$timeout)),
+        CURLOPT_SSL_VERIFYPEER => true, CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Accept: application/json'],
+        CURLOPT_USERAGENT => 'FourgeCMS Blog Sync',
+    ]);
+    $raw  = curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err  = (string)curl_error($ch);
+    fourgeCurlClose($ch);
+    $j = is_string($raw) ? json_decode($raw, true) : null;
+    return ['ok' => $code === 200 && is_array($j) && !empty($j['ok']), 'code' => $code, 'json' => is_array($j) ? $j : null, 'error' => $err];
+}
+
+// PARTNER: after a successful sync, tell the source we exist so it can push.
+// Re-registers daily while it works, hourly while it does not (an older source
+// answers "unknown action" — harmless, we simply keep polling as before).
+function fourgeBlogSyncMaybeSubscribe(array $blogSync, $base) {
+    $base = rtrim(trim((string)$base), '/');
+    $own  = fourgeBlogSyncOwnBase();
+    if ($base === '' || $own === '' || !preg_match('~^https://~i', $own)) return $blogSync;
+    $last = strtotime((string)($blogSync['subscribedAt'] ?? ''));
+    $same = (($blogSync['subscribedTo'] ?? '') === $base) && (($blogSync['subscribedAs'] ?? '') === $own);
+    $wait = !empty($blogSync['pushSubscribed']) ? 86400 : 3600;
+    if ($same && $last !== false && (time() - $last) < $wait) return $blogSync;
+    $r = fourgeBlogSyncPostJson($base . '/admin/api.php', ['action' => 'blog_sync_subscribe', 'site' => $own], 6);
+    $blogSync['subscribedAt']   = gmdate('c');
+    $blogSync['subscribedTo']   = $base;
+    $blogSync['subscribedAs']   = $own;
+    $blogSync['pushSubscribed'] = !empty($r['ok']);
+    return $blogSync;
+}
+
+function fourgeBlogSyncSubscribersRead() {
+    $reg = cmsPkgReadJson('blog-sync-subscribers.json', []);
+    if (!is_array($reg)) $reg = [];
+    $reg['subscribers'] = array_values(array_filter(is_array($reg['subscribers'] ?? null) ? $reg['subscribers'] : [], function ($s) { return is_array($s) && !empty($s['site']); }));
+    return $reg;
+}
+function fourgeBlogSyncSubscribersWrite(array $reg) { return cmsPkgWriteJson('blog-sync-subscribers.json', $reg); }
+
+// SOURCE: a partner asks to be pushed. Verified, never taken on its word: the
+// partner's PUBLIC data/site.json must say Blog Sync is on and points at us.
+function fourgeApiBlogSyncSubscribe($body) {
+    $site = rtrim(trim((string)(is_array($body) ? ($body['site'] ?? '') : '')), '/');
+    $p = @parse_url($site);
+    if (!$p || strtolower((string)($p['scheme'] ?? '')) !== 'https' || empty($p['host']) || (!empty($p['path']) && $p['path'] !== '/') || !empty($p['query']) || !fourgeTlpUrlOk($site)) {
+        echo json_encode(['ok' => false, 'reason' => 'bad_site']); return;
+    }
+    $site    = 'https://' . strtolower(preg_replace('/:\d+$/', '', $p['host']));
+    $ownHost = (string)parse_url(fourgeBlogSyncOwnBase(), PHP_URL_HOST);
+    if ($ownHost === '') { echo json_encode(['ok' => false, 'reason' => 'no_own_host']); return; }
+    if (fourgeBlogSyncSameSite((string)$p['host'], $ownHost)) { echo json_encode(['ok' => false, 'reason' => 'self']); return; }
+    $ch = curl_init($site . '/data/site.json');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 8, CURLOPT_CONNECTTIMEOUT => 4, CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_FOLLOWLOCATION => false, CURLOPT_MAXFILESIZE => 1048576,
+        CURLOPT_HTTPHEADER => ['Accept: application/json'], CURLOPT_USERAGENT => 'FourgeCMS Blog Sync',
+    ]);
+    $raw  = curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    fourgeCurlClose($ch);
+    $j  = (is_string($raw) && strlen($raw) <= 1048576) ? json_decode($raw, true) : null;
+    $bs = is_array($j) && is_array($j['blogSync'] ?? null) ? $j['blogSync'] : null;
+    $cfgHost = $bs ? (string)parse_url((string)($bs['sourceUrl'] ?? ''), PHP_URL_HOST) : '';
+    $resHost = $bs ? (string)parse_url((string)($bs['resolvedBase'] ?? ''), PHP_URL_HOST) : '';
+    if ($code !== 200 || !$bs || empty($bs['enabled']) || !(fourgeBlogSyncSameSite($cfgHost, $ownHost) || ($resHost !== '' && fourgeBlogSyncSameSite($resHost, $ownHost)))) {
+        echo json_encode(['ok' => false, 'reason' => $code !== 200 ? 'unreachable' : 'not_a_subscriber']); return;
+    }
+    $reg  = fourgeBlogSyncSubscribersRead();
+    $subs = $reg['subscribers']; $found = false;
+    foreach ($subs as &$s) {
+        if (fourgeBlogSyncSameSite((string)parse_url((string)$s['site'], PHP_URL_HOST), (string)$p['host'])) { $s['site'] = $site; $s['verifiedAt'] = gmdate('c'); $found = true; }
+    }
+    unset($s);
+    if (!$found) $subs[] = ['site' => $site, 'verifiedAt' => gmdate('c')];
+    if (count($subs) > 200) $subs = array_slice($subs, -200);
+    $reg['subscribers'] = $subs;
+    fourgeBlogSyncSubscribersWrite($reg);
+    echo json_encode(['ok' => true, 'subscribers' => count($subs)]);
+}
+
+// SOURCE: poke every registered partner. Bounded (25 partners / 40 s per run;
+// the rest are caught by their own cooldown and the next publish) and serialised
+// by a lock so two saves in a row do not double up.
+function fourgeBlogSyncNotifySubscribers($reason = 'publish') {
+    $reg  = fourgeBlogSyncSubscribersRead();
+    $subs = $reg['subscribers'];
+    if (!$subs) return ['notified' => 0, 'confirmed' => 0];
+    $own  = fourgeBlogSyncOwnBase();
+    if ($own === '') return ['notified' => 0, 'confirmed' => 0, 'skipped' => 'no own host'];
+    $dir = PUBLIC_HTML . '/data'; if (!is_dir($dir)) @mkdir($dir, 0755, true);
+    $lock = @fopen($dir . '/.blog-sync-notify.lock', 'c');
+    if ($lock && !flock($lock, LOCK_EX | LOCK_NB)) { fclose($lock); return ['notified' => 0, 'confirmed' => 0, 'skipped' => 'busy']; }
+    @set_time_limit(90);
+    $n = 0; $okN = 0; $start = time();
+    foreach ($subs as &$s) {
+        if ($n >= 25 || (time() - $start) > 40) break;
+        $n++;
+        $r = fourgeBlogSyncPostJson(rtrim((string)$s['site'], '/') . '/admin/api.php', ['action' => 'blog_sync_poke', 'push' => 1, 'source' => $own, 'reason' => $reason], 5);
+        $s['lastNotifiedAt']    = gmdate('c');
+        $s['lastNotifyOk']      = !empty($r['ok']);
+        $s['lastNotifyResult']  = !empty($r['ok'])
+            ? ('checked:' . (int)!empty($r['json']['checked']) . ' added:' . (int)($r['json']['added'] ?? 0) . (isset($r['json']['pushed']) ? ' pushed:' . (int)!empty($r['json']['pushed']) : ''))
+            : trim('HTTP ' . $r['code'] . ' ' . $r['error']);
+        if (!empty($r['ok'])) $okN++;
+    }
+    unset($s);
+    $reg['subscribers']     = $subs;
+    $reg['lastNotifiedAt']  = gmdate('c');
+    $reg['lastNotifyCount'] = $n;
+    $reg['lastNotifyOk']    = $okN;
+    fourgeBlogSyncSubscribersWrite($reg);
+    if ($lock) { flock($lock, LOCK_UN); fclose($lock); }
+    return ['notified' => $n, 'confirmed' => $okN];
+}
+
+// ── The public post-list runtime, server copy ───────────────────────────────
+// The admin (postsRuntimeAssets/postsRuntimeCss in index.html) and this file emit the
+// SAME bytes — posts_runtime_parity.mjs fails the build on any drift. The server
+// needs its own copy to place the list on a partner site's blog page during a sync
+// tick, with no admin session involved (see fourgeBlogSyncAutoPlaceServer).
+function fourgePostsRuntimeCss() {
+    return '<style id="fourge-posts-css">' . <<<'CSS'
+.fourge-posts{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:28px;margin:24px 0}.fourge-posts .fp-card{display:flex;flex-direction:column;background:#fff;border:1px solid rgba(0,0,0,.07);border-radius:14px;overflow:hidden;color:inherit;text-decoration:none;box-shadow:0 1px 3px rgba(0,0,0,.05);transition:transform .15s,box-shadow .15s}.fourge-posts .fp-card:hover{transform:translateY(-3px);box-shadow:0 14px 34px rgba(0,0,0,.10);text-decoration:none}.fourge-posts .fp-thumb{aspect-ratio:16/9;background:rgba(0,0,0,.05);overflow:hidden}.fourge-posts .fp-thumb img{width:100%;height:100%;object-fit:cover;display:block}.fourge-posts .fp-body{padding:22px 24px 24px;display:flex;flex-direction:column;flex:1}.fourge-posts .fp-date{font-size:12px;opacity:.6;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px}.fourge-posts .fp-title{font-size:21px;font-weight:700;line-height:1.3;margin:0 0 10px}.fourge-posts .fp-x{font-size:14.5px;opacity:.72;line-height:1.6;margin:0 0 14px;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}.fourge-posts .fp-more{margin-top:auto;font-size:14.5px;font-weight:600;color:var(--brand-color-primary,var(--brand-primary,var(--ember,#C8531E)))}.fourge-posts .fp-empty{grid-column:1/-1;text-align:center;opacity:.65;padding:40px 0}.fourge-posts .fp-more-wrap{grid-column:1/-1;text-align:center;padding:8px 0 4px}.fourge-posts .fp-viewmore{display:inline-block;font:inherit;font-size:15px;font-weight:700;padding:13px 28px;border-radius:999px;border:2px solid var(--brand-color-primary,var(--brand-primary,var(--ember,#C8531E)));background:transparent;color:var(--brand-color-primary,var(--brand-primary,var(--ember,#C8531E)));cursor:pointer;transition:background .15s,color .15s}.fourge-posts .fp-viewmore:hover{background:var(--brand-color-primary,var(--brand-primary,var(--ember,#C8531E)));color:#fff}.fourge-posts .fp-viewmore .fp-count{font-weight:500;opacity:.75}.fourge-posts.fp-single{display:block}.fourge-posts .fp-article{max-width:760px;margin:0 auto;padding:8px 0 40px}.fourge-posts .fp-back{display:inline-block;font-size:15px;font-weight:600;color:var(--brand-color-primary,var(--brand-primary,var(--ember,#C8531E)));text-decoration:none;margin:0 0 22px}.fourge-posts .fp-back-end{margin:36px 0 0}.fourge-posts .fp-meta{font-size:12.5px;opacity:.65;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:12px}.fourge-posts .fp-h1{font-size:clamp(30px,4.6vw,44px);line-height:1.15;font-weight:800;margin:0 0 18px;letter-spacing:-.01em}.fourge-posts .fp-hero{margin:24px 0 32px;border-radius:14px;overflow:hidden}.fourge-posts .fp-hero img{width:100%;height:auto;display:block}.fourge-posts .fp-content{font-size:18px;line-height:1.75}.fourge-posts .fp-content p{margin:0 0 1.25em}.fourge-posts .fp-content h2{font-size:1.6em;line-height:1.25;margin:1.6em 0 .6em}.fourge-posts .fp-content h3{font-size:1.3em;line-height:1.3;margin:1.4em 0 .5em}.fourge-posts .fp-content h4{font-size:1.1em;margin:1.2em 0 .4em}.fourge-posts .fp-content ul,.fourge-posts .fp-content ol{margin:0 0 1.25em 1.4em}.fourge-posts .fp-content li{margin:0 0 .5em}.fourge-posts .fp-content img,.fourge-posts .fp-content video{max-width:100%;height:auto;border-radius:10px;display:block}.fourge-posts .fp-content figure{margin:1.6em 0}.fourge-posts .fp-content figcaption{font-size:14px;opacity:.65;margin-top:8px;text-align:center}.fourge-posts .fp-content blockquote{margin:1.6em 0;padding:4px 0 4px 22px;border-left:4px solid var(--brand-color-primary,var(--brand-primary,var(--ember,#C8531E)));font-size:1.15em;font-style:italic}.fourge-posts .fp-content blockquote cite{display:block;font-size:.8em;font-style:normal;opacity:.7;margin-top:8px}.fourge-posts .fp-content .fp-embed{position:relative;padding-top:56.25%}.fourge-posts .fp-content .fp-embed iframe{position:absolute;inset:0;width:100%;height:100%;border:0;border-radius:10px}.fourge-posts .fp-content a{color:var(--brand-color-primary,var(--brand-primary,var(--ember,#C8531E)))}.fourge-posts .fp-content hr{border:0;border-top:1px solid rgba(0,0,0,.1);margin:2em 0}.fp-hidden{display:none !important}
+CSS
+    . '</style>';
+}
+function fourgePostsRuntimeJs() {
+    return <<<'JS'
+(function(){
+function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
+function dec(s){var t=document.createElement("textarea");t.innerHTML=s==null?"":String(s);return t.value;}
+function fd(d){if(!d)return"";try{return new Date(d+"T00:00:00").toLocaleDateString("en-US",{year:"numeric",month:"long",day:"numeric"});}catch(e){return d;}}
+function media(u,src){ if(!u) return ""; if(/^https?:\/\//i.test(u)||u.indexOf("data:")===0) return u; if(u.charAt(0)==="/") return src+u; return src?(src+"/"+u):u; }
+function here(box){ var s=box.getAttribute("data-single"); return s?s.replace(/[?#].*$/,""):location.pathname; }
+function slugParam(){ try{ return new URLSearchParams(location.search).get("p")||""; }catch(e){ return ""; } }
+function href(box,p,src){ return src?(src+"/posts.html?p="+encodeURIComponent(p.slug||"")):(here(box)+"?p="+encodeURIComponent(p.slug||"")); }
+function card(box,p,src){
+  return "<a class=\"fp-card\" href=\""+esc(href(box,p,src))+"\">"
+    +(p.featured?"<div class=\"fp-thumb\"><img src=\""+esc(media(p.featured,src))+"\" alt=\""+esc(dec(p.title))+"\" loading=\"lazy\"></div>":"")
+    +"<div class=\"fp-body\"><div class=\"fp-date\">"+esc(fd(p.date))+"</div>"
+    +"<h3 class=\"fp-title\">"+esc(dec(p.title))+"</h3>"
+    +(p.excerpt?"<p class=\"fp-x\">"+esc(dec(p.excerpt))+"</p>":"")
+    +"<span class=\"fp-more\">Read more \u2192</span>"
+    +"</div></a>";
+}
+function block(b,src){
+  if(!b||typeof b!=="object") return "";
+  var t=b.type||"";
+  if(t==="paragraph") return b.html?"<p>"+b.html+"</p>":"";
+  if(t==="heading"){ var lv=String(b.level||"h2").toLowerCase().replace(/[^h1-6]/g,"")||"h2"; if(lv==="h1") lv="h2"; return "<"+lv+">"+esc(b.text||"")+"</"+lv+">"; }
+  if(t==="image"){ if(!b.url) return ""; return "<figure><img src=\""+esc(media(b.url,src))+"\" alt=\""+esc(b.alt||"")+"\" loading=\"lazy\">"+(b.caption?"<figcaption>"+esc(b.caption)+"</figcaption>":"")+"</figure>"; }
+  if(t==="video"){ if(!b.url) return ""; return "<figure><video src=\""+esc(media(b.url,src))+"\""+(b.poster?" poster=\""+esc(media(b.poster,src))+"\"":"")+" controls playsinline preload=\"metadata\"></video>"+(b.caption?"<figcaption>"+esc(b.caption)+"</figcaption>":"")+"</figure>"; }
+  if(t==="quote") return "<blockquote><p>"+esc(b.text||"")+"</p>"+(b.cite?"<cite>"+esc(b.cite)+"</cite>":"")+"</blockquote>";
+  if(t==="list"){ var tag=b.ordered?"ol":"ul"; var items=Array.isArray(b.items)?b.items:String(b.items||"").split("\n"); return "<"+tag+">"+items.filter(function(x){return String(x).trim();}).map(function(x){return "<li>"+esc(String(x).trim())+"</li>";}).join("")+"</"+tag+">"; }
+  if(t==="embed"){ if(!b.url) return ""; var u=String(b.url), yt=u.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([\w-]+)/), vm=u.match(/vimeo\.com\/(\d+)/); if(yt) u="https://www.youtube.com/embed/"+yt[1]; else if(vm) u="https://player.vimeo.com/video/"+vm[1]; else return "<p><a href=\""+esc(b.url)+"\" target=\"_blank\" rel=\"noopener\">"+esc(b.url)+"</a></p>"; return "<figure class=\"fp-embed\"><iframe src=\""+esc(u)+"\" loading=\"lazy\" allowfullscreen allow=\"autoplay; encrypted-media; picture-in-picture\"></iframe></figure>"; }
+  if(t==="divider") return "<hr>";
+  if(t==="html") return b.html||"";
+  return "";
+}
+function article(box,p,src){
+  var back=esc(here(box)); var meta=[fd(p.date)]; if(p.author) meta.push("By "+dec(p.author)); if(p.readMins) meta.push(p.readMins+" min read");
+  return "<article class=\"fp-article\">"
+    +"<a class=\"fp-back\" href=\""+back+"\">\u2190 All posts</a>"
+    +"<div class=\"fp-meta\">"+esc(meta.join(" \u00b7 "))+"</div>"
+    +"<h1 class=\"fp-h1\">"+esc(dec(p.title))+"</h1>"
+    +(p.featured?"<figure class=\"fp-hero\"><img src=\""+esc(media(p.featured,src))+"\" alt=\""+esc(dec(p.title))+"\"></figure>":"")
+    +"<div class=\"fp-content\">"+(Array.isArray(p.blocks)?p.blocks.map(function(b){return block(b,src);}).join(""):"")+"</div>"
+    +"<a class=\"fp-back fp-back-end\" href=\""+back+"\">\u2190 All posts</a>"
+    +"</article>";
+}
+function headMeta(name,val){ var m=document.head.querySelector("meta[name=\""+name+"\"]"); if(!m){ m=document.createElement("meta"); m.setAttribute("name",name); document.head.appendChild(m); } m.setAttribute("content",val); }
+function seo(p){
+  var t=document.title, cut=t.lastIndexOf(" | "); if(cut<0) cut=t.lastIndexOf(" \u2014 "); var site=cut>=0?t.slice(cut):"";
+  document.title=dec(p.title)+site;
+  if(p.excerpt) headMeta("description",dec(p.excerpt));
+  var canon=p.canonicalUrl||(location.origin+location.pathname+"?p="+encodeURIComponent(p.slug||""));
+  var lk=document.head.querySelector("link[rel=\"canonical\"]"); if(!lk){ lk=document.createElement("link"); lk.setAttribute("rel","canonical"); document.head.appendChild(lk); } lk.setAttribute("href",canon);
+}
+function focus(box){
+  var wrap=box.closest("main")||document.body, keep=box;
+  while(keep.parentElement&&keep.parentElement!==wrap) keep=keep.parentElement;
+  [].slice.call(wrap.children).forEach(function(el){ if(el===keep) return; var tag=el.tagName.toLowerCase(); if(tag==="header"||tag==="nav"||tag==="footer"||tag==="script"||tag==="style"||tag==="link") return; el.classList.add("fp-hidden"); });
+}
+function paint(box,posts,src){
+  var lim=parseInt(box.getAttribute("data-limit")||"0",10);
+  var all=(lim>0)?posts.slice(0,lim):posts;
+  var slug=src?"":slugParam();
+  if(slug){
+    var p=null; for(var k=0;k<posts.length;k++){ if(posts[k].slug===slug){ p=posts[k]; break; } }
+    box.classList.add("fp-single");
+    box.innerHTML=p?article(box,p,src):"<article class=\"fp-article\"><a class=\"fp-back\" href=\""+esc(here(box))+"\">\u2190 All posts</a><h1 class=\"fp-h1\">Post not found</h1><p>This post is not available here any more.</p></article>";
+    if(p) seo(p);
+    focus(box);
+    return;
+  }
+  if(!all.length){box.innerHTML="<div class=\"fp-empty\">No posts published yet — check back soon.</div>";return;}
+  var step=parseInt(box.getAttribute("data-show")||"0",10);
+  var shown=(step>0)?Math.min(all.length,Math.max(step,box.__fpShown||0)):all.length;
+  box.__fpShown=shown;
+  var html=all.slice(0,shown).map(function(p){return card(box,p,src);}).join("");
+  if(shown<all.length) html+="<div class=\"fp-more-wrap\"><button type=\"button\" class=\"fp-viewmore\">View more posts <span class=\"fp-count\">("+(all.length-shown)+" more)</span></button></div>";
+  box.innerHTML=html;
+  var btn=box.querySelector(".fp-viewmore");
+  if(btn) btn.addEventListener("click",function(){ box.__fpShown=shown+step; paint(box,posts,src); });
+}
+async function run(){
+  var boxes=[].slice.call(document.querySelectorAll("[data-fourge-posts]")); if(!boxes.length) return;
+  var groups={};
+  boxes.forEach(function(b){ var s=(b.getAttribute("data-src")||"").replace(/\/+$/,""); (groups[s]=groups[s]||[]).push(b); });
+  for(var src in groups){
+    var posts=[]; var u=src+"/data/posts.json?t="+Date.now();
+    try{var r=await fetch(u);if(r.ok)posts=await r.json();}catch(e){ if(src) console.warn("Fourge posts: could not load "+u+" — the source site must allow cross-site reads (sign in to its CMS once on engine 1.14.75+ to enable).", e); }
+    var NOW=Date.now();
+    posts=(Array.isArray(posts)?posts:[]).filter(function(p){ if(!p) return false; if(p.published) return true; var t=p.publishAt?Date.parse(p.publishAt):NaN; return !isNaN(t)&&t<=NOW; });
+    posts.sort(function(a,b){return String(b.date||"").localeCompare(String(a.date||""));});
+    var bs=groups[src], single=!src&&slugParam();
+    for(var i=0;i<bs.length;i++){ if(single&&i>0){ bs[i].classList.add("fp-hidden"); continue; } paint(bs[i],posts,src); }
+  }
+  if(groups[""]&&!window.__fourgePostsPoked){ window.__fourgePostsPoked=true;
+    try{ fetch("/admin/api.php",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"blog_sync_poke"}),keepalive:true}).then(function(r){return r.json();}).then(function(d){ if(d&&d.added>0) run(); }).catch(function(){}); }catch(e){}
+  }
+}
+window.fourgePostsRefresh=run;
+if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",run);else run();
+})();
+JS;
+}
+function fourgePostsRuntimeHtml() {
+    return fourgePostsRuntimeCss() . "\n" . '<script id="fourge-posts-js">' . "\n" . fourgePostsRuntimeJs() . "\n" . '</script>';
+}
+// Mirror of the admin's postListSnippet(src, show): the block markup with its preview card.
+function fourgePostListSnippet($show = 3, $src = '') {
+    $src  = rtrim(trim((string)$src), '/'); $show = (int)$show;
+    $attr = ($src !== '' ? ' data-src="' . htmlspecialchars($src, ENT_QUOTES) . '"' : '') . ($show > 0 ? ' data-show="' . $show . '"' : '');
+    return '<div data-fourge-posts class="fourge-posts"' . $attr . '>'
+        . '<div class="fp-card" style="pointer-events:none"><div class="fp-thumb"></div><div class="fp-body"><div class="fp-date">Post date</div><h3 class="fp-title">'
+        . ($src !== '' ? 'Posts from ' . htmlspecialchars(preg_replace('~^https?://~i', '', $src), ENT_QUOTES) . ' appear here automatically' : 'Your published posts appear here automatically')
+        . '</h3><p class="fp-x">Newest first, straight from the ' . ($src !== '' ? 'source site’s' : '') . ' Blog tab. This preview is replaced by the live list on the published page.</p></div></div>'
+        . '</div>';
+}
+// Mirror of the admin's ensurePostsRuntime(html): one copy of the runtime, css before </head>, js before </body>.
+function fourgeEnsurePostsRuntime($html) {
+    $html = (string)$html;
+    $html = preg_replace('~<style id="fourge-posts-css">[\s\S]*?</style>\s*~i', '', $html);
+    $html = preg_replace('~<script id="fourge-posts-js">[\s\S]*?</script>\s*~i', '', $html);
+    if (strpos($html, 'data-fourge-posts') === false) return $html;
+    $assets = fourgePostsRuntimeHtml();
+    $cut = strpos($assets, '</style>') + strlen('</style>');
+    $css = substr($assets, 0, $cut); $js = ltrim(substr($assets, $cut));
+    $html = fourgeInsertBefore($html, '~</head>~i', $css . "\n") ?? ($css . "\n" . $html);
+    $html = fourgeInsertBefore($html, '~</body>~i', $js . "\n") ?? ($html . "\n" . $js);
+    return $html;
+}
+// Insert $ins right before the first match of $pattern; null when there is no match.
+function fourgeInsertBefore($html, $pattern, $ins) {
+    if (!preg_match($pattern, $html, $m, PREG_OFFSET_CAPTURE)) return null;
+    $pos = $m[0][1];
+    return substr($html, 0, $pos) . $ins . substr($html, $pos);
+}
+
+// ── Server-side placement ──────────────────────────────────────────────────
+// The sign-in placement (blogSyncAutoPlaceIfNeeded in the admin) needs an admin
+// session that reaches it; on two partner sites it never did. So a sync tick does
+// the same thing here, with the same guards: Blog Sync on, never placed before, a
+// page literally named blog.html (or blog/index.html) that does not carry the live
+// list, and no other page carrying it either. Appends the list (newest 3 + "View
+// more posts") before </main> / <footer> / </body>, adds the runtime, writes
+// atomically, mirrors to GitHub, and records blogSync.autoPlaced so it is once only.
+function fourgeBlogSyncAutoPlaceServer(array $blogSync) {
+    if (empty($blogSync['enabled']) || !empty($blogSync['autoPlaced'])) return $blogSync;
+    $root = PUBLIC_HTML; $rel = null;
+    foreach (['blog.html', 'blog/index.html'] as $cand) { if (is_file($root . '/' . $cand)) { $rel = $cand; break; } }
+    if ($rel === null) return $blogSync;
+    $html = (string)@file_get_contents($root . '/' . $rel);
+    if ($html === '' || strpos($html, 'data-fourge-posts') !== false || !preg_match('~</body>~i', $html)) return $blogSync;
+    $pages = [];
+    scanHtml($root, $root, ['preview.html', '404.html', '500.html', 'maintenance.html', 'coming-soon.html', 'offline.html'], $pages);
+    foreach ($pages as $pg) { if (!empty($pg['has_post_list'])) return $blogSync; }   // shown elsewhere on purpose — not ours to guess
+    $sec = "\n" . '<section class="fourge-posts-wrap" style="max-width:1180px;margin:0 auto;padding:40px 24px">' . fourgePostListSnippet(3) . '</section>' . "\n";
+    $out = fourgeInsertBefore($html, '~</main>~i', $sec) ?? fourgeInsertBefore($html, '~<footer\b~i', $sec) ?? fourgeInsertBefore($html, '~</body>~i', $sec);
+    if ($out === null) return $blogSync;
+    $out = fourgeEnsurePostsRuntime($out);
+    $dest = $root . '/' . $rel; $tmp = $dest . '.tmp-' . bin2hex(random_bytes(4));
+    if (@file_put_contents($tmp, $out) !== strlen($out) || !@rename($tmp, $dest)) { @unlink($tmp); return $blogSync; }
+    try { cmsGhAfterWrite($rel, $out); } catch (Throwable $e) {}
+    $blogSync['autoPlaced'] = ['page' => $rel, 'at' => gmdate('c'), 'by' => 'server'];
+    return $blogSync;
+}
+
+// During a tick: every page carrying the list gets the CURRENT runtime when its copy
+// is older — so a change like "posts open inside the page" reaches live sites at
+// their next visitor, no sign-in needed. Once per runtime version, bounded per tick.
+function fourgeBlogSyncRefreshRuntimeServer(array $blogSync) {
+    if ((int)($blogSync['runtimeSweptVersion'] ?? 0) === FOURGE_POSTS_RUNTIME_VERSION) return $blogSync;
+    $root = PUBLIC_HTML; $pages = []; $n = 0; $left = 0;
+    scanHtml($root, $root, ['preview.html', '404.html', '500.html', 'maintenance.html', 'coming-soon.html', 'offline.html'], $pages);
+    foreach ($pages as $pg) {
+        if (empty($pg['has_post_list'])) continue;
+        if ($n >= 20) { $left++; continue; }
+        $rel = (string)$pg['path']; $file = $root . '/' . $rel;
+        $html = (string)@file_get_contents($file); if ($html === '') continue;
+        $out = fourgeEnsurePostsRuntime($html);
+        if ($out === $html) continue;                                   // already current
+        $tmp = $file . '.tmp-' . bin2hex(random_bytes(4));
+        if (@file_put_contents($tmp, $out) !== strlen($out) || !@rename($tmp, $file)) { @unlink($tmp); $left++; continue; }
+        try { cmsGhAfterWrite($rel, $out); } catch (Throwable $e) {}
+        $n++;
+    }
+    if ($left === 0) $blogSync['runtimeSweptVersion'] = FOURGE_POSTS_RUNTIME_VERSION;
+    return $blogSync;
+}
+
+// ── site.json bookkeeping guard ────────────────────────────────────────────
+// A save of data/site.json from the admin is the WHOLE object as that browser last
+// loaded it. The server keeps its own Blog Sync bookkeeping in there (which posts
+// were synced, when, where it registered, what it placed), written by sync ticks
+// that browser never saw. A stale copy used to wipe syncedIds, and the next tick
+// imported every post again (thelakedigital.com: 50 posts, three times over). The
+// server-owned keys are taken from the file on disk; the operator-owned ones
+// (enabled, sourceUrl) are whatever the admin sent. syncedIds is the union.
+function fourgeBlogSyncMergeSiteBookkeeping($content, $dest) {
+    $incoming = json_decode((string)$content, true);
+    if (!is_array($incoming) || !is_file($dest)) return $content;
+    $current = json_decode((string)@file_get_contents($dest), true);
+    $cur = (is_array($current) && is_array($current['blogSync'] ?? null)) ? $current['blogSync'] : null;
+    if (!$cur) return $content;
+    $bs = is_array($incoming['blogSync'] ?? null) ? $incoming['blogSync'] : [];
+    $changed = false;
+    foreach (['syncedIds', 'lastCheckedAt', 'lastResult', 'resolvedBase', 'lastPushAt', 'subscribedAt', 'subscribedTo', 'subscribedAs', 'pushSubscribed', 'autoPlaced', 'runtimeSweptVersion'] as $k) {
+        if (!array_key_exists($k, $cur)) continue;
+        if ($k === 'syncedIds') {
+            $a = is_array($bs['syncedIds'] ?? null) ? array_map('strval', $bs['syncedIds']) : [];
+            $u = array_values(array_unique(array_merge(array_map('strval', is_array($cur['syncedIds']) ? $cur['syncedIds'] : []), $a)));
+            if ($u !== $a) { $bs['syncedIds'] = $u; $changed = true; }
+            continue;
+        }
+        if (!array_key_exists($k, $bs) || $bs[$k] !== $cur[$k]) { $bs[$k] = $cur[$k]; $changed = true; }
+    }
+    if (!$changed) return $content;
+    $incoming['blogSync'] = $bs;
+    $out = json_encode($incoming, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    if (!is_string($out)) return $content;
+    return preg_replace_callback('/^( +)/m', function ($m) { return str_repeat(' ', intdiv(strlen($m[1]), 2)); }, $out);   // the admin's 2-space style
+}
+
+// cmsWriteFile hook: data/posts.json just changed (a publish, edit or unpublish).
+// The response is already on its way; with php-fpm it is flushed first so the
+// editor never waits on partner sites, elsewhere the pokes run inline (5 s each,
+// bounded above).
+function fourgeBlogSyncAfterPostsWrite() {
+    $reg = fourgeBlogSyncSubscribersRead();
+    if (!$reg['subscribers']) return;
+    if (function_exists('fastcgi_finish_request')) { @fastcgi_finish_request(); } else { @ignore_user_abort(true); @flush(); }
+    try { fourgeBlogSyncNotifySubscribers('publish'); } catch (Throwable $e) { /* never surfaces to the save */ }
+}
+function fourgeApiBlogSyncAdmin($me, $body) {
+    if (fourgeLevel($me) < 2) { http_response_code(403); echo json_encode(['error' => 'Admin access required']); return; }
+    $op = strtolower(trim((string)($body['op'] ?? 'status')));
+    $has = false;
+    try { $has = trim((string)fourgeGetSecret(fourgeDb(), 'blog_sync_token')) !== ''; } catch (Throwable $e) { $has = false; }
+    $scheme = fourgeIsHttps() ? 'https' : 'http';
+    $host   = (string)($_SERVER['HTTP_HOST'] ?? '');
+    $endpoint = $host !== '' ? ($scheme . '://' . $host . '/api/blog-sync/tick') : '/api/blog-sync/tick';
+    if ($op === 'regenerate') {
+        if (fourgeLevel($me) < 3) { http_response_code(403); echo json_encode(['error' => 'Super Admin access required to rotate the key']); return; }
+        try {
+            $tok = bin2hex(random_bytes(24));
+            fourgeSetSecret(fourgeDb(), 'blog_sync_token', $tok, (string)($me['username'] ?? ''));
+            echo json_encode(['ok' => true, 'token' => $tok, 'endpoint' => $endpoint, 'hasToken' => true,
+                'note' => 'Copy this key now — it is stored encrypted and cannot be shown again.']);
+        } catch (Throwable $e) {
+            http_response_code(500); echo json_encode(['error' => 'Could not store the key: ' . $e->getMessage()]);
+        }
+        return;
+    }
+    if ($op === 'revoke') {
+        if (fourgeLevel($me) < 3) { http_response_code(403); echo json_encode(['error' => 'Super Admin access required']); return; }
+        try { fourgeDb()->prepare("DELETE FROM secrets WHERE name=?")->execute(['blog_sync_token']); } catch (Throwable $e) {}
+        echo json_encode(['ok' => true, 'hasToken' => false, 'endpoint' => $endpoint]);
+        return;
+    }
+    $reg = fourgeBlogSyncSubscribersRead();
+    if ($op === 'notify') {
+        $r = fourgeBlogSyncNotifySubscribers('manual');
+        echo json_encode(['ok' => true] + $r + ['subscribers' => count($reg['subscribers'])]);
+        return;
+    }
+    echo json_encode(['ok' => true, 'hasToken' => $has, 'endpoint' => $endpoint,
+        'subscribers' => count($reg['subscribers']), 'subscriberSites' => array_map(function ($s) { return (string)$s['site']; }, $reg['subscribers']),
+        'lastNotifiedAt' => $reg['lastNotifiedAt'] ?? null, 'lastNotifyOk' => $reg['lastNotifyOk'] ?? null, 'lastNotifyCount' => $reg['lastNotifyCount'] ?? null]);
+}
+// ── GOOGLE REVIEWS ──────────────────────────────────────────────────────────
+// Reviews are fetched HERE, on the server, because the Places API key is
+// billable and data/site.json is publicly readable. The key lives encrypted in
+// the secrets table and is never returned to the browser.
+//
+// WHAT GOOGLE ACTUALLY GIVES YOU: the Places API returns at most FIVE reviews
+// per place, and only the ones it considers most relevant. There is no
+// pagination and no parameter to ask for more — the full review list needs the
+// Business Profile API, which is OAuth against the owner's Google account, not
+// an API key. So this endpoint MERGES: every fetch folds new reviews into
+// data/reviews.json and leaves existing ones alone, which means the saved set
+// grows past five over time as Google rotates which five it hands back. That
+// merge is also what makes the per-review show/hide toggles durable.
+function fourgeReviewsPath() { return PUBLIC_HTML . '/data/reviews.json'; }
+function fourgeReviewsLoad() {
+    $f = fourgeReviewsPath();
+    $d = is_file($f) ? json_decode((string)@file_get_contents($f), true) : null;
+    if (!is_array($d)) $d = [];
+    if (!isset($d['items']) || !is_array($d['items'])) $d['items'] = [];
+    if (!isset($d['place']) || !is_array($d['place'])) $d['place'] = [];
+    return $d;
+}
+function fourgeReviewsSave($data) {
+    $dir = PUBLIC_HTML . '/data';
+    if (!is_dir($dir)) @mkdir($dir, 0755, true);
+    return fourgeSitePut(fourgeReviewsPath(), json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), 'Fourge: reviews') !== false;
+}
+// A review has no stable id in the legacy Places response, so identity is a hash
+// of the things that cannot change for a given review: who wrote it, when, and
+// what it says. The New API's resource name is preferred when present.
+function fourgeReviewId($r) {
+    if (!empty($r['gid'])) return substr(sha1('gid:' . $r['gid']), 0, 16);
+    return substr(sha1(strtolower(trim((string)($r['author'] ?? ''))) . '|' . (string)($r['time'] ?? '') . '|' . substr((string)($r['text'] ?? ''), 0, 120)), 0, 16);
+}
+function fourgeReviewsHttpGet($url, $headers = []) {
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_TIMEOUT        => 15,
+        CURLOPT_HTTPHEADER     => $headers,
+    ]);
+    $body = curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err  = curl_error($ch);
+    fourgeCurlClose($ch);
+    return ['body' => (string)$body, 'code' => $code, 'err' => $err];
+}
+// Normalise both API shapes into one review record.
+function fourgeReviewsNormNew($rev) {
+    $txt = $rev['originalText']['text'] ?? ($rev['text']['text'] ?? '');
+    $when = (string)($rev['publishTime'] ?? '');
+    return [
+        'gid'      => (string)($rev['name'] ?? ''),
+        'author'   => (string)($rev['authorAttribution']['displayName'] ?? ''),
+        'photo'    => (string)($rev['authorAttribution']['photoUri'] ?? ''),
+        'url'      => (string)($rev['authorAttribution']['uri'] ?? ''),
+        'rating'   => (int)($rev['rating'] ?? 0),
+        'text'     => (string)$txt,
+        'time'     => $when !== '' ? (int)strtotime($when) : 0,
+        'date'     => $when !== '' ? gmdate('Y-m-d', (int)strtotime($when)) : '',
+        'relative' => (string)($rev['relativePublishTimeDescription'] ?? ''),
+        'source'   => 'places-v1',
+    ];
+}
+function fourgeReviewsNormLegacy($rev) {
+    $t = (int)($rev['time'] ?? 0);
+    return [
+        'gid'      => '',
+        'author'   => (string)($rev['author_name'] ?? ''),
+        'photo'    => (string)($rev['profile_photo_url'] ?? ''),
+        'url'      => (string)($rev['author_url'] ?? ''),
+        'rating'   => (int)($rev['rating'] ?? 0),
+        'text'     => (string)($rev['text'] ?? ''),
+        'time'     => $t,
+        'date'     => $t ? gmdate('Y-m-d', $t) : '',
+        'relative' => (string)($rev['relative_time_description'] ?? ''),
+        'source'   => 'places-legacy',
+    ];
+}
+// Try the current Places API first, then the legacy endpoint. Which one a client's
+// Google Cloud project has enabled varies, and a 403 from one is not a reason to
+// tell the operator their key is broken.
+function fourgeReviewsFetchGoogle($key, $placeId) {
+    $tried = [];
+    $url = 'https://places.googleapis.com/v1/places/' . rawurlencode($placeId);
+    $r = fourgeReviewsHttpGet($url, [
+        'X-Goog-Api-Key: ' . $key,
+        'X-Goog-FieldMask: id,displayName,rating,userRatingCount,googleMapsUri,reviews',
+    ]);
+    $tried[] = 'places-v1 HTTP ' . $r['code'];
+    if ($r['code'] === 200) {
+        $d = json_decode($r['body'], true);
+        if (is_array($d)) {
+            $items = [];
+            foreach ((array)($d['reviews'] ?? []) as $rev) $items[] = fourgeReviewsNormNew($rev);
+            return ['ok' => true, 'api' => 'places-v1', 'tried' => $tried, 'items' => $items, 'place' => [
+                'name'   => (string)($d['displayName']['text'] ?? ''),
+                'rating' => (float)($d['rating'] ?? 0),
+                'total'  => (int)($d['userRatingCount'] ?? 0),
+                'mapUrl' => (string)($d['googleMapsUri'] ?? ''),
+            ]];
+        }
+    }
+    $newErr = '';
+    if ($r['code'] !== 200) {
+        $e = json_decode($r['body'], true);
+        $newErr = (string)($e['error']['message'] ?? $r['err']);
+    }
+    // Legacy Place Details
+    $url2 = 'https://maps.googleapis.com/maps/api/place/details/json?place_id=' . rawurlencode($placeId)
+          . '&fields=name,rating,user_ratings_total,url,reviews&reviews_sort=newest&key=' . rawurlencode($key);
+    $r2 = fourgeReviewsHttpGet($url2);
+    $tried[] = 'places-legacy HTTP ' . $r2['code'];
+    $d2 = json_decode($r2['body'], true);
+    $status = (string)($d2['status'] ?? '');
+    if ($r2['code'] === 200 && $status === 'OK' && isset($d2['result'])) {
+        $res = $d2['result'];
+        $items = [];
+        foreach ((array)($res['reviews'] ?? []) as $rev) $items[] = fourgeReviewsNormLegacy($rev);
+        return ['ok' => true, 'api' => 'places-legacy', 'tried' => $tried, 'items' => $items, 'place' => [
+            'name'   => (string)($res['name'] ?? ''),
+            'rating' => (float)($res['rating'] ?? 0),
+            'total'  => (int)($res['user_ratings_total'] ?? 0),
+            'mapUrl' => (string)($res['url'] ?? ''),
+        ]];
+    }
+    // Both failed — say which, and what it usually means.
+    $legacyErr = (string)($d2['error_message'] ?? ($status !== '' ? $status : $r2['err']));
+    $hint = '';
+    $blob = $newErr . ' ' . $legacyErr;
+    if (stripos($blob, 'not authorized') !== false || stripos($blob, 'REQUEST_DENIED') !== false || stripos($blob, 'API_KEY') !== false)
+        $hint = ' Enable "Places API (New)" (or the legacy "Places API") on this key\'s Google Cloud project, and check the key\'s API restrictions.';
+    elseif (stripos($blob, 'NOT_FOUND') !== false || stripos($blob, 'INVALID_REQUEST') !== false)
+        $hint = ' The Place ID looks wrong — use Find my Place ID below.';
+    elseif (stripos($blob, 'OVER_QUERY_LIMIT') !== false || stripos($blob, 'billing') !== false)
+        $hint = ' Billing is not enabled on the Google Cloud project, or the key is over its quota.';
+    return ['ok' => false, 'tried' => $tried,
+            'error' => 'Google refused the request. ' . trim($newErr . ($newErr && $legacyErr ? ' / ' : '') . $legacyErr) . $hint];
+}
+function fourgeApiReviewsFetch($me, $body) {
+    if (!$me) { http_response_code(401); echo json_encode(['error' => 'Not signed in']); return; }
+    $key = '';
+    try { $key = (string)fourgeGetSecret(fourgeDb(), 'google_places_key'); } catch (Throwable $e) {}
+    if (trim($key) === '') { http_response_code(400); echo json_encode(['error' => 'No Google API key saved yet — add one above and press Save key.']); return; }
+    $placeId = trim((string)($body['placeId'] ?? ''));
+    if ($placeId === '') {
+        $site = json_decode((string)@file_get_contents(PUBLIC_HTML . '/data/site.json'), true);
+        $placeId = trim((string)($site['reviews']['placeId'] ?? ''));
+    }
+    if ($placeId === '' || !preg_match('~^[A-Za-z0-9_\-]{10,}$~', $placeId)) {
+        http_response_code(400); echo json_encode(['error' => 'A Place ID is required — press "Find my Place ID" if you do not have it.']); return;
+    }
+
+    $got = fourgeReviewsFetchGoogle($key, $placeId);
+    if (empty($got['ok'])) { http_response_code(502); echo json_encode(['error' => $got['error'], 'tried' => $got['tried']]); return; }
+
+    $store = fourgeReviewsLoad();
+    $byId  = [];
+    foreach ($store['items'] as $it) { if (!empty($it['id'])) $byId[$it['id']] = $it; }
+
+    $added = 0; $updated = 0;
+    foreach ($got['items'] as $rev) {
+        $id = fourgeReviewId($rev);
+        $rev['id'] = $id;
+        if (isset($byId[$id])) {
+            // Keep the operator's decisions; refresh only what Google owns.
+            $old = $byId[$id];
+            $rev['hidden'] = !empty($old['hidden']);
+            $rev['added']  = (string)($old['added'] ?? gmdate('c'));
+            if ($old['text'] !== $rev['text'] || (int)$old['rating'] !== (int)$rev['rating']) $updated++;
+            $byId[$id] = array_merge($old, $rev);
+        } else {
+            $rev['hidden'] = false;          // new reviews are visible by default
+            $rev['added']  = gmdate('c');
+            $byId[$id] = $rev;
+            $added++;
+        }
+    }
+    $items = array_values($byId);
+    // Newest first; a review with no date sorts last rather than to the top.
+    usort($items, function ($a, $b) { return ((int)($b['time'] ?? 0)) <=> ((int)($a['time'] ?? 0)); });
+
+    $store['items']   = $items;
+    $store['place']   = $got['place'];
+    $store['placeId'] = $placeId;
+    $store['api']     = $got['api'];
+    $store['updated'] = gmdate('c');
+    if (!fourgeReviewsSave($store)) { http_response_code(500); echo json_encode(['error' => 'Could not write data/reviews.json (check that the data folder is writable)']); return; }
+
+    echo json_encode([
+        'ok' => true, 'api' => $got['api'], 'returned' => count($got['items']),
+        'added' => $added, 'updated' => $updated, 'total' => count($items),
+        'place' => $got['place'], 'tried' => $got['tried'],
+    ]);
+}
+// Place ID discovery, so nobody has to go hunting in Google's ID finder tool.
+function fourgeApiReviewsFindPlace($me, $body) {
+    if (!$me) { http_response_code(401); echo json_encode(['error' => 'Not signed in']); return; }
+    $key = '';
+    try { $key = (string)fourgeGetSecret(fourgeDb(), 'google_places_key'); } catch (Throwable $e) {}
+    if (trim($key) === '') { http_response_code(400); echo json_encode(['error' => 'Save a Google API key first.']); return; }
+    $q = trim((string)($body['query'] ?? ''));
+    if ($q === '') {
+        // Default to this site's own business name + address.
+        $site = json_decode((string)@file_get_contents(PUBLIC_HTML . '/data/site.json'), true);
+        $a = $site['address'] ?? [];
+        $q = trim(((string)($site['name'] ?? '')) . ' ' . implode(' ', array_filter([
+            (string)($a['street'] ?? ''), (string)($a['city'] ?? ''), (string)($a['state'] ?? ''), (string)($a['zip'] ?? '')
+        ])));
+    }
+    if ($q === '') { http_response_code(400); echo json_encode(['error' => 'Type the business name and city to search for.']); return; }
+
+    // searchText is POST-only, so this one does not go through the GET helper.
+    $ch = curl_init('https://places.googleapis.com/v1/places:searchText');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_TIMEOUT => 15, CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_POSTFIELDS => json_encode(['textQuery' => $q, 'maxResultCount' => 5]),
+        CURLOPT_HTTPHEADER => [
+            'X-Goog-Api-Key: ' . $key,
+            'X-Goog-FieldMask: places.id,places.displayName,places.formattedAddress,places.rating,places.userRatingCount',
+            'Content-Type: application/json',
+        ],
+    ]);
+    $body2 = (string)curl_exec($ch);
+    $code  = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err   = curl_error($ch);
+    fourgeCurlClose($ch);
+    $d = json_decode($body2, true);
+    if ($code === 200 && isset($d['places'])) {
+        $out = [];
+        foreach ((array)$d['places'] as $pl) {
+            $out[] = [
+                'placeId' => (string)($pl['id'] ?? ''),
+                'name'    => (string)($pl['displayName']['text'] ?? ''),
+                'address' => (string)($pl['formattedAddress'] ?? ''),
+                'rating'  => (float)($pl['rating'] ?? 0),
+                'total'   => (int)($pl['userRatingCount'] ?? 0),
+            ];
+        }
+        echo json_encode(['ok' => true, 'query' => $q, 'results' => $out]);
+        return;
+    }
+    // Fall back to the legacy Find Place endpoint for keys that only have it.
+    $u = 'https://maps.googleapis.com/maps/api/place/findplacefromtext/json?input=' . rawurlencode($q)
+       . '&inputtype=textquery&fields=place_id,name,formatted_address,rating,user_ratings_total&key=' . rawurlencode($key);
+    $r2 = fourgeReviewsHttpGet($u);
+    $d2 = json_decode($r2['body'], true);
+    if ($r2['code'] === 200 && (($d2['status'] ?? '') === 'OK')) {
+        $out = [];
+        foreach ((array)($d2['candidates'] ?? []) as $pl) {
+            $out[] = [
+                'placeId' => (string)($pl['place_id'] ?? ''),
+                'name'    => (string)($pl['name'] ?? ''),
+                'address' => (string)($pl['formatted_address'] ?? ''),
+                'rating'  => (float)($pl['rating'] ?? 0),
+                'total'   => (int)($pl['user_ratings_total'] ?? 0),
+            ];
+        }
+        echo json_encode(['ok' => true, 'query' => $q, 'results' => $out, 'api' => 'legacy']);
+        return;
+    }
+    $msg = (string)($d['error']['message'] ?? ($d2['error_message'] ?? ($err ?: 'Google returned HTTP ' . $code)));
+    http_response_code(502);
+    echo json_encode(['error' => 'Place search failed: ' . $msg . ' Make sure "Places API (New)" is enabled for this key.']);
+}
+// ── 44i TARGETED LANDING PAGE FEED ──────────────────────────────────────────
+// A read-only pull from the 44i platform: which clients have landing-page data,
+// and for one client the exact service + geo pairs an account manager entered.
+//
+// This is a PROXY rather than a browser fetch, for one reason: the feed's only
+// protection is a shared key in the query string. Fetching it from the browser
+// would put that key in the admin's page source and in every network log; the
+// key lives in the encrypted store and is appended here, server-side, so it
+// never reaches a client at all.
+function fourgeTlpUrlOk($url) {
+    $p = @parse_url($url);
+    if (!$p || ($p['scheme'] ?? '') !== 'https' || empty($p['host'])) return false;
+    $host = strtolower($p['host']);
+    // The URL is operator-supplied, so it is semi-trusted at best — a typo or a
+    // pasted internal address must not turn this endpoint into a way to make the
+    // server fetch things on its own network.
+    if ($host === 'localhost' || substr($host, -6) === '.local') return false;
+    $ips = [];
+    if (filter_var($host, FILTER_VALIDATE_IP)) $ips = [$host];
+    else { $r = @gethostbynamel($host); if (is_array($r)) $ips = $r; }
+    foreach ($ips as $ip) {
+        if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) return false;
+    }
+    // A host that resolves to nothing is left to curl to fail on, rather than
+    // being rejected here — DNS can be slow or split-horizon on shared hosts.
+    return true;
+}
+function fourgeApiTlpFeed($me, $body) {
+    if (!$me) { http_response_code(401); echo json_encode(['error' => 'Not signed in']); return; }
+    $pdo = fourgeDb();
+    if (fourgeLevel($me) < fourgeSecretLevel('tlp_key')) {
+        http_response_code(403); echo json_encode(['error' => 'You do not have access to the landing page feed']); return;
+    }
+    $base = ''; $key = '';
+    try { $base = trim((string)fourgeGetSecret($pdo, 'tlp_url')); } catch (Throwable $e) {}
+    try { $key  = trim((string)fourgeGetSecret($pdo, 'tlp_key')); } catch (Throwable $e) {}
+    if ($base === '' || $key === '') {
+        http_response_code(400);
+        echo json_encode(['error' => 'Add the feed address and access key first.', 'configured' => false]);
+        return;
+    }
+    if (!fourgeTlpUrlOk($base)) {
+        http_response_code(400);
+        echo json_encode(['error' => 'The feed address must be an https:// URL on a public host.']);
+        return;
+    }
+    $qs = ['key' => $key];
+    $client = trim((string)($body['client'] ?? ''));
+    $intake = trim((string)($body['intake'] ?? ''));
+    if ($intake !== '')      $qs['intake'] = $intake;
+    else if ($client !== '') $qs['client'] = $client;
+    $url = $base . (strpos($base, '?') === false ? '?' : '&') . http_build_query($qs);
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 20, CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_FOLLOWLOCATION => false,   // a redirect could aim the key somewhere else
+        CURLOPT_HTTPHEADER => ['Accept: application/json'],
+        CURLOPT_USERAGENT => 'FourgeCMS TLP',
+    ]);
+    $raw  = (string)curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err  = curl_error($ch);
+    fourgeCurlClose($ch);
+
+    if ($code === 0) {
+        http_response_code(502);
+        echo json_encode(['error' => 'Could not reach the feed: ' . ($err ?: 'no response')]);
+        return;
+    }
+    if ($code === 401) {
+        http_response_code(401);
+        echo json_encode(['error' => 'The feed rejected the access key. Check it, or ask 44i to rotate it.']);
+        return;
+    }
+    if ($code === 404) {
+        http_response_code(404);
+        echo json_encode(['error' => 'That client has no landing page data in the feed yet.']);
+        return;
+    }
+    $d = json_decode($raw, true);
+    if ($code !== 200 || !is_array($d)) {
+        http_response_code(502);
+        echo json_encode(['error' => 'The feed returned HTTP ' . $code . '.']);
+        return;
+    }
+    echo json_encode(['ok' => true, 'feed' => $d]);
+}
+// ── FLEET DASHBOARD: report this site's status to 44i's cross-site board ───
+// Built entirely from files already on disk (no dependency on an open admin
+// session's JS state), so it rides the login self-heal exactly like the other
+// riders below and still reports on a site nobody has opened in weeks. Silent
+// no-op until an operator saves a dashboard address and key (same shape as
+// tlp_url/tlp_key) — most sites will never configure this.
+function fourgeFleetSnapshot() {
+    $site  = cmsPkgReadJson('site.json', []);
+    $pages = cmsPkgReadJson('pages.json', []);
+    $seo   = cmsPkgReadJson('seo.json', []);
+    if (!is_array($site))  $site  = [];
+    if (!is_array($pages)) $pages = [];
+    if (!is_array($seo))   $seo   = [];
+
+    $engineVersion = '';
+    $idxPath = PUBLIC_HTML . '/admin/index.html';
+    if (is_file($idxPath)) {
+        // Only the first slice — the constant sits near the top and this file
+        // can be well over a megabyte.
+        $head = @file_get_contents($idxPath, false, null, 0, 200000);
+        if ($head !== false && preg_match("/const CMS_VERSION='([^']+)'/", $head, $m)) $engineVersion = $m[1];
+    }
+
+    $tlpCount = 0;
+    foreach ($pages as $pg) { if (is_array($pg) && !empty($pg['tlp'])) $tlpCount++; }
+
+    // "On-page SEO generated" and the SEO grade are both the SAME weak/missing
+    // gate the daily AI-autofix job already uses (fourgeAiWeak / FOURGE_TITLE_*
+    // / FOURGE_DESC_*) — reused rather than a second, independently-invented
+    // definition of "done", so this number and "Generate New Content" always
+    // agree on what still needs work.
+    $total = count($pages);
+    $complete = 0;
+    foreach ($pages as $pid => $pg) {
+        $s = is_array($seo[$pid] ?? null) ? $seo[$pid] : [];
+        $needT = fourgeAiWeak($s['title'] ?? '',       FOURGE_TITLE_MIN, FOURGE_TITLE_MAX);
+        $needD = fourgeAiWeak($s['description'] ?? '', FOURGE_DESC_MIN,  FOURGE_DESC_MAX);
+        if (!$needT && !$needD) $complete++;
+    }
+    $pct   = $total > 0 ? (int)round($complete / $total * 100) : null;
+    $grade = $pct === null ? null : ($pct >= 80 ? 'A' : ($pct >= 55 ? 'B' : 'C'));
+
+    $sitemapPath = PUBLIC_HTML . '/sitemap.xml';
+    $sitemapExists = is_file($sitemapPath);
+    $sitemapUrls = $sitemapExists ? substr_count((string)@file_get_contents($sitemapPath), '<loc>') : 0;
+
+    $plcRaw = cmsPkgReadJson('postlaunch.json', null);
+    $plc = ['everRun' => false, 'lastRun' => null, 'clean' => null, 'counts' => null];
+    if (is_array($plcRaw)) {
+        $plc = ['everRun' => true, 'lastRun' => $plcRaw['lastRun'] ?? null,
+                'clean' => $plcRaw['clean'] ?? null, 'counts' => $plcRaw['counts'] ?? null];
+    }
+
+    return [
+        'name'          => (string)($site['name'] ?? ''),
+        'url'           => trim((string)($site['website'] ?? '')),
+        'engineVersion' => $engineVersion,
+        'seo'           => ['grade' => $grade, 'generatedPages' => $complete, 'totalPages' => $total, 'pct' => $pct],
+        'sitemap'       => ['exists' => $sitemapExists, 'urlCount' => $sitemapUrls],
+        'tlpCount'      => $tlpCount,
+        'postLaunch'    => $plc,
+        'reportedAt'    => gmdate('c'),
+    ];
+}
+function fourgeFleetReport() {
+    $pdo = fourgeDb();
+    $url = ''; $key = '';
+    try { $url = trim((string)fourgeGetSecret($pdo, 'fleet_url')); } catch (Throwable $e) {}
+    try { $key = trim((string)fourgeGetSecret($pdo, 'fleet_key')); } catch (Throwable $e) {}
+    if ($url === '' || $key === '') return false;         // not configured — silent no-op
+    if (!fourgeTlpUrlOk($url)) return false;              // same https/public-host guard the TLP feed uses — this URL is operator-supplied too
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_TIMEOUT => 10, CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_FOLLOWLOCATION => false,   // a redirect could aim the key at a different host
+        CURLOPT_HTTPHEADER => ['Authorization: Bearer ' . $key, 'Content-Type: application/json', 'Accept: application/json'],
+        // 'action' rides in the body, not a query string appended to the
+        // operator-entered URL — avoids double-'?' if that URL ever has its
+        // own query string, and needs no change on the receiving dashboard,
+        // which already falls back to $body['action'] when $_GET has none.
+        CURLOPT_POSTFIELDS => json_encode(['action' => 'register'] + fourgeFleetSnapshot()),
+    ]);
+    $res = curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    fourgeCurlClose($ch);
+    return $code >= 200 && $code < 300 && $res !== false;
+}
+// ── MAP: ADDRESS → COORDINATES ──────────────────────────────────────────────
+// Server-side so no key ever reaches the browser, and so this works on a site
+// that has no key at all. Google first when a key exists (the same encrypted
+// Places key the reviews plugin uses, under the same API restriction), then
+// OpenStreetMap's Nominatim, which needs nothing. Either way the browser gets
+// back two numbers.
+function fourgeMapGeocodeGoogle($key, $addr) {
+    $ch = curl_init('https://places.googleapis.com/v1/places:searchText');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_TIMEOUT => 15, CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_POSTFIELDS => json_encode(['textQuery' => $addr, 'maxResultCount' => 1]),
+        CURLOPT_HTTPHEADER => [
+            'X-Goog-Api-Key: ' . $key,
+            'X-Goog-FieldMask: places.location,places.formattedAddress,places.displayName',
+            'Content-Type: application/json',
+        ],
+    ]);
+    $raw  = (string)curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    fourgeCurlClose($ch);
+    if ($code !== 200) return null;
+    $d  = json_decode($raw, true);
+    $pl = $d['places'][0] ?? null;
+    if (!$pl || !isset($pl['location']['latitude'])) return null;
+    return [
+        'lat'   => round((float)$pl['location']['latitude'], 6),
+        'lng'   => round((float)$pl['location']['longitude'], 6),
+        'label' => (string)($pl['formattedAddress'] ?? ($pl['displayName']['text'] ?? '')),
+        'via'   => 'Google',
+    ];
+}
+function fourgeMapGeocodeOsm($addr) {
+    // Nominatim's usage policy requires an identifying User-Agent and does not
+    // want to be hammered — a pin is geocoded once, by hand, so that is fine.
+    $u = 'https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' . rawurlencode($addr);
+    $ch = curl_init($u);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 15, CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_HTTPHEADER => ['Accept: application/json'],
+        CURLOPT_USERAGENT => 'FourgeCMS/1.x (+' . (defined('PUBLIC_HTML') ? 'self-hosted' : 'cms') . ')',
+    ]);
+    $raw  = (string)curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    fourgeCurlClose($ch);
+    if ($code !== 200) return null;
+    $d = json_decode($raw, true);
+    $r = (is_array($d) && isset($d[0])) ? $d[0] : null;
+    if (!$r || !isset($r['lat'])) return null;
+    return [
+        'lat'   => round((float)$r['lat'], 6),
+        'lng'   => round((float)$r['lon'], 6),
+        'label' => (string)($r['display_name'] ?? ''),
+        'via'   => 'OpenStreetMap',
+    ];
+}
+function fourgeApiMapGeocode($me, $body) {
+    if (!$me) { http_response_code(401); echo json_encode(['error' => 'Not signed in']); return; }
+    $addr = trim((string)($body['address'] ?? ''));
+    if ($addr === '') { http_response_code(400); echo json_encode(['error' => 'Type an address first.']); return; }
+    $key = '';
+    try { $key = trim((string)fourgeGetSecret(fourgeDb(), 'google_places_key')); } catch (Throwable $e) {}
+    $hit = null;
+    if ($key !== '') { try { $hit = fourgeMapGeocodeGoogle($key, $addr); } catch (Throwable $e) { $hit = null; } }
+    if (!$hit)       { try { $hit = fourgeMapGeocodeOsm($addr); }          catch (Throwable $e) { $hit = null; } }
+    if (!$hit) {
+        http_response_code(404);
+        echo json_encode(['error' => 'No match for that address. Check the spelling, or paste the coordinates from Google Maps directly.']);
+        return;
+    }
+    echo json_encode(['ok' => true] + $hit);
+}
+// ── INDEXING SCAFFOLD ───────────────────────────────────────────────────────
+// Three server-level indexing controls, in one marker-spliced block placed
+// ABOVE the clean-URL rewrite (order matters — that block's catch-all rewrite
+// would otherwise swallow the redirect below).
+//
+// Safety rules this block obeys, because ~16 live client sites run it:
+//  • Options -MultiViews lives INSIDE <IfModule mod_rewrite.c>. If mod_rewrite
+//    were unavailable, MultiViews would be the only thing serving /page from
+//    page.html — disabling it unconditionally would break every clean URL.
+//  • The trailing-slash 301 only fires when the slashed form is neither a real
+//    file nor a real directory, i.e. only for URLs that 404 today. It cannot
+//    change any working URL.
+//  • The non-production guard matches an EXPLICIT list of non-production host
+//    shapes and then unconditionally exempts this site's own configured
+//    production host (and its www/non-www twin). There is deliberately NO
+//    "anything else is non-production" catch-all: a client with extra live
+//    domain aliases must never be de-indexed by this. If the site's host can't
+//    be determined, the guard is omitted entirely.
+function fourgeWriteIndexingHtaccess() {
+    // Production host comes from the site's configured Website URL only — never
+    // from the request, which could be the dev host we're guarding against.
+    $prodHost = '';
+    try {
+        $site = json_decode((string)@file_get_contents(PUBLIC_HTML . '/data/site.json'), true);
+        $w = trim((string)($site['website'] ?? ''));
+        if ($w !== '') {
+            if (!preg_match('~^https?://~i', $w)) $w = 'https://' . $w;
+            $h = (string)parse_url($w, PHP_URL_HOST);
+            $h = strtolower(preg_replace('~^www\.~i', '', $h));
+            if ($h !== '' && preg_match('~^[a-z0-9.\-]+$~', $h)) $prodHost = $h;
+        }
+    } catch (Throwable $e) { $prodHost = ''; }
+
+    $L = [];
+    $L[] = '<IfModule mod_rewrite.c>';
+    $L[] = '  RewriteEngine On';
+    $L[] = '  # Stop Apache/LiteSpeed content negotiation from resolving /page on its';
+    $L[] = '  # own — it silently bypasses (and defeats) the rules below.';
+    $L[] = '  Options -MultiViews';
+    $L[] = '  # /page/ -> /page  (only for a slashed URL that is not a real file or';
+    $L[] = '  # directory, so this can never touch a URL that already works)';
+    $L[] = '  RewriteCond %{REQUEST_URI} !^/(admin|data)/ [NC]';
+    $L[] = '  RewriteCond %{REQUEST_FILENAME} !-d';
+    $L[] = '  RewriteCond %{REQUEST_FILENAME} !-f';
+    $L[] = '  RewriteRule ^(.+)/$ /$1 [R=301,L]';
+    $L[] = '</IfModule>';
+    if ($prodHost !== '') {
+        $esc = str_replace('.', '\\.', $prodHost);
+        $L[] = '<IfModule mod_setenvif.c>';
+        $L[] = '  # Non-production hosts: explicit shapes only, never a catch-all.';
+        $L[] = '  SetEnvIf Host "^(dev|staging|stg|test|qa|uat|preview|beta|demo|sandbox)[.\-]" FOURGE_NONPROD=1';
+        $L[] = '  SetEnvIf Host "\.fourge\.com$" FOURGE_NONPROD=1';
+        $L[] = '  SetEnvIf Host "^localhost" FOURGE_NONPROD=1';
+        $L[] = '  SetEnvIf Host "\.local$" FOURGE_NONPROD=1';
+        $L[] = '  SetEnvIf Host "^[0-9.]+$" FOURGE_NONPROD=1';
+        $L[] = '  # …and this site\'s own production host is ALWAYS production, last word.';
+        $L[] = '  SetEnvIf Host "^(www\.)?' . $esc . '(:[0-9]+)?$" !FOURGE_NONPROD';
+        $L[] = '</IfModule>';
+        $L[] = '<IfModule mod_headers.c>';
+        $L[] = '  Header always set X-Robots-Tag "noindex, nofollow" env=FOURGE_NONPROD';
+        $L[] = '</IfModule>';
+        $L[] = '<IfModule mod_rewrite.c>';
+        $L[] = '  RewriteCond %{ENV:FOURGE_NONPROD} =1';
+        $L[] = '  RewriteRule ^robots\.txt$ /_fourge_robots_nonprod.txt [L]';
+        $L[] = '</IfModule>';
+    }
+    // The alternate robots file the rule above serves on non-production hosts.
+    $nonProd = PUBLIC_HTML . '/_fourge_robots_nonprod.txt';
+    if (!is_file($nonProd)) {
+        fourgeSitePut($nonProd, "# Served only on non-production hosts (see the Fourge Indexing block in .htaccess).\nUser-agent: *\nDisallow: /\n", 'Fourge: server rules');
+    }
+    return cmsPkgSpliceHtaccess('# BEGIN Fourge Indexing', '# END Fourge Indexing', implode("\n", $L));
+}
+// ── ONE ADDRESS FOR THE SITE (parked domains → the Website URL) ─────────────
+// A client's extra domains are parked on the same hosting, so they open the
+// site — under the parked name, which then stays in the address bar. The
+// Website URL in Site Foundry is the one address the site should answer to, so
+// the CMS writes a redirect block that sends every other host there (www and
+// bare included, path and query kept, 301). Two things keep it from ever
+// sending a site to the wrong place:
+//   • it is written only after the Website URL has answered as THIS very
+//     installation (host_probe → the install id below), and taken out again
+//     when that address answers as a different installation, redirects
+//     somewhere else, or is cleared; an address that cannot be reached at all
+//     changes nothing either way;
+//   • the rule never fires on a non-production host — the same explicit shapes
+//     the Indexing block uses (dev./staging./…, *.fourge.com, localhost,
+//     *.local, bare IPs) — so a staging copy carrying the production URL in its
+//     site.json keeps serving as staging.
+function fourgeInstallId() {
+    $k = ''; try { $k = fourgePassphrase(); } catch (Throwable $e) { $k = ''; }
+    return hash('sha256', 'fourge-install:' . $k . ':' . (string)realpath(PUBLIC_HTML) . ':' . (string)php_uname('n'));
+}
+// A host that must never be the site's public address nor a redirect target:
+// a development/staging shape, the agency's preview domain, a hosting preview
+// domain, localhost, a bare IP, or no dot at all. Shared by the canonical-host
+// writer (never redirect TO such a host — a dev link that later forwards to the
+// live domain would loop), by the sign-in auto-fill below, and by the
+// site.json write guard.
+function fourgeIsNonProdHost($host) {
+    $h = strtolower(trim((string)$host)); $h = preg_replace('~:\d+$~', '', $h);
+    if ($h === '' || $h === 'localhost' || strpos($h, '.') === false) return true;
+    if ($h[0] === '[' || filter_var($h, FILTER_VALIDATE_IP)) return true;
+    if (preg_match('~^(dev|staging|stage|stg|test|testing|qa|uat|preview|beta|demo|sandbox)\d*[.\-]~', $h)) return true;
+    if (preg_match('~\.(fourge\.com|local|test|localhost|internal|lan|pages\.dev|netlify\.app|vercel\.app|herokuapp\.com|github\.io|ngrok\.io|ngrok-free\.app|trycloudflare\.com)$~', $h)) return true;
+    if (preg_match('~(^|\.)devlink\d*\.[a-z]{2,}$~', $h)) return true;   // the agency's devlink9.info-style addresses
+    return false;
+}
+// A development LINK: a non-production host with a real name (not localhost, an
+// IP, or a local-only suffix) — the address a site is built on before launch,
+// which should forward to the live domain once the site is live there.
+function fourgeIsDevLinkHost($host) {
+    $h = strtolower(trim((string)$host)); $h = preg_replace('~:\d+$~', '', $h);
+    if ($h === '' || $h === 'localhost' || strpos($h, '.') === false || $h[0] === '[' || filter_var($h, FILTER_VALIDATE_IP)) return false;
+    if (preg_match('~\.(local|test|localhost|internal|lan)$~', $h)) return false;
+    return fourgeIsNonProdHost($h);
+}
+// Sign-in at a development link: remember it in site.json (devHosts, last five)
+// so that, once the site is live at its Website URL, that link forwards there
+// too — nobody keeps using or indexing the dev address. A staging COPY is never
+// verified as the live site, so it never gets the block at all, and a copied
+// .htaccess names the original site's links, never the copy's own host.
+function fourgeRememberDevHost() {
+    $host = strtolower(trim((string)($_SERVER['HTTP_HOST'] ?? ''))); $host = preg_replace('~:\d+$~', '', $host);
+    if ($host === '' || !preg_match('~^[a-z0-9.\-]+$~', $host) || !fourgeIsDevLinkHost($host)) return null;
+    $f = PUBLIC_HTML . '/data/site.json';
+    $site = json_decode((string)@file_get_contents($f), true); if (!is_array($site)) $site = [];
+    $list = array_values(array_filter(array_map('strval', (array)($site['devHosts'] ?? [])), 'strlen'));
+    if (in_array($host, $list, true)) return $host;
+    $list[] = $host; $site['devHosts'] = array_slice($list, -5);
+    fourgeSitePut($f, json_encode($site, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), 'Fourge: site address');
+    return $host;
+}
+// Sign-in at the site's real address: when the stored Website URL is empty or a
+// development/staging/preview host (pages built on a dev link carry that link
+// in their canonical tags, and the admin's detection used to adopt it), and the
+// request arrived on a production-looking host, that host becomes the Website
+// URL. A production value is never replaced — signing in through a parked
+// domain must not move the address — so the first real domain wins, and Site
+// Foundry can correct it. Returns ['from' => …, 'to' => …] or null.
+function fourgeAutoWebsite() {
+    $host = strtolower(trim((string)($_SERVER['HTTP_HOST'] ?? '')));
+    if ($host === '' || !preg_match('~^[a-z0-9.\-]+(:\d+)?$~', $host) || fourgeIsNonProdHost($host)) return null;
+    $f = PUBLIC_HTML . '/data/site.json';
+    $site = json_decode((string)@file_get_contents($f), true); if (!is_array($site)) $site = [];
+    $cur = trim((string)($site['website'] ?? ''));
+    if ($cur !== '') { $t = fourgeCanonicalHostTarget($cur); if ($t && !fourgeIsNonProdHost($t['host'])) return null; }
+    $new = (fourgeIsHttps() ? 'https' : 'http') . '://' . $host;
+    if ($cur === $new) return null;
+    $site['website'] = $new;
+    if (fourgeSitePut($f, json_encode($site, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), 'Fourge: site address') === false) return null;
+    return ['from' => $cur, 'to' => $new];
+}
+// A stale admin copy must not move the Website URL backwards: when the browser
+// sends a development/staging address while the server already holds a
+// production one (set at sign-in on the real domain, or by hand), the server's
+// address stays. An empty value (a deliberate clear) and any production
+// address are accepted as sent.
+function fourgeSiteJsonKeepWebsite($content) {
+    $in = json_decode((string)$content, true); if (!is_array($in)) return $content;
+    $want = trim((string)($in['website'] ?? '')); if ($want === '') return $content;
+    $wt = fourgeCanonicalHostTarget($want); if ($wt && !fourgeIsNonProdHost($wt['host'])) return $content;
+    $cur = json_decode((string)@file_get_contents(PUBLIC_HTML . '/data/site.json'), true); if (!is_array($cur)) return $content;
+    $have = trim((string)($cur['website'] ?? '')); if ($have === '') return $content;
+    $ht = fourgeCanonicalHostTarget($have); if (!$ht || fourgeIsNonProdHost($ht['host'])) return $content;
+    $in['website'] = $have;
+    return json_encode($in, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+}
+function fourgeCanonicalHostMarkers() { return ['# BEGIN Fourge Canonical Host — managed by Fourge, do not edit by hand', '# END Fourge Canonical Host']; }
+// The Website URL as a redirect target — scheme + host[:port] — or null when
+// the value is empty or not a plain web address.
+function fourgeCanonicalHostTarget($website) {
+    $w = trim((string)$website);
+    if ($w === '') return null;
+    if (!preg_match('~^https?://~i', $w)) $w = 'https://' . $w;
+    $p = @parse_url($w);
+    if (!$p || empty($p['host'])) return null;
+    $host = strtolower((string)$p['host']);
+    if (!preg_match('~^[a-z0-9.\-]+$~', $host) || strpos($host, '..') !== false) return null;
+    $scheme = (strtolower((string)($p['scheme'] ?? 'https')) === 'http') ? 'http' : 'https';
+    $port = !empty($p['port']) ? (int)$p['port'] : 0;
+    $std = ($scheme === 'https' && $port === 443) || ($scheme === 'http' && $port === 80);
+    $hostPort = $host . (($port && !$std) ? ':' . $port : '');
+    return ['scheme' => $scheme, 'host' => $host, 'hostPort' => $hostPort, 'url' => $scheme . '://' . $hostPort];
+}
+function fourgeCanonicalHostBlock($t, $devHosts = []) {
+    list($B, $E) = fourgeCanonicalHostMarkers();
+    $hostRe = str_replace('.', '\\.', $t['host']);
+    $dev = [];
+    foreach ((array)$devHosts as $h) { $h = strtolower(preg_replace('~:\d+$~', '', trim((string)$h))); if ($h !== '' && $h !== $t['host'] && preg_match('~^[a-z0-9.\-]+$~', $h) && !in_array($h, $dev, true)) $dev[] = $h; }
+    $L = [];
+    $L[] = $B;
+    $L[] = '# Every other address this site answers on (a parked or alias domain, www';
+    $L[] = '# when the site is bare, or the reverse) lands on ' . $t['url'] . ' — the';
+    $L[] = '# Website URL in Site Foundry — so that is what the address bar shows.';
+    $L[] = '# Written only after that address answered as this very installation.';
+    $L[] = '# Non-production hosts (dev./staging./…, *.fourge.com, localhost, *.local,';
+    $L[] = '# bare IPs) are never redirected, so a staging copy stays staging.';
+    $L[] = '<IfModule mod_rewrite.c>';
+    $L[] = '  RewriteEngine On';
+    if ($dev) {
+        $L[] = '  # The development link(s) this site was built on go there too, now that it is live';
+        $L[] = '  RewriteCond %{HTTP_HOST} ^(' . implode('|', array_map(function ($h) { return str_replace('.', '\\.', $h); }, $dev)) . ')(:[0-9]+)?$ [NC]';
+        $L[] = '  RewriteCond %{REQUEST_URI} !^/\.well-known/ [NC]';
+        $L[] = '  RewriteRule ^ ' . $t['url'] . '%{REQUEST_URI} [R=301,L]';
+    }
+    $L[] = '  RewriteCond %{HTTP_HOST} !^' . $hostRe . '(:[0-9]+)?$ [NC]';
+    $L[] = '  RewriteCond %{HTTP_HOST} !^(dev|staging|stage|stg|test|testing|qa|uat|preview|beta|demo|sandbox)[0-9]*[.\-] [NC]';
+    $L[] = '  RewriteCond %{HTTP_HOST} !\.(fourge\.com|local|test|localhost|internal|lan|pages\.dev|netlify\.app|vercel\.app|herokuapp\.com|github\.io|ngrok\.io|ngrok-free\.app|trycloudflare\.com)(:[0-9]+)?$ [NC]';
+    $L[] = '  RewriteCond %{HTTP_HOST} !(^|\.)devlink[0-9]*\.[a-z]+(:[0-9]+)?$ [NC]';
+    $L[] = '  RewriteCond %{HTTP_HOST} !^localhost [NC]';
+    $L[] = '  RewriteCond %{HTTP_HOST} !^[0-9.]+(:[0-9]+)?$';
+    $L[] = '  RewriteCond %{HTTP_HOST} !^\[';
+    $L[] = '  RewriteCond %{REQUEST_URI} !^/\.well-known/ [NC]';
+    $L[] = '  RewriteRule ^ ' . $t['url'] . '%{REQUEST_URI} [R=301,L]';
+    $L[] = '</IfModule>';
+    $L[] = $E;
+    return implode("\n", $L);
+}
+// The address the block in $text currently redirects to ('' when there is none).
+function fourgeCanonicalHostCurrent($text) {
+    list($B, $E) = fourgeCanonicalHostMarkers();
+    $s = strpos((string)$text, $B); if ($s === false) return '';
+    $e = strpos((string)$text, $E, $s); if ($e === false) return '';
+    return preg_match('~RewriteRule \^ (\S+?)%\{REQUEST_URI\}~', substr($text, $s, $e - $s), $m) ? $m[1] : '';
+}
+// Pure: $text with the block set to $block, or removed when $block is null.
+// Returns null when nothing would change. A new block goes at the very top —
+// a host redirect must run before every rewrite below it, force-HTTPS included,
+// so a visitor on a parked http:// address lands on the right https:// one in
+// a single hop.
+function fourgeCanonicalHostApplyText($text, $block) {
+    list($B, $E) = fourgeCanonicalHostMarkers();
+    $text = (string)$text;
+    $s = strpos($text, $B); $e = ($s !== false) ? strpos($text, $E, $s) : false;
+    if ($s !== false && $e !== false) {
+        $end = $e + strlen($E);
+        if ($block === null) {
+            $before = rtrim(substr($text, 0, $s), "\n"); $after = ltrim(substr($text, $end), "\n");
+            $out = ($before === '') ? $after : ($after === '' ? $before . "\n" : $before . "\n\n" . $after);
+        } else {
+            $out = substr($text, 0, $s) . $block . substr($text, $end);
+        }
+        return ($out === $text) ? null : $out;
+    }
+    if ($block === null) return null;
+    $rest = ltrim($text, "\n");
+    return $block . "\n" . ($rest === '' ? '' : "\n" . $rest);
+}
+// Does the Website URL answer as THIS installation? 'match'; 'mismatch' (some
+// other site or installation answers there, or it redirects to another host —
+// a redirect of ours on top of that would loop); 'unreachable' (nothing
+// conclusive: refused, timed out, a non-JSON answer).
+function fourgeCanonicalHostVerify($t) {
+    $host = $t['host'];
+    // Operator-supplied address: never let it point the server at its own
+    // network (loopback and private ranges) — except in the test harness.
+    if (!getenv('FOURGE_PROBE_ALLOW_LOCAL')) {
+        if ($host === 'localhost' || substr($host, -6) === '.local') return ['verdict' => 'unreachable', 'detail' => 'a local address'];
+        $ips = filter_var($host, FILTER_VALIDATE_IP) ? [$host] : (@gethostbynamel($host) ?: []);
+        foreach ($ips as $ip) if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) return ['verdict' => 'unreachable', 'detail' => 'a private address'];
+    }
+    $ch = curl_init($t['url'] . '/admin/api.php');
+    $resolve = trim((string)getenv('FOURGE_PROBE_RESOLVE'));   // tests: "host:port:ip,…" so a production-looking name reaches the test server
+    if ($resolve !== '') curl_setopt($ch, CURLOPT_RESOLVE, array_map('trim', explode(',', $resolve)));
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true, CURLOPT_POSTFIELDS => json_encode(['action' => 'host_probe']),
+        CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 8, CURLOPT_CONNECTTIMEOUT => 5,
+        CURLOPT_SSL_VERIFYPEER => true, CURLOPT_FOLLOWLOCATION => true, CURLOPT_MAXREDIRS => 3, CURLOPT_POSTREDIR => 7,
+        CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Accept: application/json'],
+        CURLOPT_USERAGENT => 'FourgeCMS host check',
+    ]);
+    $raw = curl_exec($ch); $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $eff = (string)curl_getinfo($ch, CURLINFO_EFFECTIVE_URL); $err = (string)curl_error($ch);
+    fourgeCurlClose($ch);
+    if ($raw === false || $code === 0) return ['verdict' => 'unreachable', 'detail' => $err !== '' ? $err : 'no answer'];
+    $effHost = strtolower((string)@parse_url($eff, PHP_URL_HOST));
+    if ($effHost !== '' && $effHost !== $host) return ['verdict' => 'mismatch', 'detail' => 'it redirects to ' . $effHost . ' — set the Website URL to the address the site settles on'];
+    $j = json_decode((string)$raw, true);
+    if ($code === 200 && is_array($j) && !empty($j['install'])) {
+        return ((string)$j['install'] === fourgeInstallId()) ? ['verdict' => 'match', 'detail' => ''] : ['verdict' => 'mismatch', 'detail' => 'another installation answers there'];
+    }
+    return ['verdict' => 'unreachable', 'detail' => 'HTTP ' . $code];
+}
+// The last verdict, kept in admin/ (PHP exits before the JSON, so it is never
+// served): a sign-in must not wait on a timeout every time.
+function fourgeCanonicalHostStatePath() { return __DIR__ . '/canonical-host.php'; }
+function fourgeCanonicalHostRemember($set = false) {
+    $f = fourgeCanonicalHostStatePath();
+    if ($set === false) {
+        if (!is_file($f)) return null;
+        $raw = (string)@file_get_contents($f); $p = strpos($raw, "\n");
+        $j = json_decode($p === false ? '' : substr($raw, $p + 1), true);
+        return is_array($j) ? $j : null;
+    }
+    if ($set === null) { @unlink($f); return null; }
+    @file_put_contents($f, "<?php exit; ?>\n" . json_encode($set));
+    return $set;
+}
+// Decide and write. Returns {on, host, url, reason, detail, changed, checkedAt}:
+// reason = verified | elsewhere | unreachable | kept | no_website.
+function fourgeWriteCanonicalHostHtaccess($force = false) {
+    $htPath = PUBLIC_HTML . '/.htaccess';
+    $existing = is_file($htPath) ? (string)file_get_contents($htPath) : '';
+    $current = fourgeCanonicalHostCurrent($existing);
+    $site = json_decode((string)@file_get_contents(PUBLIC_HTML . '/data/site.json'), true);
+    $t = fourgeCanonicalHostTarget(is_array($site) ? ($site['website'] ?? '') : '');
+    $devHosts = array_values(array_filter(array_map(function ($h) { return strtolower(preg_replace('~:\d+$~', '', trim((string)$h))); }, is_array($site) ? (array)($site['devHosts'] ?? []) : []), function ($h) { return $h !== '' && preg_match('~^[a-z0-9.\-]+$~', $h); }));
+    $devRedirect = !(is_array($site) && array_key_exists('devLinkRedirect', $site) && $site['devLinkRedirect'] === false);
+    $res = ['on' => $current !== '', 'host' => $t ? $t['hostPort'] : '', 'url' => $t ? $t['url'] : '', 'reason' => '', 'detail' => '', 'changed' => false, 'checkedAt' => '', 'devHosts' => $devHosts, 'devLinkRedirect' => $devRedirect];
+    $write = function ($block) use ($htPath, $existing, &$res) {
+        $out = fourgeCanonicalHostApplyText($existing, $block);
+        if ($out !== null) $res['changed'] = fourgeSitePut($htPath, $out, 'Fourge: server rules') !== false;
+        $res['on'] = ($block !== null);
+    };
+    if (!$t) { $res['reason'] = 'no_website'; $write(null); fourgeCanonicalHostRemember(null); return $res; }
+    // A dev/staging/preview address is never a redirect target: the live domain
+    // would be sent to it, and once that link forwards back to the live domain
+    // (the usual post-launch setup) the two redirects loop.
+    if (fourgeIsNonProdHost($t['host'])) { $res['reason'] = 'nonprod_url'; $write(null); fourgeCanonicalHostRemember(null); return $res; }
+    // Re-check at most every 6 h while it matches, every 20 min otherwise.
+    $prev = fourgeCanonicalHostRemember();
+    $ttl = ($prev && ($prev['verdict'] ?? '') === 'match') ? 6 * 3600 : 20 * 60;
+    if (!$force && $prev && ($prev['url'] ?? '') === $t['url'] && (time() - (int)($prev['at'] ?? 0)) < $ttl) {
+        $v = ['verdict' => (string)$prev['verdict'], 'detail' => (string)($prev['detail'] ?? '')];
+        $res['checkedAt'] = date('c', (int)$prev['at']);
+    } else {
+        $v = fourgeCanonicalHostVerify($t);
+        fourgeCanonicalHostRemember(['url' => $t['url'], 'verdict' => $v['verdict'], 'detail' => $v['detail'], 'at' => time()]);
+        $res['checkedAt'] = date('c');
+    }
+    $res['detail'] = $v['detail'];
+    if ($v['verdict'] === 'match')         { $res['reason'] = 'verified';  $write(fourgeCanonicalHostBlock($t, $devRedirect ? $devHosts : [])); }
+    elseif ($v['verdict'] === 'mismatch')  { $res['reason'] = 'elsewhere'; $write(null); }
+    elseif ($current !== '' && $current !== $t['url']) { $res['reason'] = 'unreachable'; $write(null); }   // the block pointed at an address the operator has since replaced
+    else                                   { $res['reason'] = ($current !== '') ? 'kept' : 'unreachable'; }   // nothing conclusive: the file stays as it is
+    return $res;
+}
+function fourgeApiCanonicalHost($me, $body) {
+    if (fourgeLevel($me) < 2) { http_response_code(403); echo json_encode(['ok' => false, 'error' => 'Admin access required']); return; }
+    $r = fourgeWriteCanonicalHostHtaccess(!empty($body['force']));
+    echo json_encode(['ok' => true] + $r);
+}
+
+// ── SECRETS ARE NOT DOWNLOADABLE ────────────────────────────────────────────
+// admin/.htaccess denies direct HTTP access to the SQLite database (password
+// hashes + encrypted secrets), config.secret.php (the key those secrets are
+// encrypted WITH), and the Google service-account files. That file ships in the
+// repo, but it is not in the updater's fetch list and never was self-healed, so
+// a site deployed before it existed has no protection at all — and nobody would
+// know, because nothing ever checked. This writes it, marker-spliced, on every
+// login, preserving whatever else the operator put in that file.
+function fourgeWriteAdminHtaccess() {
+    $htPath   = __DIR__ . '/.htaccess';
+    $existing = is_file($htPath) ? (string)file_get_contents($htPath) : '';
+    $begin = '# BEGIN Fourge Secret Files';
+    $end   = '# END Fourge Secret Files';
+    $rules = <<<'HT'
+# Never serve these over HTTP. PHP source is not emitted by the interpreter, but
+# the .db and .json files here are not PHP and WOULD be sent as downloads.
+<FilesMatch "(\.secret\.php|service-account\.json|\.ga-token\.json|\.db|\.db-wal|\.db-shm|\.sqlite|\.sqlite3)$">
+  <IfModule mod_authz_core.c>
+    Require all denied
+  </IfModule>
+  <IfModule !mod_authz_core.c>
+    Order allow,deny
+    Deny from all
+  </IfModule>
+</FilesMatch>
+HT;
+    $block = $begin . "\n" . $rules . "\n" . $end;
+    $s = strpos($existing, $begin);
+    $e = strpos($existing, $end);
+    if ($s !== false && $e !== false && $e >= $s) {
+        $existing = substr($existing, 0, $s) . $block . substr($existing, $e + strlen($end));
+    } else {
+        $existing = ($existing === '' ? '' : rtrim($existing) . "\n\n") . $block . "\n";
+    }
+    return fourgeSitePut($htPath, $existing, 'Fourge: server rules') !== false;
+}
+// Prove it, rather than assume it. A deny rule in .htaccess does NOTHING on a
+// host configured with AllowOverride None, and that failure is completely
+// silent. So ask the web server for the files over real HTTP, from the server
+// itself, and report what it actually sends back.
+function fourgeSecretExposure($baseUrl = '') {
+    $base = rtrim((string)$baseUrl, '/');
+    if ($base === '') {
+        // Fall back to this site's configured domain, then the request host.
+        $site = json_decode((string)@file_get_contents(PUBLIC_HTML . '/data/site.json'), true);
+        $w = trim((string)($site['website'] ?? ''));
+        if ($w !== '' && !preg_match('~^https?://~i', $w)) $w = 'https://' . $w;
+        if ($w === '' && !empty($_SERVER['HTTP_HOST'])) {
+            $w = ((!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https://' : 'http://') . $_SERVER['HTTP_HOST'];
+        }
+        $base = rtrim($w, '/');
+    }
+    if ($base === '') return ['ok' => false, 'error' => 'No site URL to test against — set Design → Website URL.'];
+
+    // The database, wherever it actually lives, plus the key file and the
+    // service-account files. Only paths inside the web root can be requested.
+    $targets = [];
+    $dbAbs = '';
+    try { $dbAbs = (string)fourgeDbPath(); } catch (Throwable $e) {}
+    if ($dbAbs !== '') {
+        $real = realpath($dbAbs) ?: $dbAbs;
+        $rootReal = realpath(PUBLIC_HTML) ?: PUBLIC_HTML;
+        if (strpos($real, $rootReal) === 0) {
+            $targets['database'] = ltrim(str_replace('\\', '/', substr($real, strlen($rootReal))), '/');
+        }
+    }
+    $adminRel = ltrim(str_replace(realpath(PUBLIC_HTML) ?: PUBLIC_HTML, '', realpath(__DIR__) ?: __DIR__), '/\\');
+    $adminRel = $adminRel === '' ? 'admin' : str_replace('\\', '/', $adminRel);
+    $targets['encryption key'] = $adminRel . '/config.secret.php';
+    if (is_file(__DIR__ . '/service-account.json')) $targets['Google service account'] = $adminRel . '/service-account.json';
+    if (is_file(__DIR__ . '/protect.secret.php'))   $targets['page passwords']          = $adminRel . '/protect.secret.php';
+
+    $findings = []; $exposed = 0; $unknown = 0;
+    foreach ($targets as $label => $rel) {
+        if ($rel === '') continue;
+        $url = $base . '/' . $rel;
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 10, CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_SSL_VERIFYPEER => true, CURLOPT_RANGE => '0-512',
+        ]);
+        $body = (string)curl_exec($ch);
+        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $err  = curl_error($ch);
+        fourgeCurlClose($ch);
+        $row = ['label' => $label, 'path' => '/' . $rel, 'status' => $code];
+        if ($code === 0) { $row['verdict'] = 'unknown'; $row['detail'] = 'Could not reach the site from the server itself' . ($err ? ' (' . $err . ')' : '') . '.'; $unknown++; }
+        elseif ($code === 200 || $code === 206) {
+            // A PHP file that executed to nothing is fine; real bytes are not.
+            $looksSource = (strpos($body, '<?php') !== false);
+            $isPhp = (substr($rel, -4) === '.php');
+            if ($isPhp && !$looksSource && trim($body) === '') { $row['verdict'] = 'ok'; $row['detail'] = 'Served empty — PHP executed it instead of sending the source.'; }
+            else { $row['verdict'] = 'exposed'; $row['detail'] = 'DOWNLOADABLE by anyone who knows the URL.'; $exposed++; }
+        }
+        elseif ($code === 403 || $code === 401) { $row['verdict'] = 'ok'; $row['detail'] = 'Blocked (HTTP ' . $code . ').'; }
+        elseif ($code === 404)                  { $row['verdict'] = 'ok'; $row['detail'] = 'Not found (HTTP 404) — nothing to download.'; }
+        else                                    { $row['verdict'] = 'ok'; $row['detail'] = 'Not served (HTTP ' . $code . ').'; }
+        $findings[] = $row;
+    }
+    return ['ok' => true, 'base' => $base, 'exposed' => $exposed, 'unknown' => $unknown, 'findings' => $findings];
+}
+function fourgeApiSecretExposure($me, $body) {
+    if (!$me) { http_response_code(401); echo json_encode(['error' => 'Not signed in']); return; }
+    if (fourgeLevel($me) < 3) { http_response_code(403); echo json_encode(['error' => 'Super Admin access required']); return; }
+    $installed = false;
+    try { $installed = fourgeWriteAdminHtaccess(); } catch (Throwable $e) {}
+    $res = fourgeSecretExposure((string)($body['base'] ?? ''));
+    $res['guardInstalled'] = $installed;
+    // The server's own outbound address, so an API key can be pinned to it in
+    // Google Cloud. A restricted key is worthless to anyone who copies it.
+    $res['serverIp'] = fourgeOutboundIp();
+    echo json_encode($res);
+}
+// Best-effort: what Google (or anyone) sees as this server's source address.
+function fourgeOutboundIp() {
+    $local = (string)($_SERVER['SERVER_ADDR'] ?? '');
+    $ch = curl_init('https://api.ipify.org');
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 6, CURLOPT_SSL_VERIFYPEER => true]);
+    $ip = trim((string)curl_exec($ch));
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    fourgeCurlClose($ch);
+    if ($code === 200 && filter_var($ip, FILTER_VALIDATE_IP)) return ['outbound' => $ip, 'local' => $local];
+    return ['outbound' => '', 'local' => $local];
+}
+// ── SAFE SECURITY HEADERS, ON BY DEFAULT ────────────────────────────────────
+// The audit fails sites without these and none of them can change how a page
+// renders, so they no longer wait for a deploy package to arrive. Content-
+// Security-Policy is deliberately NOT here: a wrong CSP blocks the site's own
+// scripts and styles and takes the page down, so it stays package-and-review
+// only. A package's own value for any of these still overrides the default,
+// because that block is spliced separately and later in the file.
+function fourgeWriteDefaultHeaders() {
+    $L = [];
+    $L[] = '<IfModule mod_headers.c>';
+    $L[] = '  Header always set X-Content-Type-Options "nosniff"';
+    $L[] = '  Header always set X-Frame-Options "SAMEORIGIN"';
+    $L[] = '  Header always set Referrer-Policy "strict-origin-when-cross-origin"';
+    // HSTS only over HTTPS. Uses env=HTTPS rather than an <If> block: <If> is
+    // Apache 2.4-only, and an unknown directive inside a module that DOES exist
+    // on 2.2 is a fatal config error — it would 500 the whole site. mod_ssl sets
+    // the HTTPS env var, so env= is the portable form and is a no-op on plain
+    // HTTP, where sending HSTS would be useless at best and would lock a
+    // not-yet-certificated domain out of the browser at worst.
+    $L[] = '  Header always set Strict-Transport-Security "max-age=31536000" env=HTTPS';
+    $L[] = '</IfModule>';
+    return cmsPkgSpliceHtaccess('# BEGIN Fourge Default Headers', '# END Fourge Default Headers', implode("\n", $L));
+}
+// ── llms.txt ────────────────────────────────────────────────────────────────
+// A map of the site for AI crawlers. Built from real data only — the imported
+// business facts plus this site's own published pages and posts — so a site gets
+// one before any package ships a hand-written version. Never overwrites a file
+// that already exists: a delivered or hand-edited llms.txt always wins.
+function fourgeLlmsFallback() {
+    $site = json_decode((string)@file_get_contents(PUBLIC_HTML . '/data/site.json'), true);
+    if (!is_array($site)) $site = [];
+    $b = is_array($site['business'] ?? null) ? $site['business'] : [];
+    $name = trim((string)(($b['name'] ?? '') ?: ($site['name'] ?? '')));
+    if ($name === '') return '';
+    $base = trim((string)($site['website'] ?? ''));
+    if ($base !== '' && !preg_match('~^https?://~i', $base)) $base = 'https://' . $base;
+    $base = rtrim($base, '/');
+
+    $out = '# ' . $name . "\n";
+    $desc = trim((string)(($b['description'] ?? '') ?: ($site['tagline'] ?? '')));
+    if ($desc !== '') $out .= "\n> " . $desc . "\n";
+    if (!empty($b['services'])) $out .= "\nServices: " . implode(', ', (array)$b['services']) . "\n";
+    $sa = (array)($b['service_area'] ?? []);
+    $towns = array_filter(array_merge([(string)($sa['primary'] ?? '')], (array)($sa['secondary'] ?? [])));
+    if ($towns) $out .= 'Service area: ' . implode(', ', $towns) . "\n";
+    $contact = array_filter([(string)($b['phone'] ?? ($site['phone'] ?? '')), (string)($b['email'] ?? ($site['email'] ?? ''))]);
+    if ($contact) $out .= 'Contact: ' . implode(' · ', $contact) . "\n";
+
+    $pages = cmsPkgReadJson('pages.json', []);
+    if (is_array($pages) && $pages) {
+        $lines = [];
+        foreach ($pages as $rec) {
+            if (!is_array($rec) || !empty($rec['draft'])) continue;
+            $file = (string)($rec['path'] ?? ($rec['file'] ?? ''));
+            if ($file === '') continue;
+            $t = trim((string)($rec['title'] ?? ''));
+            if ($t === '') continue;
+            $lines[] = '- [' . $t . '](' . ($base !== '' ? cmsPkgPageUrl($base, $file) : '/' . cmsPkgUrlPath($file)) . ')';
+            if (count($lines) >= 25) break;
+        }
+        if ($lines) $out .= "\n## Key pages\n" . implode("\n", $lines) . "\n";
+    }
+    $posts = cmsPkgReadJson('posts.json', []);
+    if (is_array($posts) && $posts) {
+        $lines = [];
+        foreach ($posts as $po) {
+            if (!is_array($po) || empty($po['published'])) continue;
+            $t = trim((string)($po['title'] ?? ''));
+            if ($t === '') continue;
+            $u = (string)($po['path'] ?? '');
+            $href = $u !== '' ? ($base !== '' ? cmsPkgPageUrl($base, $u) : '/' . cmsPkgUrlPath($u))
+                              : ($base . '/posts.html?p=' . rawurlencode((string)($po['slug'] ?? '')));
+            $lines[] = '- [' . $t . '](' . $href . ')';
+            if (count($lines) >= 10) break;
+        }
+        if ($lines) $out .= "\n## Recent articles\n" . implode("\n", $lines) . "\n";
+    }
+    return $out;
+}
+// FOURGE_LLMS_MARK is defined at the top, with the other constants the dispatcher needs.
+function fourgeEnsureLlms($force = false) {
+    $f = PUBLIC_HTML . '/llms.txt';
+    if (is_file($f)) {
+        $cur = trim((string)@file_get_contents($f));
+        // A delivered or hand-edited llms.txt always wins. Only a file Fourge
+        // generated itself is ever rewritten — which is what lets newly imported
+        // business facts and pages show up in it.
+        $ours = $cur === '' || strpos($cur, FOURGE_LLMS_MARK) !== false;
+        if (!$ours) return false;
+        if ($cur !== '' && !$force) return false;
+    }
+    $body = fourgeLlmsFallback();
+    if ($body === '') return false;
+    return fourgeSitePut($f, FOURGE_LLMS_MARK . "\n" . $body, 'Fourge: llms.txt') !== false;
+}
+// ── AI AUTO-FIX ─────────────────────────────────────────────────────────────
+// Fills the gaps an audit grades — SEO titles, meta descriptions, image alt
+// text, internal links — using the Anthropic key this site already has.
+//
+// The absolute rule: IT ONLY EVER FILLS GAPS. A title or description a human
+// wrote is never touched. A "weak" value (outside the length the audit grades)
+// IS rewritten, because a 12-character title is a gap wearing a hat — but a
+// value that reads fine and measures fine is left exactly alone.
+//
+// Every run is capped so it stays cheap and quick, and every item lands in the
+// report as written or skipped-with-a-reason. Nothing is ever silently dropped.
+// FOURGE_AI_MODEL, FOURGE_AI_STATE and the FOURGE_TITLE_* / FOURGE_DESC_* lengths
+// are defined at the top: a define() down here runs only after the dispatcher.
+
+function fourgeAiKey() {
+    $key = '';
+    try { $key = (string)fourgeGetSecret(fourgeDb(), 'claude_key'); } catch (Throwable $e) { $key = ''; }
+    if ($key === '') { $cfg = foundrySecret(); $key = trim((string)($cfg['anthropic_key'] ?? '')); }
+    if ($key === '' || strpos($key, 'REPLACE') !== false) return '';
+    return $key;
+}
+// A custom endpoint is used only when ALL THREE fields are set — a half-filled
+// one (e.g. a key pasted before the model name) is treated as not configured
+// at all rather than guessing a default, so a typo fails obviously (missing
+// key error) instead of silently misrouting a real request.
+function fourgeAiEndpointCfg() {
+    $pdo = fourgeDb();
+    $url = ''; $key = ''; $model = '';
+    try { $url   = trim((string)fourgeGetSecret($pdo, 'ai_endpoint_url'));   } catch (Throwable $e) {}
+    try { $key   = trim((string)fourgeGetSecret($pdo, 'ai_endpoint_key'));   } catch (Throwable $e) {}
+    try { $model = trim((string)fourgeGetSecret($pdo, 'ai_endpoint_model')); } catch (Throwable $e) {}
+    if ($url === '' || $key === '' || $model === '') return null;
+    if (!fourgeTlpUrlOk($url)) return null;   // same https/public-host guard every other operator-supplied URL gets
+    return ['url' => $url, 'key' => $key, 'model' => $model];
+}
+// One server-side LLM call that RETURNS text (claudeProxy echoes to the
+// client, which is no use to a batch job). Returns a string, or ['error'=>…].
+// A configured custom endpoint (Settings → Custom AI Endpoint) is preferred
+// over Anthropic — same "more specific wins" precedence cmsSendForm already
+// uses for SMTP over Mailgun — so an operator who has set one up never pays
+// for both providers on the same generation.
+function fourgeAiText($system, $user, $max = 400) {
+    $custom = fourgeAiEndpointCfg();
+    if ($custom) return fourgeAiTextCustomEndpoint($custom, $system, $user, $max);
+    $key = fourgeAiKey();
+    if ($key === '') return ['error' => 'No Anthropic API key is configured for this site.'];
+    $ch = curl_init(foundryAnthropicBase() . '/v1/messages');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_SSL_VERIFYPEER => true, CURLOPT_TIMEOUT => 45,
+        CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'x-api-key: ' . $key, 'anthropic-version: 2023-06-01'],
+        CURLOPT_POSTFIELDS => json_encode(['model' => FOURGE_AI_MODEL, 'max_tokens' => (int)$max,
+            'system' => (string)$system, 'messages' => [['role' => 'user', 'content' => (string)$user]]]),
+    ]);
+    $res = (string)curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err = curl_error($ch);
+    fourgeCurlClose($ch);
+    if ($err) return ['error' => 'Could not reach Anthropic: ' . $err];
+    $d = json_decode($res, true);
+    if ($code !== 200) {
+        return ['error' => 'Anthropic ' . $code . ': ' . mb_substr((string)($d['error']['message'] ?? $res), 0, 200)];
+    }
+    $text = '';
+    foreach ((array)($d['content'] ?? []) as $blk) if (($blk['type'] ?? '') === 'text') $text .= (string)($blk['text'] ?? '');
+    return trim($text);
+}
+// "Test Connection" — exercises the CUSTOM endpoint specifically (not
+// fourgeAiText(), which would silently fall back to Anthropic if the
+// endpoint is half-configured, defeating the point of a connectivity test).
+function fourgeApiAiEndpointTest($me, $body) {
+    if (fourgeLevel($me) < 4) { http_response_code(403); echo json_encode(['error' => 'Architect access required']); return; }
+    $custom = fourgeAiEndpointCfg();
+    if (!$custom) { http_response_code(400); echo json_encode(['error' => 'Set the endpoint URL, key, and model first, then save.']); return; }
+    $reply = fourgeAiTextCustomEndpoint($custom, 'You are a connectivity test. Reply with exactly one word.', 'Reply with the single word: ok', 10);
+    if (is_array($reply)) { http_response_code(502); echo json_encode(['error' => $reply['error'] ?? 'Unknown error']); return; }
+    echo json_encode(['ok' => true, 'reply' => $reply]);
+}
+// A generic OpenAI-compatible /chat/completions call — Open WebUI, Ollama, LM
+// Studio and vLLM all speak this same request/response shape, unlike
+// Anthropic's: the system prompt rides inside messages[] rather than a
+// separate top-level field, and the reply is choices[0].message.content
+// rather than a content-blocks array. A longer timeout than the Anthropic
+// call: a self-hosted single-worker instance can queue behind other traffic.
+function fourgeAiTextCustomEndpoint($cfg, $system, $user, $max) {
+    $ch = curl_init($cfg['url']);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_SSL_VERIFYPEER => true, CURLOPT_TIMEOUT => 60,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Authorization: Bearer ' . $cfg['key']],
+        CURLOPT_POSTFIELDS => json_encode(['model' => $cfg['model'], 'max_tokens' => (int)$max,
+            'messages' => [['role' => 'system', 'content' => (string)$system], ['role' => 'user', 'content' => (string)$user]]]),
+    ]);
+    $res = (string)curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err = curl_error($ch);
+    fourgeCurlClose($ch);
+    if ($err) return ['error' => 'Could not reach the custom AI endpoint: ' . $err];
+    $d = json_decode($res, true);
+    if ($code !== 200) {
+        return ['error' => 'AI endpoint ' . $code . ': ' . mb_substr((string)($d['error']['message'] ?? $res), 0, 200)];
+    }
+    $text = (string)($d['choices'][0]['message']['content'] ?? '');
+    return trim($text);
+}
+// Models wrap JSON in ``` fences however you ask them not to.
+function fourgeAiJson($text) {
+    $t = trim(preg_replace('~^```(?:json)?|```$~m', '', (string)$text));
+    $d = json_decode($t, true);
+    if (is_array($d)) return $d;
+    if (preg_match('~\{[\s\S]*\}~', $t, $m)) { $d = json_decode($m[0], true); if (is_array($d)) return $d; }
+    return null;
+}
+function fourgeAiWeak($v, $min, $max) {
+    $v = trim((string)$v);
+    if ($v === '') return true;                       // missing
+    $n = mb_strlen($v);
+    return $n < $min || $n > $max;                    // weak
+}
+// "1. Some alt text" → indexed list, tolerant of 1) and stray blank lines.
+function fourgeAiNumbered($text) {
+    $out = [];
+    foreach (preg_split('~\r?\n~', (string)$text) as $line) {
+        if (preg_match('~^\s*(\d+)\s*[.)]\s*(.+)$~', $line, $m)) {
+            $v = trim($m[2]);
+            $v = trim(preg_replace('~^["\x27]|["\x27]$~', '', $v));
+            if ($v !== '') $out[(int)$m[1] - 1] = mb_substr($v, 0, 125);
+        }
+    }
+    return $out;
+}
+// Deterministic alt from a filename, used when the model skips an item:
+// "kitchen-remodel_lubbock-2-300x200.jpg" → "Kitchen remodel lubbock".
+function fourgeAiAltFromFile($file) {
+    $s = preg_replace('~\.[a-z0-9]+$~i', '', basename((string)$file));
+    $s = preg_replace('~-?\d+x\d+$|-scaled$|-copy(-\d+)?$|-e\d{10,}~i', '', $s);
+    $s = trim(preg_replace('~[-_]+~', ' ', $s));
+    $s = trim(preg_replace('~\s*\d+\s*$~', '', $s));
+    if ($s === '' || preg_match('~^(img|image|dsc|photo|screenshot|untitled|final|new)[\s\d]*$~i', $s)) return '';
+    return ucfirst(mb_strtolower($s));
+}
+// Link the FIRST plain-text mention of a keyword, walking the markup so it can
+// never land inside an existing link, a heading, a button, or a tag attribute.
+// Returns the new HTML, or null when there was nowhere safe to put one.
+// Detection only — a PHP-side echo of the client's seoFaqFromDoc() heuristic,
+// used to decide whether a page ALREADY reads as an FAQ before the daily job
+// considers writing one. Deliberately regex-based like the rest of this file
+// rather than DOMDocument, which is not guaranteed present on every host this
+// runs on. One Q&A pair is not an FAQ; real content needs at least two.
+function fourgeHasQaContent($html) {
+    $html = (string)$html;
+    if (strlen($html) > 400000) return false;   // pathological page size — skip detection, not correctness-critical
+    if (!preg_match_all('~<h[23]\b[^>]*>(.*?)</h[23]>~is', $html, $heads, PREG_OFFSET_CAPTURE)) return false;
+    $n = count($heads[0]); $qualifying = 0;
+    for ($i = 0; $i < $n; $i++) {
+        $q = trim(preg_replace('~\s+~', ' ', strip_tags($heads[1][$i][0])));
+        if (!preg_match('~\?\s*$~', $q) || mb_strlen($q) < 8 || mb_strlen($q) > 200) continue;
+        $start = $heads[0][$i][1] + strlen($heads[0][$i][0]);
+        $end = ($i + 1 < $n) ? $heads[0][$i + 1][1] : strlen($html);
+        $chunk = substr($html, $start, $end - $start);
+        // Stop at the NEXT heading of any level — an h4 between two h2s still
+        // ends the answer, same as the JS version walking nextElementSibling.
+        if (preg_match('~<h[1-6]\b~i', $chunk, $hm, PREG_OFFSET_CAPTURE)) $chunk = substr($chunk, 0, $hm[0][1]);
+        $a = trim(preg_replace('~\s+~', ' ', strip_tags($chunk)));
+        if (mb_strlen($a) >= 40) $qualifying++;
+        if ($qualifying >= 2) return true;
+    }
+    return false;
+}
+// A minimal, standalone FAQPage stamp — deliberately NOT folded into
+// cmsPkgStampSeo's extraJsonld, which is reserved for schema a package
+// delivered verbatim. Marked with its own attribute so it can be told apart
+// from (and cleanly superseded by) the full graph the page editor builds from
+// the SAME aeoFAQs data the next time a human actually saves this page.
+function fourgeAeoStampFaq($html, $faqs) {
+    $html = (string)$html;
+    $html = preg_replace('~[ \t]*<script\b[^>]*data-fourge-aeo-faq[^>]*>[\s\S]*?</script>[ \t]*\r?\n?~i', '', $html);
+    $faqs = array_values(array_filter((array)$faqs, function ($f) {
+        return is_array($f) && trim((string)($f['question'] ?? '')) !== '' && trim((string)($f['answer'] ?? '')) !== '';
+    }));
+    if (!$faqs) return $html;
+    $entities = array_map(function ($f) {
+        return ['@type' => 'Question', 'name' => trim((string)$f['question']),
+                'acceptedAnswer' => ['@type' => 'Answer', 'text' => trim((string)$f['answer'])]];
+    }, $faqs);
+    $json = json_encode(['@context' => 'https://schema.org', '@type' => 'FAQPage', 'mainEntity' => $entities],
+                         JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    $json = str_ireplace('</script', '<\\/script', (string)$json);
+    $block = '<script type="application/ld+json" data-fourge-aeo-faq>' . $json . '</script>';
+    if (preg_match('~</head>~i', $html)) return preg_replace('~</head>~i', $block . "\n</head>", $html, 1);
+    if (preg_match('~<head\b[^>]*>~i', $html)) return preg_replace('~<head\b[^>]*>~i', '$0' . "\n" . $block, $html, 1);
+    return $block . "\n" . $html;
+}
+function fourgeAiLinkKeyword($html, $kw, $url) {
+    $html = (string)$html;
+    if ($kw === '' || $url === '') return null;
+    if (stripos($html, 'href="' . $url) !== false) return null;      // already links there
+    $parts = preg_split('~(<[^>]+>)~', $html, -1, PREG_SPLIT_DELIM_CAPTURE);
+    $inA = 0; $inH = 0; $inBtn = 0; $inSkip = 0;
+    $rx = '~\b(' . preg_quote($kw, '~') . ')\b~i';
+    foreach ($parts as $i => $seg) {
+        if ($seg === '') continue;
+        if ($seg[0] === '<') {
+            if     (preg_match('~^<a\b~i', $seg))            $inA++;
+            elseif (preg_match('~^</a>~i', $seg))            $inA = max(0, $inA - 1);
+            elseif (preg_match('~^<h[1-6]\b~i', $seg))       $inH++;
+            elseif (preg_match('~^</h[1-6]>~i', $seg))       $inH = max(0, $inH - 1);
+            elseif (preg_match('~^<button\b~i', $seg))       $inBtn++;
+            elseif (preg_match('~^</button>~i', $seg))       $inBtn = max(0, $inBtn - 1);
+            // Never inside script/style/textarea — their text is not prose.
+            elseif (preg_match('~^<(script|style|textarea)\b~i', $seg)) $inSkip++;
+            elseif (preg_match('~^</(script|style|textarea)>~i', $seg)) $inSkip = max(0, $inSkip - 1);
+            continue;
+        }
+        if ($inA || $inH || $inBtn || $inSkip) continue;
+        if (preg_match($rx, $seg)) {
+            $parts[$i] = preg_replace($rx, '<a href="' . htmlspecialchars($url, ENT_QUOTES, 'UTF-8') . '">$1</a>', $seg, 1);
+            return implode('', $parts);
+        }
+    }
+    return null;
+}
+function fourgeAiState() { $s = cmsPkgReadJson(FOURGE_AI_STATE, []); return is_array($s) ? $s : []; }
+function fourgeAiSaveState($s) { cmsPkgWriteJson(FOURGE_AI_STATE, $s); }
+
+// The run. Caps keep each pass cheap; the weekly trigger picks up what is left.
+function fourgeAiAutofix($opts = []) {
+    $metaCap = max(0, (int)($opts['metaCap'] ?? 10));
+    $altCap  = max(0, (int)($opts['altCap']  ?? 8));
+    $linkCap = max(0, (int)($opts['linkCap'] ?? 10));
+    $dry     = !empty($opts['dry']);
+    if (fourgeAiKey() === '') {
+        return ['ok' => false, 'error' => 'No Anthropic API key is configured. Add one in Settings → Secrets (claude_key) first.'];
+    }
+    $rep = ['ok' => true, 'ran_at' => gmdate('c'), 'dry_run' => $dry,
+            'metas' => [], 'alts' => [], 'links' => [], 'aeo' => [], 'skipped' => []];
+    $skip = function ($what, $why) use (&$rep) { $rep['skipped'][] = ['item' => $what, 'reason' => $why]; };
+
+    $site  = cmsPkgReadJson('site.json', []);  if (!is_array($site))  $site  = [];
+    $pages = cmsPkgReadJson('pages.json', []); if (!is_array($pages)) $pages = [];
+    $seo   = cmsPkgReadJson('seo.json', []);   if (!is_array($seo))   $seo   = [];
+    $siteName = trim((string)($site['name'] ?? ''));
+    $baseUrl  = trim((string)($site['website'] ?? ''));
+    if ($baseUrl !== '' && !preg_match('~^https?://~i', $baseUrl)) $baseUrl = 'https://' . $baseUrl;
+
+    // ── 1. missing OR weak SEO titles and descriptions ──────────────────────
+    $seoDirty = false; $done = 0;
+    foreach ($pages as $pid => $rec) {
+        if ($done >= $metaCap) break;
+        if (!is_array($rec) || !empty($rec['draft'])) continue;
+        $file = (string)($rec['path'] ?? ($rec['file'] ?? ''));
+        if ($file === '') continue;
+        $cur   = is_array($seo[$pid] ?? null) ? $seo[$pid] : [];
+        $needT = fourgeAiWeak($cur['title'] ?? '',       FOURGE_TITLE_MIN, FOURGE_TITLE_MAX);
+        $needD = fourgeAiWeak($cur['description'] ?? '', FOURGE_DESC_MIN,  FOURGE_DESC_MAX);
+        if (!$needT && !$needD) continue;
+        $abs = PUBLIC_HTML . '/' . ltrim($file, '/');
+        $html = is_file($abs) ? (string)@file_get_contents($abs) : '';
+        if (trim($html) === '') { $skip((string)($rec['title'] ?? $pid), 'The page file is missing or empty'); continue; }
+        // Body text only — the nav and footer are the same on every page and
+        // would make every description read the same.
+        $body = $html;
+        if (preg_match('~<main\b[^>]*>([\s\S]*?)</main>~i', $html, $m)) $body = $m[1];
+        $text = trim(preg_replace('~\s+~', ' ', strip_tags(preg_replace('~<(script|style)\b[\s\S]*?</\1>~i', ' ', $body))));
+        if (mb_strlen($text) < 60) { $skip((string)($rec['title'] ?? $pid), 'Not enough text on the page to describe it honestly'); continue; }
+        $out = fourgeAiText(
+            'You write SEO metadata. Reply with ONLY compact JSON, no markdown, no commentary: '
+            . '{"title":"a ' . FOURGE_TITLE_MIN . '-' . FOURGE_TITLE_MAX . ' character page title","description":"a '
+            . FOURGE_DESC_MIN . '-' . FOURGE_DESC_MAX . ' character meta description ending in a call to action"}. '
+            . 'Describe only what the page actually says. Never invent services, locations, credentials, prices or guarantees.',
+            'Site: ' . ($siteName ?: 'this business') . "\nPage title: " . (string)($rec['title'] ?? '')
+            . "\nPage content:\n" . mb_substr($text, 0, 1200), 300);
+        if (is_array($out)) { $skip((string)($rec['title'] ?? $pid), $out['error']); continue; }
+        $j = fourgeAiJson($out);
+        if (!$j) { $skip((string)($rec['title'] ?? $pid), 'The model did not return usable JSON'); continue; }
+        $wrote = [];
+        if ($needT && trim((string)($j['title'] ?? '')) !== '') {
+            $cur['title'] = mb_substr(trim(preg_replace('~[\r\n\t]+~', ' ', (string)$j['title'])), 0, 120);
+            $wrote[] = 'title';
+        }
+        if ($needD && trim((string)($j['description'] ?? '')) !== '') {
+            $cur['description'] = mb_substr(trim(preg_replace('~[\r\n\t]+~', ' ', (string)$j['description'])), 0, 320);
+            $wrote[] = 'description';
+        }
+        if (!$wrote) { $skip((string)($rec['title'] ?? $pid), 'The model returned nothing for the missing field'); continue; }
+        if (!$dry) {
+            $seo[$pid] = $cur; $seoDirty = true;
+            // Write straight to the live page too. Without this, the fix sits in
+            // seo.json until a human happens to open this exact page in the editor
+            // and save it — which, for an UNATTENDED daily run, could be never.
+            // Reuses the same stamp the deploy-package importer already trusts for
+            // exactly this: title, description, canonical, robots, OG, Twitter.
+            cmsPkgBackup($file);
+            $canon = cmsPkgPageUrl($baseUrl, $file);
+            fourgeSitePut($abs, cmsPkgStampSeo($html, $cur, $canon, !empty($rec['draft'])), 'Fourge: AI auto-fix');
+        }
+        $rep['metas'][] = ['page' => (string)($rec['title'] ?? $pid), 'wrote' => implode(' + ', $wrote),
+                           'was' => ($needT && ($cur['title'] ?? '') !== '' ? 'weak/missing' : 'missing')];
+        $done++;
+    }
+    if ($seoDirty && !$dry) cmsPkgWriteJson('seo.json', $seo);
+
+    // ── 2. images with no alt text ──────────────────────────────────────────
+    $state = fourgeAiState();
+    $altDone = is_array($state['alts'] ?? null) ? $state['alts'] : [];
+    $done = 0;
+    foreach ($pages as $pid => $rec) {
+        if ($done >= $altCap) break;
+        if (!is_array($rec)) continue;
+        $file = (string)($rec['path'] ?? ($rec['file'] ?? ''));
+        if ($file === '') continue;
+        $abs = PUBLIC_HTML . '/' . ltrim($file, '/');
+        if (!is_file($abs)) continue;
+        $html = (string)@file_get_contents($abs);
+        $sig = md5($html);
+        if (($altDone[$pid] ?? '') === $sig) continue;          // unchanged since we last looked
+        // An <img> with no alt attribute at all, or one that is empty/whitespace.
+        // The value must START with a real character: writing it as [^"]*\S lets
+        // \S match the CLOSING QUOTE, so alt="" reads as "already described" and
+        // every empty alt on the site gets silently skipped.
+        $rx = '~<img\b(?![^>]*\balt\s*=\s*"\s*[^"\s])(?![^>]*\balt\s*=\s*\x27\s*[^\x27\s])[^>]*>~i';
+        if (!preg_match_all($rx, $html, $mm) || !$mm[0]) { $altDone[$pid] = $sig; continue; }
+        $tags = array_slice($mm[0], 0, 12);
+        $names = [];
+        foreach ($tags as $t) { preg_match('~\bsrc\s*=\s*["\x27]([^"\x27]+)["\x27]~i', $t, $m); $names[] = basename($m[1] ?? 'image'); }
+        $lines = []; foreach ($names as $i => $n) $lines[] = ($i + 1) . '. ' . $n;
+        $out = fourgeAiText(
+            'You write image alt text: max 12 words, describing what the image shows. No quotes, no "image of", '
+            . 'no marketing copy. Reply with a numbered list only, one line per input line, in the same order.',
+            'Site: ' . ($siteName ?: 'this business') . "\nPage: " . (string)($rec['title'] ?? '')
+            . "\nImage filenames:\n" . implode("\n", $lines), 500);
+        $alts = [];
+        if (is_array($out)) $skip('alt text on "' . (string)($rec['title'] ?? $pid) . '"', $out['error'] . ' — used filenames instead');
+        else $alts = fourgeAiNumbered($out);
+        $i = 0; $filled = 0;
+        $next = preg_replace_callback($rx, function ($m) use (&$i, $alts, $names, &$filled) {
+            $alt = trim((string)($alts[$i] ?? ''));
+            if ($alt === '') $alt = fourgeAiAltFromFile($names[$i] ?? '');
+            $i++;
+            if ($alt === '') return $m[0];
+            $filled++;
+            // Replace an empty alt="" if present, otherwise insert one.
+            if (preg_match('~\balt\s*=\s*("\s*"|\x27\s*\x27)~i', $m[0])) {
+                return preg_replace('~\balt\s*=\s*("\s*"|\x27\s*\x27)~i', 'alt="' . htmlspecialchars($alt, ENT_QUOTES, 'UTF-8') . '"', $m[0], 1);
+            }
+            return preg_replace('~^<img\b~i', '<img alt="' . htmlspecialchars($alt, ENT_QUOTES, 'UTF-8') . '"', $m[0], 1);
+        }, $html);
+        if ($next !== null && $next !== $html && $filled > 0) {
+            if (!$dry) { cmsPkgBackup($file); fourgeSitePut($abs, $next, 'Fourge: AI auto-fix'); $altDone[$pid] = md5($next); }
+            $rep['alts'][] = ['page' => (string)($rec['title'] ?? $pid), 'images' => $filled];
+            $done++;
+        } else {
+            $altDone[$pid] = $sig;
+        }
+    }
+
+    // ── 3. internal links to the pages the campaign is targeting ────────────
+    $linked = 0;
+    if ($linkCap > 0 && $baseUrl !== '') {
+        $targets = [];
+        foreach ($pages as $pid => $rec) {
+            if (!is_array($rec) || !empty($rec['draft'])) continue;
+            $kw = trim((string)(($seo[$pid]['focusKeyword'] ?? '')));
+            if (mb_strlen($kw) < 6) continue;                   // too short to link safely
+            $file = (string)($rec['path'] ?? ($rec['file'] ?? ''));
+            if ($file === '') continue;
+            $targets[$pid] = ['kw' => $kw, 'url' => cmsPkgPageUrl($baseUrl, $file), 'title' => (string)($rec['title'] ?? $pid)];
+        }
+        foreach ($targets as $tid => $t) {
+            if ($linked >= $linkCap) break;
+            foreach ($pages as $did => $drec) {
+                if ($linked >= $linkCap) break;
+                if ($did === $tid || !is_array($drec) || !empty($drec['draft'])) continue;
+                $dfile = (string)($drec['path'] ?? ($drec['file'] ?? ''));
+                if ($dfile === '') continue;
+                $dabs = PUBLIC_HTML . '/' . ltrim($dfile, '/');
+                if (!is_file($dabs)) continue;
+                $dhtml = (string)@file_get_contents($dabs);
+                // Only inside <main> — a keyword in the shared nav or footer
+                // would link every page to the same target.
+                if (!preg_match('~(<main\b[^>]*>)([\s\S]*?)(</main>)~i', $dhtml, $mm)) continue;
+                $newInner = fourgeAiLinkKeyword($mm[2], $t['kw'], $t['url']);
+                if ($newInner === null) continue;
+                $next = str_replace($mm[0], $mm[1] . $newInner . $mm[3], $dhtml);
+                if (!$dry) { cmsPkgBackup($dfile); fourgeSitePut($dabs, $next, 'Fourge: AI auto-fix'); }
+                $rep['links'][] = ['from' => (string)($drec['title'] ?? $did), 'to' => $t['title'], 'keyword' => $t['kw']];
+                $linked++;
+                break;                                          // one inbound link per target per run
+            }
+        }
+    } elseif ($linkCap > 0) {
+        $skip('internal links', 'Set Design → Website URL first — a link needs the site\'s real address');
+    }
+
+    // ── 4. AEO: FAQ content for pages that have none at all ─────────────────
+    // "None at all" means BOTH halves are empty: no hand-entered/previously-
+    // generated aeoFAQs, AND the page's own headings don't already read as an
+    // FAQ (seoBuildSchema harvests those for free — writing AI ones on top
+    // would just replace better, more specific copy with generic AI copy).
+    $faqCap = max(0, (int)($opts['faqCap'] ?? 4));
+    $aeoDone = 0; $aeoSeoDirty = false;
+    foreach ($pages as $pid => $rec) {
+        if ($aeoDone >= $faqCap) break;
+        if (!is_array($rec) || !empty($rec['draft'])) continue;
+        $file = (string)($rec['path'] ?? ($rec['file'] ?? ''));
+        if ($file === '') continue;
+        $cur = is_array($seo[$pid] ?? null) ? $seo[$pid] : [];
+        $existing = array_values(array_filter((array)($cur['aeoFAQs'] ?? []), function ($f) {
+            return is_array($f) && trim((string)($f['question'] ?? ($f['q'] ?? ''))) !== ''
+                && trim((string)($f['answer'] ?? ($f['a'] ?? ''))) !== '';
+        }));
+        if ($existing) continue;   // real content already there — never touched
+        $abs = PUBLIC_HTML . '/' . ltrim($file, '/');
+        $html = is_file($abs) ? (string)@file_get_contents($abs) : '';
+        if (trim($html) === '') { $skip((string)($rec['title'] ?? $pid) . ' (FAQs)', 'The page file is missing or empty'); continue; }
+        if (fourgeHasQaContent($html)) continue;   // the page's own headings already read as an FAQ
+        $body = $html;
+        if (preg_match('~<main\b[^>]*>([\s\S]*?)</main>~i', $html, $m)) $body = $m[1];
+        $text = trim(preg_replace('~\s+~', ' ', strip_tags(preg_replace('~<(script|style)\b[\s\S]*?</\1>~i', ' ', $body))));
+        if (mb_strlen($text) < 150) { $skip((string)($rec['title'] ?? $pid) . ' (FAQs)', 'Not enough content to write honest FAQs from'); continue; }
+        $out = fourgeAiText(
+            'You write FAQ content for a real business webpage, useful for both search results and AI answer engines. '
+            . 'Reply with ONLY compact JSON, no markdown, no commentary: {"faqs":[{"question":"...","answer":"..."}]}. '
+            . 'Write 3 to 4 questions a real customer would ask about THIS page specifically, each with a 2-3 sentence '
+            . 'answer grounded ONLY in the page content given. Never invent services, locations, prices, credentials, '
+            . 'guarantees, or policies that are not stated. If the page cannot honestly support 3 questions, return fewer.',
+            'Site: ' . ($siteName ?: 'this business') . "\nPage title: " . (string)($rec['title'] ?? '')
+            . "\nPage content:\n" . mb_substr($text, 0, 1600), 700);
+        if (is_array($out)) { $skip((string)($rec['title'] ?? $pid) . ' (FAQs)', $out['error']); continue; }
+        $j = fourgeAiJson($out);
+        $raw = (is_array($j) && is_array($j['faqs'] ?? null)) ? $j['faqs'] : [];
+        $faqs = [];
+        foreach ($raw as $f) {
+            $q = trim((string)(is_array($f) ? ($f['question'] ?? '') : ''));
+            $a = trim((string)(is_array($f) ? ($f['answer'] ?? '') : ''));
+            if ($q === '' || $a === '' || mb_strlen($a) < 30) continue;
+            $faqs[] = ['question' => mb_substr($q, 0, 200), 'answer' => mb_substr($a, 0, 500)];
+            if (count($faqs) >= 5) break;
+        }
+        if (count($faqs) < 2) { $skip((string)($rec['title'] ?? $pid) . ' (FAQs)', 'The model could not produce enough genuine questions for this page'); continue; }
+        if (!$dry) {
+            $cur['aeoFAQs'] = $faqs;
+            $seo[$pid] = $cur; $aeoSeoDirty = true;
+            // Same reasoning as the metadata phase: put it on the live page NOW,
+            // marked separately so a later human save (which rebuilds the whole
+            // schema graph FROM this same aeoFAQs data) cleanly replaces it
+            // instead of ending up with two FAQPage blocks.
+            cmsPkgBackup($file);
+            fourgeSitePut($abs, fourgeAeoStampFaq($html, $faqs), 'Fourge: AI auto-fix');
+        }
+        $rep['aeo'][] = ['page' => (string)($rec['title'] ?? $pid), 'faqs' => count($faqs)];
+        $aeoDone++;
+    }
+    if ($aeoSeoDirty && !$dry) cmsPkgWriteJson('seo.json', $seo);
+
+    if (!$dry) {
+        $state['alts'] = $altDone;
+        $state['last'] = $rep;
+        $state['last_run'] = time();
+        fourgeAiSaveState($state);
+    }
+    $rep['totals'] = ['metas' => count($rep['metas']), 'alts' => count($rep['alts']),
+                      'links' => count($rep['links']), 'aeo' => count($rep['aeo']), 'skipped' => count($rep['skipped'])];
+    return $rep;
+}
+function fourgeApiAiAutofix($me, $body) {
+    if (!$me) { http_response_code(401); echo json_encode(['error' => 'Not signed in']); return; }
+    if (fourgeLevel($me) < 2) { http_response_code(403); echo json_encode(['error' => 'Admin access required']); return; }
+    echo json_encode(fourgeAiAutofix([
+        'dry'     => !empty($body['dry']),
+        'metaCap' => isset($body['metaCap']) ? (int)$body['metaCap'] : 10,
+        'altCap'  => isset($body['altCap'])  ? (int)$body['altCap']  : 8,
+        'linkCap' => isset($body['linkCap']) ? (int)$body['linkCap'] : 10,
+        'faqCap'  => isset($body['faqCap'])  ? (int)$body['faqCap']  : 4,
+    ]));
+}
+// Whether the daily job should run at all. Distinguishes "an operator
+// explicitly turned this off" (respected) from "nobody has ever touched this
+// setting" (now ON — that silent default was the whole complaint: a fix that
+// only runs when someone remembers to click something keeps getting missed).
+// 'weekly' is the old key, kept readable so a site that had already opted in
+// (or explicitly out) under the old name is not silently reset.
+function fourgeAiAutoOn($state) {
+    if (array_key_exists('auto', $state))   return !empty($state['auto']);
+    if (array_key_exists('weekly', $state)) return !empty($state['weekly']);
+    return true;
+}
+// Daily upkeep, so pages created since the last run get covered without anyone
+// pressing a button. Fourge has no cron, so this rides two things: the login
+// self-heal (best-effort, whenever anyone happens to sign in) AND the SEO
+// platform's own scheduled ping (fourgeApiSeoPkgTick) — which fires on a real
+// clock regardless of whether anyone logs into this particular site. Either
+// way it is time-boxed and never blocks whatever it is riding inside.
+function fourgeAiDailyTick() {
+    $state = fourgeAiState();
+    if (!fourgeAiAutoOn($state)) return false;
+    $last = (int)($state['last_run'] ?? 0);
+    if ($last && (time() - $last) < 86400) return false;
+    if (fourgeAiKey() === '') return false;
+    try { fourgeAiAutofix(['metaCap' => 5, 'altCap' => 4, 'linkCap' => 5, 'faqCap' => 3]); return true; }
+    catch (Throwable $e) { return false; }
+}
+
+// ── THE FLEET DASHBOARD'S FOLDER ON CLIENT SITES ─────────────────────────────
+// The Fleet Dashboard (fleet-dashboard/) is a separate tool, set up once on its
+// own, but it lives in the same repository as the engine — so a site built from
+// that repository deployed a copy into its web root, where the page scan listed
+// its index.html as one of the site's pages and anyone could open it. A copy that
+// was never set up is removed at sign-in: from the server, and from the site's
+// own repository, so a later deploy can't put it back. Nothing else is touched —
+// a set-up dashboard (config.secret.php or data/sites.json present), a folder
+// holding anything beyond the dashboard's own files, or one whose files aren't
+// the dashboard's stays exactly as it is ('kept'). The page scan skips the folder
+// either way (SKIP_DIRS). Answers absent / kept / removed / partly.
+// A function, not a const: the dispatcher runs before execution reaches a const defined down here.
+function fourgeFleetCopyFiles() { return ['index.html', 'api.php', 'config.secret.example.php', '.htaccess', 'data/.htaccess']; }
+function fourgeRemoveStrayFleetDashboard() {
+    $dir = PUBLIC_HTML . '/fleet-dashboard';
+    if (!is_dir($dir)) return 'absent';
+    if (is_file($dir . '/config.secret.php') || is_file($dir . '/data/sites.json')) return 'kept';
+    foreach (['', 'data'] as $sub) {
+        $p = $sub === '' ? $dir : $dir . '/' . $sub;
+        if ($sub !== '' && !is_dir($p)) continue;
+        $items = @scandir($p);
+        if (!is_array($items)) return 'kept';
+        foreach ($items as $f) {
+            if ($f === '.' || $f === '..' || ($sub === '' && $f === 'data' && is_dir($p . '/data'))) continue;
+            if (!in_array(($sub === '' ? '' : $sub . '/') . $f, fourgeFleetCopyFiles(), true)) return 'kept';   // something of the site's own lives here
+        }
+    }
+    $idx = (string)@file_get_contents($dir . '/index.html');
+    $api = (string)@file_get_contents($dir . '/api.php');
+    if (stripos($idx, '<title>Fleet Dashboard</title>') === false && strpos($api, 'Fleet Dashboard') === false) return 'kept';
+    foreach (fourgeFleetCopyFiles() as $f) { if (is_file($dir . '/' . $f)) @unlink($dir . '/' . $f); }
+    if (is_dir($dir . '/data')) @rmdir($dir . '/data');
+    @rmdir($dir);
+    if (is_dir($dir)) return 'partly';
+    foreach (fourgeFleetCopyFiles() as $f) {   // and out of the site's repository (each commit [skip ci]); stop at the first GitHub problem
+        try { $r = cmsGhDeletePath('fleet-dashboard/' . $f, 'Fourge: remove the Fleet Dashboard copy (fleet-dashboard/' . $f . ')'); }
+        catch (Throwable $e) { break; }
+        if (empty($r['ok'])) break;
+    }
+    return 'removed';
+}
+function fourgeApiInstallCleanUrls($me) {
+    if (!$me) { http_response_code(401); echo json_encode(['error' => 'Not signed in']); return; }
+    if (!fourgeWriteCleanUrlHtaccess()) {
+        http_response_code(500);
+        echo json_encode(['error' => 'Could not write .htaccess (check that the site root is writable by PHP)']);
+        return;
+    }
+    // Best-effort riders on the same login self-heal: the browser-caching policy,
+    // open the public posts feed to cross-site reads, install the SEO-platform
+    // endpoints, and publish any scheduled deploy-package content that has come
+    // due. None of these can fail the clean-URL install.
+    $cache = false; $cors = false; $seoApi = false; $idx = false; $due = []; $canon = null; $websiteAuto = null;
+    try { $cache  = fourgeWriteCacheHtaccess();    } catch (Throwable $e) { $cache = false; }
+    // Signed in at the site's real address while the Website URL is empty or a dev link? Then that address is the Website URL from now on.
+    try { $websiteAuto = fourgeAutoWebsite(); } catch (Throwable $e) { $websiteAuto = null; }
+    // Signed in at a development link? Remember it, so it forwards to the live domain once the site is live there.
+    try { fourgeRememberDevHost(); } catch (Throwable $e) {}
+    // Parked domains → the Website URL, once that address has answered as this installation (cached verdict; see fourgeWriteCanonicalHostHtaccess).
+    try { $canon  = fourgeWriteCanonicalHostHtaccess(false); } catch (Throwable $e) { $canon = null; }
+    try { $cors   = fourgeWritePostsCorsHtaccess(); } catch (Throwable $e) { $cors = false; }
+    try { $seoApi = fourgeWriteSeoApiHtaccess();    } catch (Throwable $e) { $seoApi = false; }
+    try { $idx    = fourgeWriteIndexingHtaccess(); } catch (Throwable $e) { $idx = false; }
+    // Make sure this site's secret files cannot be downloaded. Sites deployed
+    // before admin/.htaccess existed have had no protection at all.
+    $sec = false;
+    try { $sec    = fourgeWriteAdminHtaccess();    } catch (Throwable $e) { $sec = false; }
+    // Same reasoning as admin/.htaccess above: a site that had form entries or
+    // uploads before these guards existed has had no protection at all.
+    $entriesGuard = false; $uploadsGuard = false;
+    try { $entriesGuard = fourgeWriteEntriesHtaccess(); } catch (Throwable $e) { $entriesGuard = false; }
+    try { $uploadsGuard = fourgeWriteUploadsHtaccess(); } catch (Throwable $e) { $uploadsGuard = false; }
+    // Earlier copies of pages (data/bak/, data/rev_*.html): closed to the web and to search engines.
+    $backupsGuard = false;
+    try { $backupsGuard = fourgeWriteBackupsHtaccess(); } catch (Throwable $e) { $backupsGuard = false; }
+    // A copy of the Fleet Dashboard that came with the repository is not part of the site.
+    $fleetCopy = 'absent';
+    try { $fleetCopy = fourgeRemoveStrayFleetDashboard(); } catch (Throwable $e) { $fleetCopy = 'error'; }
+    // A captcha secret an older admin saved into the public site.json moves to the secret store.
+    $captchaSecrets = 'none';
+    try { $captchaSecrets = fourgeMoveCaptchaSecrets(); } catch (Throwable $e) { $captchaSecrets = 'error'; }
+    // The four safe security headers, and an llms.txt if the site has none.
+    $hdr = false; $llms = false;
+    try { $hdr    = fourgeWriteDefaultHeaders();   } catch (Throwable $e) { $hdr = false; }
+    try { $llms   = fourgeEnsureLlms();            } catch (Throwable $e) { $llms = false; }
+    // Daily AI upkeep — on by default; see fourgeAiAutoOn().
+    try { fourgeAiDailyTick(); } catch (Throwable $e) {}
+    try { $due    = cmsPkgTick(false);              } catch (Throwable $e) { $due = []; }
+    // Fleet Dashboard: silent no-op on every site that has not configured one.
+    $fleet = false;
+    try { $fleet  = fourgeFleetReport();            } catch (Throwable $e) { $fleet = false; }
+    // Blog Sync: install the tick endpoint's rewrite rule, then opportunistically
+    // check the source blog if it's been ≥10 minutes since the last check.
+    // Silent no-op on every site that has not enabled it.
+    $blogSyncApi = false; $blogSync = null;
+    try { $blogSyncApi = fourgeWriteBlogSyncApiHtaccess(); } catch (Throwable $e) { $blogSyncApi = false; }
+    try { $blogSync     = fourgeBlogSyncTickIfDue();       } catch (Throwable $e) { $blogSync = null; }
+    // The MarkUp hub only: keep the webhook's address rule (a hand-edited or redeployed .htaccess may have lost it).
+    $markupHook = null;
+    try { if (fourgeMarkupIsHub() && fourgeMarkupWebhookSecret(false) !== '') $markupHook = fourgeWriteMarkupWebhookHtaccess(); } catch (Throwable $e) { $markupHook = false; }
+    echo json_encode(['ok' => true, 'cacheHeaders' => $cache, 'canonicalHost' => $canon, 'websiteAuto' => $websiteAuto, 'postsCors' => $cors, 'seoApi' => $seoApi, 'indexing' => $idx,
+        'secretGuard' => $sec, 'headers' => $hdr, 'llms' => $llms, 'published' => count($due), 'fleet' => $fleet,
+        'blogSyncApi' => $blogSyncApi, 'blogSync' => $blogSync, 'markupWebhook' => $markupHook,
+        'entriesGuard' => $entriesGuard, 'uploadsGuard' => $uploadsGuard, 'backupsGuard' => $backupsGuard, 'fleetDashboardCopy' => $fleetCopy, 'captchaSecrets' => $captchaSecrets]);
+}
+function fourgeApiSetPagePassword($me, $body) {
+    $path = (string)($body['path'] ?? '');
+    $password = (string)($body['password'] ?? '');
+    $path = ltrim(str_replace('\\', '/', $path), '/');
+    $lower = strtolower($path);
+    if ($path === '' || strpos($path, '..') !== false) {
+        http_response_code(400); echo json_encode(['error' => 'Invalid path']); return;
+    }
+    if (strpos($lower, 'admin/') === 0 || strpos($lower, 'data/') === 0 || !preg_match('/\.html?$/', $lower)) {
+        http_response_code(400); echo json_encode(['error' => 'Only site .html pages can be password-protected']); return;
+    }
+    $map = fourgeLoadProtectMap();
+    if ($password === '') {
+        unset($map[$path]);                          // disable protection
+    } else {
+        if (strlen($password) < 4) {
+            http_response_code(400); echo json_encode(['error' => 'Password must be at least 4 characters']); return;
+        }
+        $map[$path] = password_hash($password, PASSWORD_DEFAULT);
+    }
+    if (!fourgeSaveProtectMap($map))   { http_response_code(500); echo json_encode(['error' => 'Could not save the password store']); return; }
+    if (!fourgeWriteGateFile())        { http_response_code(500); echo json_encode(['error' => 'Could not write the page gate']); return; }
+    if (!fourgeWriteProtectHtaccess(array_keys($map))) { http_response_code(500); echo json_encode(['error' => 'Could not update .htaccess']); return; }
+    echo json_encode(['ok' => true, 'protected' => array_keys($map)]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 44i SEO PLATFORM — DEPLOY PACKAGE IMPORTER
+// Consumes the same "44i-deploy-package" v1 file the WordPress connector eats,
+// so one exported file deploys to either platform. The apply logic lives HERE
+// (server side) and the admin screen calls it with mode=preview|apply — so the
+// UI and the machine endpoint cannot drift apart. Nothing from the file is ever
+// executed: HTML is sanitized, redirect targets are URL-validated, header
+// name/value pairs are charset-restricted, and .htaccess writes are confined to
+// marker-delimited managed blocks.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The package's "format" field. The platform wrote "44i-deploy-package" until
+// it was renamed; it now writes "ydg-deploy-package". Same file, same version 1.
+function cmsPkgFormats() { return ['ydg-deploy-package', '44i-deploy-package']; }
+function cmsPkgDataPath($name) { return PUBLIC_HTML . '/data/' . $name; }
+function cmsPkgReadJson($name, $fallback) {
+    $f = cmsPkgDataPath($name);
+    if (!is_file($f)) return $fallback;
+    $j = json_decode((string)@file_get_contents($f), true);
+    return ($j === null) ? $fallback : $j;
+}
+function cmsPkgWriteJson($name, $data) {
+    if ($name === 'site.json' && is_array($data)) { try { $disk = json_decode((string)@file_get_contents(PUBLIC_HTML . '/data/site.json'), true); $data = fourgeCaptchaSecretsOut($data, is_array($disk) ? $disk : null, false); } catch (Throwable $e) {} }   // never a captcha secret in the public file
+    $dir = PUBLIC_HTML . '/data';
+    if (!is_dir($dir)) @mkdir($dir, 0755, true);
+    return fourgeSitePut(cmsPkgDataPath($name), json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), 'Fourge: SEO package data') !== false;
+}
+// One-generation backup of any existing file we are about to overwrite.
+function cmsPkgBackup($relPath) {
+    $src = PUBLIC_HTML . '/' . ltrim($relPath, '/');
+    if (!is_file($src)) return;
+    $dir = PUBLIC_HTML . '/data/bak';
+    if (!is_dir($dir)) @mkdir($dir, 0755, true);
+    // A package can arrive before anyone signs in: close the folder before its first copy lands.
+    if (!is_file($dir . '/.htaccess')) { try { fourgeWriteBackupsHtaccess(); } catch (Throwable $e) {} }
+    @copy($src, $dir . '/' . str_replace(['/', '\\'], '__', ltrim($relPath, '/')));
+}
+// ── PUBLIC URL PATHS, PHP SIDE ──────────────────────────────────────────────
+// Two jobs that were previously (wrongly) one function:
+//
+//   cmsPkgUrlPath()  — the path that actually appears in a public URL. Must be
+//                      byte-identical to fourgePagePath() in admin/index.html,
+//                      because both write canonical tags for the same page.
+//                      CASE-PRESERVING: on a case-sensitive filesystem a page
+//                      file named About.html is served at /About, and a canonical
+//                      of /about is a 404 pointing search engines at nothing.
+//   cmsPkgNormPath() — a comparison KEY for matching a deploy-package target
+//                      against pages.json. Case- and trailing-slash-folded on
+//                      purpose, so /Services/ and services/index.html match.
+//
+// PHP cannot call the JS helper, so the two are locked together by a shared
+// vector table asserted in both test suites (indexing.mjs / indexing_test.php).
+//
+// Shape: extensionless, no leading slash, home = '', a directory index folds to
+// its directory ('services/index.html' -> 'services/', which is the URL Apache
+// actually serves for that file via DirectoryIndex).
+function cmsPkgUrlPath($u) {
+    $u = trim((string)$u);
+    if ($u === '') return '';
+    // A host is only stripped when the input was genuinely absolute. Sniffing
+    // for "a dot before the first slash" would eat bare page filenames — a
+    // pages.json entry of "about.html" would normalize to '' and collide with
+    // the homepage, so nothing would resolve.
+    $hadHost = false;
+    if (preg_match('~^[a-z][a-z0-9+.\-]*://~i', $u)) { $u = preg_replace('~^[a-z][a-z0-9+.\-]*://~i', '', $u); $hadHost = true; }
+    elseif (strpos($u, '//') === 0) { $u = substr($u, 2); $hadHost = true; }
+    if ($hadHost) { $slash = strpos($u, '/'); $u = ($slash === false) ? '' : substr($u, $slash); }
+    $u = preg_replace('~[?#].*$~', '', (string)$u);
+    $u = ltrim((string)$u, '/');
+    // The index match needs a start-or-slash boundary, or "myindex.html" folds
+    // to "my" — a canonical pointing at a URL that does not exist.
+    $u = preg_replace('~(^|/)index\.html?$~i', '$1', $u);   // dir index -> the dir
+    return preg_replace('~\.html?$~i', '', (string)$u);
+}
+// Absolute public URL for a page file — the PHP mirror of fourgePageUrl().
+// '' when no canonical origin is known; the home page keeps its single slash.
+function cmsPkgPageUrl($base, $file) {
+    $base = rtrim((string)$base, '/');
+    if ($base === '') return '';
+    $p = cmsPkgUrlPath($file);
+    return $p !== '' ? ($base . '/' . $p) : ($base . '/');
+}
+// Comparable path key: scheme/host/query/extension/case/trailing-slash agnostic.
+// The homepage normalizes to '' from every spelling. Note that services.html and
+// services/index.html deliberately fold to the same key — they compete for the
+// same public URL, so treating them as one target is the correct behaviour.
+function cmsPkgNormPath($u) {
+    return rtrim(strtolower(cmsPkgUrlPath($u)), '/');
+}
+function cmsPkgSlug($s) {
+    $s = strtolower(trim((string)$s));
+    $s = preg_replace('~[^a-z0-9]+~', '-', $s);
+    return trim((string)$s, '-');
+}
+// What a content item says about its own address and search snippet. The
+// platform sends them as slug / seo_title / seo_description, but it has also
+// run them together in "slug", one labelled part after another:
+//   "/hardscape-materials-winona-lake-in TITLE TAG: … META DESCRIPTION: … H1: …"
+// which made a filename hundreds of characters long, with the title tag and
+// description lost. The labelled parts are split out and used for what they
+// are. A seo_title / seo_description field that is filled in wins over them.
+// Returns slug (raw, not yet slugified), title, description, h1, and split
+// (true when the slug field held labelled parts).
+function cmsPkgContentMeta(array $c) {
+    $raw = trim((string)($c['slug'] ?? ''));
+    $out = ['slug' => $raw, 'title' => '', 'description' => '', 'h1' => '', 'split' => false];
+    $re = '~(?:^|\s)(TITLE\s+TAG|SEO\s+TITLE|META\s+TITLE|META\s+DESCRIPTION|H1|URL\s+SLUG|SLUG)\s*:\s*~i';
+    if ($raw !== '' && preg_match_all($re, $raw, $m, PREG_OFFSET_CAPTURE | PREG_SET_ORDER)) {
+        $out['split'] = true;
+        $out['slug'] = trim(substr($raw, 0, $m[0][0][1]));
+        foreach ($m as $i => $hit) {
+            $from = $hit[0][1] + strlen($hit[0][0]);
+            $to = isset($m[$i + 1]) ? $m[$i + 1][0][1] : strlen($raw);
+            $val = trim(substr($raw, $from, $to - $from));
+            $label = strtoupper((string)preg_replace('~\s+~', ' ', $hit[1][0]));
+            $key = ($label === 'META DESCRIPTION') ? 'description' : (($label === 'H1') ? 'h1' : (($label === 'SLUG' || $label === 'URL SLUG') ? 'slug' : 'title'));
+            if ($val !== '' && ($out[$key] === '' || $key === 'slug')) $out[$key] = $val;
+        }
+    }
+    foreach (['seo_title' => 'title', 'seo_description' => 'description'] as $src => $dst) {
+        $v = trim((string)($c[$src] ?? ''));
+        if ($v !== '') $out[$dst] = $v;
+    }
+    return $out;
+}
+// A new page's file name, from its slug: at most 100 characters, cut at a word
+// break, so no slug can make a name the server refuses to write.
+function cmsPkgPageSlug($s) {
+    $slug = cmsPkgSlug($s);
+    if (strlen($slug) <= 100) return $slug;
+    $cut = substr($slug, 0, 101);
+    $p = strrpos($cut, '-');
+    return rtrim(($p !== false && $p >= 40) ? substr($cut, 0, $p) : substr($slug, 0, 100), '-');
+}
+// Strip every tag Fourge manages (its own data-fourge-seo nodes plus the
+// standard set it takes over) so a re-stamp is idempotent — mirrors
+// seoInjectIntoHtml() in the admin.
+function cmsPkgStripManagedSeo($html) {
+    $html = preg_replace('~[ \t]*<script\b[^>]*data-fourge-seo[^>]*>[\s\S]*?</script>[ \t]*\r?\n?~i', '', (string)$html);
+    $html = preg_replace('~[ \t]*<(?:meta|link)\b[^>]*data-fourge-seo[^>]*>[ \t]*\r?\n?~i', '', (string)$html);
+    $html = preg_replace('~[ \t]*<meta\b[^>]*name\s*=\s*["\'](?:description|robots)["\'][^>]*>[ \t]*\r?\n?~i', '', (string)$html);
+    $html = preg_replace('~[ \t]*<link\b[^>]*rel\s*=\s*["\']canonical["\'][^>]*>[ \t]*\r?\n?~i', '', (string)$html);
+    $html = preg_replace('~[ \t]*<meta\b[^>]*property\s*=\s*["\']og:[^"\']*["\'][^>]*>[ \t]*\r?\n?~i', '', (string)$html);
+    $html = preg_replace('~[ \t]*<meta\b[^>]*name\s*=\s*["\']twitter:[^"\']*["\'][^>]*>[ \t]*\r?\n?~i', '', (string)$html);
+    return (string)$html;
+}
+// og_tags blocks arrive as raw HTML and are reduced to <meta> tags ONLY.
+// http-equiv / charset / anything that isn't a name|property+content pair is
+// dropped, values are stripped of CR/LF.
+function cmsPkgSanitizeMetaTags($html) {
+    $out = [];
+    if (!preg_match_all('~<meta\b[^>]*>~i', (string)$html, $m)) return $out;
+    foreach ($m[0] as $tag) {
+        if (preg_match('~http-equiv|charset~i', $tag)) continue;
+        if (preg_match('~\b(property|name)\s*=\s*"([^"]+)"~i', $tag, $k)) { $attr = strtolower($k[1]); $key = trim($k[2]); }
+        elseif (preg_match("~\b(property|name)\s*=\s*'([^']+)'~i", $tag, $k)) { $attr = strtolower($k[1]); $key = trim($k[2]); }
+        else continue;
+        if (preg_match('~\bcontent\s*=\s*"([^"]*)"~i', $tag, $c)) $val = $c[1];
+        elseif (preg_match("~\bcontent\s*=\s*'([^']*)'~i", $tag, $c)) $val = $c[1];
+        else continue;
+        if (!preg_match('~^[A-Za-z0-9:_.\-]{1,64}$~', $key)) continue;
+        $val = trim(str_replace(["\r", "\n"], ' ', html_entity_decode($val, ENT_QUOTES, 'UTF-8')));
+        if ($val === '') continue;
+        $out[] = ['attr' => $attr, 'key' => $key, 'content' => $val];
+    }
+    return $out;
+}
+// Content HTML: drop executable/structural elements outright, kill inline
+// handlers and script-ish URLs, then allow-list the remaining tags.
+function cmsPkgSanitizeHtml($html) {
+    $html = (string)$html;
+    $html = preg_replace('~<!--[\s\S]*?-->~', '', $html);
+    $kill = 'script|style|iframe|object|embed|applet|form|input|button|select|textarea|link|meta|base|svg|math';
+    $html = preg_replace('~<(' . $kill . ')\b[^>]*>[\s\S]*?</\1\s*>~i', '', $html);
+    $html = preg_replace('~<(' . $kill . ')\b[^>]*/?>~i', '', $html);
+    $html = preg_replace('~\son[a-z]+\s*=\s*("[^"]*"|\'[^\']*\'|[^\s>]+)~i', '', $html);
+    $html = preg_replace('~\s(?:href|src|srcset|action|formaction|xlink:href)\s*=\s*("|\')\s*(?:javascript|vbscript|data)\s*:[^"\']*\1~i', '', $html);
+    $allow = ['p','br','strong','b','em','i','u','s','ul','ol','li','h1','h2','h3','h4','h5','h6',
+              'blockquote','a','img','figure','figcaption','table','thead','tbody','tfoot','tr','th','td',
+              'hr','span','div','section','article','small','sup','sub','code','pre','dl','dt','dd'];
+    $html = strip_tags($html, '<' . implode('><', $allow) . '>');
+    return trim((string)$html);
+}
+// Build the managed <head> block for a page from its seo.json record and stamp
+// it in. Same marker + tag shape the admin uses, so the two converge instead of
+// fighting: whichever runs last produces the same output from the same record.
+function cmsPkgStampSeo($html, $rec, $canonical, $isDraft = false) {
+    $html = cmsPkgStripManagedSeo($html);
+    $esc = function ($s) { return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); };
+    $L = [];
+    $title = trim((string)($rec['title'] ?? ''));
+    if ($title !== '') {
+        if (preg_match('~<title\b[^>]*>~i', $html)) $html = preg_replace('~<title\b[^>]*>[\s\S]*?</title>~i', '<title>' . $esc($title) . '</title>', $html, 1);
+        else $html = preg_replace('~<head\b[^>]*>~i', '$0' . "\n" . '<title>' . $esc($title) . '</title>', $html, 1);
+    }
+    $desc = trim((string)($rec['description'] ?? ''));
+    if ($desc !== '') $L[] = '<meta name="description" content="' . $esc($desc) . '" data-fourge-seo>';
+    $canon = trim((string)($rec['canonical'] ?? '')) ?: (string)$canonical;
+    if ($canon !== '') $L[] = '<link rel="canonical" href="' . $esc($canon) . '" data-fourge-seo>';
+    $noindex = !empty($rec['noindex']) || $isDraft;
+    $L[] = '<meta name="robots" content="' . ($noindex ? 'noindex' : 'index') . ',' . (!empty($rec['nofollow']) ? 'nofollow' : 'follow') . '" data-fourge-seo>';
+    $ogT = trim((string)($rec['ogTitle'] ?? $title));
+    $ogD = trim((string)($rec['ogDescription'] ?? $desc));
+    $ogI = trim((string)($rec['ogImage'] ?? ''));
+    if ($ogT !== '') $L[] = '<meta property="og:title" content="' . $esc($ogT) . '" data-fourge-seo>';
+    if ($ogD !== '') $L[] = '<meta property="og:description" content="' . $esc($ogD) . '" data-fourge-seo>';
+    if ($ogI !== '') $L[] = '<meta property="og:image" content="' . $esc($ogI) . '" data-fourge-seo>';
+    if ($canon !== '') $L[] = '<meta property="og:url" content="' . $esc($canon) . '" data-fourge-seo>';
+    $L[] = '<meta name="twitter:card" content="' . $esc($rec['twitterCard'] ?? 'summary_large_image') . '" data-fourge-seo>';
+    if ($ogT !== '') $L[] = '<meta name="twitter:title" content="' . $esc($ogT) . '" data-fourge-seo>';
+    if ($ogD !== '') $L[] = '<meta name="twitter:description" content="' . $esc($ogD) . '" data-fourge-seo>';
+    if ($ogI !== '') $L[] = '<meta name="twitter:image" content="' . $esc($ogI) . '" data-fourge-seo>';
+    foreach ((array)($rec['extraMeta'] ?? []) as $mt) {
+        $a = ($mt['attr'] ?? 'name') === 'property' ? 'property' : 'name';
+        $k = (string)($mt['key'] ?? ''); $v = (string)($mt['content'] ?? '');
+        if ($k === '' || $v === '') continue;
+        if (preg_match('~^(?:og:(?:title|description|image|url)|twitter:(?:card|title|description|image)|description|robots)$~i', $k)) continue; // already managed
+        $L[] = '<meta ' . $a . '="' . $esc($k) . '" content="' . $esc($v) . '" data-fourge-seo>';
+    }
+    foreach ((array)($rec['extraJsonld'] ?? []) as $blk) {
+        $json = is_string($blk) ? $blk : json_encode($blk, JSON_UNESCAPED_SLASHES);
+        if (!is_string($json) || trim($json) === '') continue;
+        $json = str_ireplace('</script', '<\\/script', $json);   // can never break out of the block
+        $L[] = '<script type="application/ld+json" data-fourge-seo>' . $json . '</script>';
+    }
+    $block = implode("\n", $L);
+    if ($block === '') return $html;
+    if (preg_match('~</head>~i', $html)) return preg_replace('~</head>~i', $block . "\n</head>", $html, 1);
+    if (preg_match('~<head\b[^>]*>~i', $html)) return preg_replace('~<head\b[^>]*>~i', '$0' . "\n" . $block, $html, 1);
+    return $block . "\n" . $html;
+}
+// Generic marker-splice for a managed .htaccess block.
+function cmsPkgSpliceHtaccess($begin, $end, $rules) {
+    $htPath   = PUBLIC_HTML . '/.htaccess';
+    $existing = is_file($htPath) ? file_get_contents($htPath) : '';
+    $block = $begin . "\n" . $rules . "\n" . $end;
+    $s = strpos($existing, $begin);
+    $e = strpos($existing, $end);
+    if ($s !== false && $e !== false && $e >= $s) {
+        $existing = substr($existing, 0, $s) . $block . substr($existing, $e + strlen($end));
+    } else {
+        // Redirects and headers must precede the clean-URL rewrite block.
+        $cu = strpos($existing, '# BEGIN Fourge Clean URLs');
+        if ($cu !== false) $existing = substr($existing, 0, $cu) . $block . "\n\n" . substr($existing, $cu);
+        else $existing = ($existing === '' ? '' : rtrim($existing) . "\n\n") . $block . "\n";
+    }
+    return fourgeSitePut($htPath, $existing, 'Fourge: server rules') !== false;
+}
+// A redirect rule is only accepted when both sides are safe to place in a
+// server config: constrained source path charset, absolute-or-rooted target,
+// no whitespace/newlines anywhere.
+function cmsPkgValidRedirect($from, $to) {
+    $from = '/' . ltrim(preg_replace('~[?#].*$~', '', (string)$from), '/');
+    $p = trim($from, '/');
+    if ($p === '' || strlen($p) > 300) return null;
+    if (!preg_match('~^[A-Za-z0-9/_%.\-]+$~', $p)) return null;
+    $to = trim((string)$to);
+    if ($to === '' || strlen($to) > 600) return null;
+    if (preg_match('~[\s"\'\\\\]~', $to)) return null;
+    if (!preg_match('~^(?:https?://[A-Za-z0-9.\-]+(?::\d+)?(?:/[^\s]*)?|/[^\s]*)$~', $to)) return null;
+    return ['from' => '/' . $p, 'to' => $to];
+}
+function cmsPkgWriteRedirects($rules) {
+    $lines = ['<IfModule mod_rewrite.c>', '  RewriteEngine On'];
+    foreach ($rules as $r) {
+        $p = trim((string)$r['from'], '/');
+        $code = (int)($r['code'] ?? 301);
+        if ($code !== 301 && $code !== 302 && $code !== 307 && $code !== 308) $code = 301;
+        $pat = str_replace(['.', ' '], ['\\.', '\\ '], $p);
+        $lines[] = '  RewriteRule ^' . $pat . '/?$ ' . $r['to'] . ' [R=' . $code . ',L]';
+    }
+    $lines[] = '</IfModule>';
+    return cmsPkgSpliceHtaccess('# BEGIN Fourge Package Redirects', '# END Fourge Package Redirects', implode("\n", $lines));
+}
+// Parse Apache `Header always set X "Y"` and nginx `add_header X "Y" always;`.
+function cmsPkgParseHeaders($raw) {
+    $pairs = [];
+    foreach (preg_split('~\r?\n~', (string)$raw) as $line) {
+        $line = trim($line);
+        if ($line === '' || $line[0] === '#') continue;
+        $m = null;
+        if (preg_match('~^Header\s+(?:always\s+)?set\s+([A-Za-z0-9\-]+)\s+"([^"]*)"~i', $line, $m)) {}
+        elseif (preg_match("~^Header\s+(?:always\s+)?set\s+([A-Za-z0-9\-]+)\s+'([^']*)'~i", $line, $m)) {}
+        elseif (preg_match('~^add_header\s+([A-Za-z0-9\-]+)\s+"([^"]*)"~i', $line, $m)) {}
+        elseif (preg_match("~^add_header\s+([A-Za-z0-9\-]+)\s+'([^']*)'~i", $line, $m)) {}
+        else continue;
+        $name = $m[1]; $val = str_replace(["\r", "\n"], '', $m[2]);
+        if (!preg_match('~^[A-Za-z0-9\-]{1,64}$~', $name)) continue;
+        // A quote or backslash means the source line was quoted in a way this
+        // parser can't round-trip safely into .htaccess — drop it rather than
+        // emit a broken directive.
+        if (strpos($val, '"') !== false || strpos($val, '\\') !== false || strlen($val) > 1500) continue;
+        // Response-shaping headers we must never let a data file set.
+        if (preg_match('~^(?:set-cookie|location|status|content-length|transfer-encoding)$~i', $name)) continue;
+        $pairs[$name] = $val;
+    }
+    return $pairs;
+}
+function cmsPkgWriteHeaders($pairs) {
+    $lines = ['<IfModule mod_headers.c>'];
+    foreach ($pairs as $n => $v) $lines[] = '  Header always set ' . $n . ' "' . $v . '"';
+    $lines[] = '</IfModule>';
+    return cmsPkgSpliceHtaccess('# BEGIN Fourge Package Headers', '# END Fourge Package Headers', implode("\n", $lines));
+}
+// ── APPROVED BUSINESS FACTS (package `business`) ────────────────────────────
+// The platform's console holds the client-approved NAP, hours, socials, service
+// area and (when it has real GBP data) a rating. Importing them lets Fourge emit
+// a complete LocalBusiness/E-E-A-T graph on every page instead of the thin
+// Organization node it can build from Site Info alone.
+//
+// They are written into data/site.json TWICE on purpose: as a `business` block
+// (the delivered record, kept whole) and mapped onto the top-level name/phone/
+// email/address/social fields the existing schema builder already reads. One
+// import therefore improves the schema on every page without any other wiring,
+// and without a second source of truth for the fields Site Info already owns.
+//
+// Nothing is invented. A field the package did not deliver is left exactly as it
+// was — an import must never blank out something a human typed into Site Info.
+function cmsPkgBusiness($biz, &$pages_unused = null) {
+    $txt = function ($v) { return trim(preg_replace('~[\r\n\t]+~', ' ', (string)$v)); };
+    $out = [];
+    foreach (['name','url','type','categories','description','phone','email','street','city','state','zip','hours','gbp_url'] as $k) {
+        $v = $txt($biz[$k] ?? '');
+        if ($v !== '') $out[$k] = mb_substr($v, 0, 500);
+    }
+    $same = [];
+    foreach ((array)($biz['sameas'] ?? []) as $u) {
+        $u = $txt($u);
+        if ($u !== '' && preg_match('~^https?://~i', $u)) $same[] = mb_substr($u, 0, 300);
+    }
+    if ($same) $out['sameas'] = array_values(array_unique($same));
+    $sa = (array)($biz['service_area'] ?? []);
+    $area = [];
+    if ($txt($sa['primary'] ?? '') !== '') $area['primary'] = $txt($sa['primary']);
+    $sec = [];
+    foreach ((array)($sa['secondary'] ?? []) as $t) { $t = $txt($t); if ($t !== '') $sec[] = mb_substr($t, 0, 120); }
+    if ($sec) $area['secondary'] = array_values(array_unique($sec));
+    if ($area) $out['service_area'] = $area;
+    $svc = [];
+    foreach ((array)($biz['services'] ?? []) as $t) { $t = $txt($t); if ($t !== '') $svc[] = mb_substr($t, 0, 120); }
+    if ($svc) $out['services'] = array_values(array_unique($svc));
+    // A rating is only ever carried through when BOTH halves are real numbers in
+    // range. An invented or half-populated AggregateRating is a Google structured-
+    // data violation and an FTC problem, so a partial one is dropped entirely.
+    $rv = $txt($biz['rating_value'] ?? '');
+    $rc = $txt($biz['rating_count'] ?? '');
+    if ($rv !== '' && $rc !== '' && is_numeric($rv) && is_numeric($rc)
+        && (float)$rv > 0 && (float)$rv <= 5 && (int)$rc > 0) {
+        $out['rating_value'] = (string)round((float)$rv, 1);
+        $out['rating_count'] = (string)(int)$rc;
+    }
+    return $out;
+}
+// Merge the delivered facts onto the fields Site Info already owns, filling
+// blanks only — a human's typed value always wins over the package.
+function cmsPkgBusinessToSite(array $b, array $site) {
+    $fill = function (&$target, $key, $val) {
+        if ($val === '' || $val === null) return false;
+        if (trim((string)($target[$key] ?? '')) !== '') return false;
+        $target[$key] = $val; return true;
+    };
+    $filled = [];
+    if ($fill($site, 'name',  $b['name'] ?? ''))  $filled[] = 'name';
+    if ($fill($site, 'phone', $b['phone'] ?? '')) $filled[] = 'phone';
+    if ($fill($site, 'email', $b['email'] ?? '')) $filled[] = 'email';
+    $addr = is_array($site['address'] ?? null) ? $site['address'] : [];
+    foreach (['street' => 'street', 'city' => 'city', 'state' => 'state', 'zip' => 'zip'] as $src => $dst) {
+        if ($fill($addr, $dst, $b[$src] ?? '')) $filled[] = 'address.' . $dst;
+    }
+    if ($addr) $site['address'] = $addr;
+    // Socials are a map in Site Info; add any delivered profile that is not
+    // already listed, keyed by its network so the UI can label it.
+    $social = is_array($site['social'] ?? null) ? $site['social'] : [];
+    $known = array_map('strtolower', array_map('strval', array_values($social)));
+    foreach ((array)($b['sameas'] ?? []) as $u) {
+        if (in_array(strtolower($u), $known, true)) continue;
+        $host = strtolower((string)parse_url($u, PHP_URL_HOST));
+        $net = 'website';
+        foreach (['facebook' => 'facebook', 'instagram' => 'instagram', 'linkedin' => 'linkedin',
+                  'youtube' => 'youtube', 'twitter' => 'twitter', 'x.com' => 'twitter',
+                  'tiktok' => 'tiktok', 'yelp' => 'yelp', 'pinterest' => 'pinterest'] as $needle => $name) {
+            if (strpos($host, $needle) !== false) { $net = $name; break; }
+        }
+        if (trim((string)($social[$net] ?? '')) === '') { $social[$net] = $u; $known[] = strtolower($u); $filled[] = 'social.' . $net; }
+    }
+    if ($social) $site['social'] = $social;
+    return [$site, $filled];
+}
+// Clone the site's own homepage shell for a new page so imported content wears
+// the site's header/footer/design (same donor approach as post→page).
+function cmsPkgPageFromShell($title, $bodyHtml, $h1 = '') {
+    $esc = htmlspecialchars($title, ENT_QUOTES, 'UTF-8');
+    $h1 = trim((string)$h1);
+    $inner = "\n" . '<section style="max-width:880px;margin:0 auto;padding:48px 24px">' . "\n"
+           . '<h1>' . ($h1 !== '' ? htmlspecialchars($h1, ENT_QUOTES, 'UTF-8') : $esc) . '</h1>' . "\n" . $bodyHtml . "\n" . '</section>' . "\n";
+    $home = PUBLIC_HTML . '/index.html';
+    $shell = is_file($home) ? (string)file_get_contents($home) : '';
+    if ($shell !== '' && preg_match('~<main\b[^>]*>[\s\S]*?</main>~i', $shell)) {
+        $out = preg_replace_callback('~(<main\b[^>]*>)([\s\S]*?)(</main>)~i',
+            function ($m) use ($inner) { return $m[1] . $inner . $m[3]; }, $shell, 1);
+        $out = preg_replace_callback('~<title\b[^>]*>[\s\S]*?</title>~i',
+            function ($m) use ($esc) { return '<title>' . $esc . '</title>'; }, (string)$out, 1);
+        $out = cmsPkgStripManagedSeo((string)$out);
+        // Donor's page-scoped custom CSS/JS and its form markup don't belong here.
+        $out = preg_replace('~[ \t]*<(style|script)\b[^>]*data-fourge-page[^>]*>[\s\S]*?</\1>[ \t]*\r?\n?~i', '', (string)$out);
+        $out = preg_replace('~[ \t]*<link\b[^>]*data-fourge-page[^>]*>[ \t]*\r?\n?~i', '', (string)$out);
+        return (string)$out;
+    }
+    return "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\">\n"
+         . "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+         . "<title>" . $esc . "</title>\n<link rel=\"stylesheet\" href=\"settings.css\">\n</head>\n"
+         . "<body>\n<main>" . $inner . "</main>\n</body>\n</html>\n";
+}
+// Publish any scheduled deploy-package content whose time has arrived. Posts
+// also self-publish in the public runtime (it treats publishAt<=now as live);
+// this is what flips the stored record and handles page-type items.
+function cmsPkgTick($dry = false) {
+    $now = time(); $done = []; $live = [];
+    $posts = cmsPkgReadJson('posts.json', []);
+    $postsDirty = false;
+    if (is_array($posts)) {
+        foreach ($posts as $i => $p) {
+            if (!is_array($p) || !empty($p['published']) || empty($p['publishAt'])) continue;
+            $t = strtotime((string)$p['publishAt']);
+            if ($t === false || $t > $now) continue;
+            $posts[$i]['published'] = true; unset($posts[$i]['publishAt']);
+            $postsDirty = true;
+            $done[] = ['type' => 'post', 'title' => (string)($p['title'] ?? '')];
+            $live[] = ['post', $posts[$i]];
+        }
+    }
+    $pages = cmsPkgReadJson('pages.json', []);
+    $pagesDirty = false;
+    if (is_array($pages)) {
+        foreach ($pages as $pid => $rec) {
+            if (!is_array($rec) || empty($rec['publishAt'])) continue;
+            $t = strtotime((string)$rec['publishAt']);
+            if ($t === false || $t > $now) continue;
+            $pages[$pid]['draft'] = false; unset($pages[$pid]['publishAt']);
+            $pagesDirty = true;
+            $done[] = ['type' => 'page', 'title' => (string)($rec['title'] ?? $pid)];
+            $live[] = ['page', $pid, $pages[$pid]];
+        }
+    }
+    if (!$dry) {
+        if ($postsDirty) cmsPkgWriteJson('posts.json', $posts);
+        if ($pagesDirty) cmsPkgWriteJson('pages.json', $pages);
+        // Going live has to reach the page itself and the sitemap too: the flag
+        // alone left each page stamped noindex and out of sitemap.xml, so it was
+        // "published" but hidden from search engines until someone saved SEO.
+        try { cmsPkgGoneLive($live); } catch (Throwable $e) {}
+        try { cmsPkgReleaseStuck(); } catch (Throwable $e) {}
+    }
+    return $done;
+}
+// Flip the robots tag Fourge stamped on a page (data-fourge-seo, or the admin's
+// data-fourge-canon) from noindex to index — unless seo.json marks the page
+// noindex on purpose. A robots tag someone wrote by hand is never touched.
+function cmsReleaseRobots($html, $srec) {
+    if (is_array($srec) && !empty($srec['noindex'])) return (string)$html;
+    return (string)preg_replace_callback('~<meta\b[^>]*>~i', function ($m) {
+        $tag = $m[0];
+        if (!preg_match('~\bname\s*=\s*["\']robots["\']~i', $tag) || !preg_match('~\bdata-fourge-(?:seo|canon)\b~i', $tag)) return $tag;
+        return preg_replace('~(\bcontent\s*=\s*["\'][^"\']*?)\bnoindex\b~i', '$1index', $tag, 1);
+    }, (string)$html);
+}
+// Add URLs that just went live to sitemap.xml. The admin rebuilds the whole file
+// on Save SEO; until then a page published on schedule was missing from it. Only
+// a plain <urlset> is touched (a sitemap index, over the URL cap, waits for the
+// next rebuild), and each URL is added once, dated today.
+function cmsSitemapAdd(array $urls) {
+    $f = PUBLIC_HTML . '/sitemap.xml';
+    if (!$urls || !is_file($f)) return 0;
+    $xml = (string)@file_get_contents($f);
+    if (stripos($xml, '<urlset') === false || !preg_match('~</urlset>\s*$~i', $xml)) return 0;
+    $add = ''; $n = 0;
+    foreach (array_unique($urls) as $u) {
+        $loc = str_replace('&', '&amp;', (string)$u);
+        if ($loc === '' || strpos($xml, '<loc>' . $loc . '</loc>') !== false) continue;
+        $add .= '  <url><loc>' . $loc . '</loc><lastmod>' . gmdate('Y-m-d') . '</lastmod></url>' . "\n";
+        $n++;
+    }
+    if (!$n) return 0;
+    $xml = (string)preg_replace('~\n?</urlset>\s*$~i', "\n" . $add . '</urlset>' . "\n", $xml, 1);
+    return fourgeSitePut($f, $xml, 'Fourge: sitemap (scheduled content went live)') !== false ? $n : 0;
+}
+function cmsPkgSiteBase() {
+    $site = cmsPkgReadJson('site.json', []);
+    $base = trim((string)(is_array($site) ? ($site['website'] ?? '') : ''));
+    if ($base !== '' && !preg_match('~^https?://~i', $base)) $base = 'https://' . $base;
+    return rtrim($base, '/');
+}
+// A page's robots tag released (backed up first); returns its public URL, or ''.
+function cmsPkgReleasePage($pid, array $rec, array $seo, $base) {
+    $file = (string)($rec['path'] ?? ($rec['file'] ?? ($pid . '.html')));
+    $abs = PUBLIC_HTML . '/' . ltrim($file, '/');
+    $srec = is_array($seo[$pid] ?? null) ? $seo[$pid] : [];
+    if (!empty($srec['noindex'])) return '';
+    if (is_file($abs)) {
+        $html = (string)@file_get_contents($abs);
+        $out = cmsReleaseRobots($html, $srec);
+        if ($html !== '' && $out !== $html) { cmsPkgBackup($file); fourgeSitePut($abs, $out, 'Fourge: scheduled page went live'); }
+    }
+    return cmsPkgPageUrl($base, $file);
+}
+// What cmsPkgTick just released: pages get their robots tag flipped, and pages and
+// posts are added to sitemap.xml.
+function cmsPkgGoneLive(array $live) {
+    if (!$live) return 0;
+    $base = cmsPkgSiteBase();
+    $seo = cmsPkgReadJson('seo.json', []); if (!is_array($seo)) $seo = [];
+    $urls = [];
+    foreach ($live as $item) {
+        if ($item[0] === 'page') { $u = cmsPkgReleasePage((string)$item[1], (array)$item[2], $seo, $base); if ($u !== '') $urls[] = $u; }
+        elseif ($base !== '') {
+            $p = (array)$item[1];
+            if (!empty($p['path'])) $urls[] = cmsPkgPageUrl($base, (string)$p['path']);
+            elseif (trim((string)($p['slug'] ?? '')) !== '') $urls[] = $base . '/posts.html?p=' . rawurlencode((string)$p['slug']);
+        }
+    }
+    return $base !== '' ? cmsSitemapAdd($urls) : 0;
+}
+// Package pages that went live before that was fixed: live (no draft flag, no
+// schedule), not marked noindex, yet still carrying Fourge's noindex stamp. Each
+// is released the same way. Package pages only (extId) — the ones a schedule
+// stamped. Returns how many were released.
+function cmsPkgReleaseStuck() {
+    $pages = cmsPkgReadJson('pages.json', []);
+    if (!is_array($pages)) return 0;
+    $seo = null; $base = null; $urls = []; $n = 0;
+    foreach ($pages as $pid => $rec) {
+        if (!is_array($rec) || trim((string)($rec['extId'] ?? '')) === '' || !empty($rec['draft']) || !empty($rec['publishAt'])) continue;
+        $file = (string)($rec['path'] ?? ($rec['file'] ?? ''));
+        $abs = PUBLIC_HTML . '/' . ltrim($file, '/');
+        if ($file === '' || !is_file($abs)) continue;
+        $html = (string)@file_get_contents($abs);
+        if (!preg_match('~<meta\b[^>]*name\s*=\s*["\']robots["\'][^>]*noindex[^>]*data-fourge-(?:seo|canon)|<meta\b[^>]*data-fourge-(?:seo|canon)[^>]*name\s*=\s*["\']robots["\'][^>]*noindex~i', $html)) continue;
+        if ($seo === null) { $seo = cmsPkgReadJson('seo.json', []); if (!is_array($seo)) $seo = []; $base = cmsPkgSiteBase(); }
+        $u = cmsPkgReleasePage((string)$pid, $rec, $seo, $base);
+        if ($u !== '') { $urls[] = $u; $n++; }
+    }
+    if ($urls && $base !== '') cmsSitemapAdd($urls);
+    return $n;
+}
+// Session (admin ≥2) OR constant-time Bearer match against the stored key.
+function cmsPkgAuthorized($me, $body) {
+    if ($me && fourgeLevel($me) >= 2) return true;
+    $tok = '';
+    $hdr = trim((string)($_SERVER['HTTP_AUTHORIZATION'] ?? ''));
+    if ($hdr !== '' && preg_match('~^Bearer\s+(.+)$~i', $hdr, $m)) $tok = trim($m[1]);
+    if ($tok === '') $tok = trim((string)($_SERVER['HTTP_X_SEO_PKG_TOKEN'] ?? ''));   // hosts that strip Authorization
+    if ($tok === '') $tok = trim((string)($body['pkg_token'] ?? ''));
+    if ($tok === '') return false;
+    $stored = '';
+    try { $stored = (string)fourgeGetSecret(fourgeDb(), 'seo_pkg_token'); } catch (Throwable $e) { $stored = ''; }
+    if ($stored === '') return false;
+    return hash_equals($stored, $tok);
+}
+
+function cmsPkgApply($pkg, $dry) {
+    $applied = []; $skipped = []; $manual = [];
+    $add  = function ($type, $item, $note = '') use (&$applied) { $applied[] = ['type' => $type, 'item' => $item] + ($note !== '' ? ['note' => $note] : []); };
+    $skip = function ($type, $item, $reason) use (&$skipped) { $skipped[] = ['type' => $type, 'item' => $item, 'reason' => $reason]; };
+    $man  = function ($type, $item, $action = '') use (&$manual) { $manual[] = ['type' => $type, 'item' => $item] + ($action !== '' ? ['action' => $action] : []); };
+
+    $site  = cmsPkgReadJson('site.json', []);
+    $pages = cmsPkgReadJson('pages.json', []);
+    $seo   = cmsPkgReadJson('seo.json', []);
+    if (!is_array($pages)) $pages = [];
+    if (!is_array($seo))   $seo = [];
+
+    // Site sanity check (warn only — never refuse to import).
+    $declared = trim((string)($pkg['site'] ?? ''));
+    if ($declared !== '') {
+        $dHost = strtolower(preg_replace('~^www\.~i', '', (string)parse_url($declared, PHP_URL_HOST)));
+        $cHost = strtolower(preg_replace('~^www\.~i', '', (string)parse_url((string)($site['website'] ?? ''), PHP_URL_HOST)));
+        if ($dHost !== '' && $cHost !== '' && $dHost !== $cHost) {
+            $man('site_mismatch', $declared, 'This package was generated for ' . $dHost . ' but this site is configured as ' . $cHost . '. Confirm you are importing into the right site.');
+        }
+    }
+    $baseUrl = rtrim((string)($site['website'] ?? ''), '/');
+    if ($baseUrl !== '' && !preg_match('~^https?://~i', $baseUrl)) $baseUrl = 'https://' . $baseUrl;
+
+    // target URL → page id
+    $byPath = [];
+    foreach ($pages as $pid => $rec) {
+        if (!is_array($rec)) continue;
+        $byPath[cmsPkgNormPath((string)($rec['path'] ?? $rec['file'] ?? ''))] = $pid;
+    }
+    $resolve = function ($target) use ($byPath) {
+        $k = cmsPkgNormPath($target);
+        return $byPath[$k] ?? null;
+    };
+    $touched = [];   // pid => true (pages needing a re-stamp)
+
+    // 1 ── seo_meta
+    foreach ((array)($pkg['seo_meta'] ?? []) as $row) {
+        $t = (string)($row['target'] ?? '');
+        $pid = $resolve($t);
+        if (!$pid) { $skip('seo_meta', $t, 'No page on this site matches that URL path'); continue; }
+        if (!isset($seo[$pid]) || !is_array($seo[$pid])) $seo[$pid] = [];
+        $fields = [];
+        foreach (['seo_title' => 'title', 'seo_description' => 'description', 'canonical' => 'canonical'] as $src => $dst) {
+            $v = trim((string)($row[$src] ?? ''));
+            if ($v !== '') { $seo[$pid][$dst] = $v; $fields[] = $dst; }
+        }
+        if (!$fields) { $skip('seo_meta', $t, 'No title, description, or canonical value in the entry'); continue; }
+        $touched[$pid] = true;
+        $add('seo_meta', $t, implode(' + ', $fields));
+    }
+
+    // 2 ── schema (JSON-LD). Replace semantics per target: the package owns the
+    // imported set, so re-importing cannot stack duplicates.
+    $schemaByPid = [];
+    foreach ((array)($pkg['schema'] ?? []) as $row) {
+        $t = (string)($row['target'] ?? '');
+        $pid = $resolve($t);
+        if (!$pid) { $skip('schema', $t, 'No page on this site matches that URL path'); continue; }
+        $ld = $row['jsonld'] ?? null;
+        if (!is_array($ld) || !$ld) { $skip('schema', $t, 'jsonld is missing or not an object'); continue; }
+        $type = is_array($ld['@type'] ?? null) ? implode('/', $ld['@type']) : (string)($ld['@type'] ?? 'JSON-LD');
+        $schemaByPid[$pid][] = $ld;
+        $add('schema', $t, $type);
+    }
+    foreach ($schemaByPid as $pid => $blocks) {
+        if (!isset($seo[$pid]) || !is_array($seo[$pid])) $seo[$pid] = [];
+        $seo[$pid]['extraJsonld'] = $blocks;
+        $touched[$pid] = true;
+    }
+
+    // 3 ── og_tags → <meta> only. Known OG/Twitter values are folded into
+    // Fourge's own fields so the page never carries two og:title tags.
+    $metaByPid = [];
+    foreach ((array)($pkg['og_tags'] ?? []) as $row) {
+        $t = (string)($row['target'] ?? '');
+        $pid = $resolve($t);
+        if (!$pid) { $skip('og_tags', $t, 'No page on this site matches that URL path'); continue; }
+        $tags = cmsPkgSanitizeMetaTags((string)($row['html'] ?? ''));
+        if (!$tags) { $skip('og_tags', $t, 'No usable <meta> tags after sanitizing (scripts and http-equiv are always dropped)'); continue; }
+        if (!isset($seo[$pid]) || !is_array($seo[$pid])) $seo[$pid] = [];
+        $extras = [];
+        foreach ($tags as $tg) {
+            $k = strtolower($tg['key']);
+            if ($k === 'og:title')            $seo[$pid]['ogTitle'] = $tg['content'];
+            elseif ($k === 'og:description')  $seo[$pid]['ogDescription'] = $tg['content'];
+            elseif ($k === 'og:image')        $seo[$pid]['ogImage'] = $tg['content'];
+            elseif ($k === 'twitter:card')    $seo[$pid]['twitterCard'] = $tg['content'];
+            elseif (in_array($k, ['og:url', 'twitter:title', 'twitter:description', 'twitter:image'], true)) { /* derived */ }
+            else $extras[] = $tg;
+        }
+        $metaByPid[$pid] = $extras;
+        $touched[$pid] = true;
+        $add('og_tags', $t, count($tags) . ' meta tag(s)');
+    }
+    foreach ($metaByPid as $pid => $extras) { $seo[$pid]['extraMeta'] = $extras; }
+
+    // 4 ── site files
+    $sf = (array)($pkg['site_files'] ?? []);
+    $robots = trim((string)($sf['robots_txt'] ?? ''));
+    if ($robots !== '') {
+        $g = (isset($seo['__site']) && is_array($seo['__site'])) ? $seo['__site'] : [];
+        $existing = trim((string)($g['robotsTxt'] ?? ''));
+        if ($existing !== '' && $existing !== $robots) {
+            $skip('robots_txt', '/robots.txt', 'This site already has custom robots.txt content in the SEO panel — left alone so the import cannot overwrite it. Paste the package version in by hand if you want it.');
+        } else {
+            $g['robotsTxt'] = $robots; $seo['__site'] = $g;
+            $out = $robots;
+            if ($baseUrl !== '' && !preg_match('~^sitemap:~im', $out)) $out .= "\nSitemap: " . $baseUrl . '/sitemap.xml';
+            if (!$dry) { cmsPkgBackup('robots.txt'); fourgeSitePut(PUBLIC_HTML . '/robots.txt', $out . "\n", 'Fourge: SEO package'); }
+            $add('robots_txt', '/robots.txt', 'served, Sitemap line preserved');
+        }
+    }
+    $llms = trim((string)($sf['llms_txt'] ?? ''));
+    if ($llms !== '') {
+        if (!$dry) { cmsPkgBackup('llms.txt'); fourgeSitePut(PUBLIC_HTML . '/llms.txt', $llms . "\n", 'Fourge: SEO package'); }
+        $add('llms_txt', '/llms.txt', strlen($llms) . ' bytes');
+    }
+    if (trim((string)($sf['sitemap_xml'] ?? '')) !== '') {
+        $skip('sitemap_xml', '/sitemap.xml', 'Fourge generates its own sitemap from live pages and posts — the package copy would go stale. Rebuild it from the SEO panel instead.');
+    }
+
+    // 5 ── redirects (merge + dedupe by source path; raw is a manual item)
+    $rd = (array)($pkg['redirects'] ?? []);
+    $store = cmsPkgReadJson('redirects.json', []);
+    if (!is_array($store)) $store = [];
+    $bySrc = [];
+    foreach ($store as $r) { if (is_array($r) && !empty($r['from'])) $bySrc[strtolower(trim((string)$r['from'], '/'))] = $r; }
+    $newCount = 0;
+    foreach ((array)($rd['rules'] ?? []) as $r) {
+        $v = cmsPkgValidRedirect($r['from'] ?? '', $r['to'] ?? '');
+        if (!$v) { $skip('redirect', (string)($r['from'] ?? '?') . ' → ' . (string)($r['to'] ?? '?'), 'Source path or target URL failed validation (unsafe characters, or the target is not an absolute/rooted URL)'); continue; }
+        $code = (int)($r['code'] ?? 301);
+        $key = strtolower(trim($v['from'], '/'));
+        $bySrc[$key] = ['from' => $v['from'], 'to' => $v['to'], 'code' => $code];
+        $newCount++;
+    }
+    if ($newCount) {
+        $rules = array_values($bySrc);
+        if (!$dry) { cmsPkgBackup('.htaccess'); cmsPkgWriteJson('redirects.json', $rules); cmsPkgWriteRedirects($rules); }
+        $add('redirects', $newCount . ' rule(s)', count($rules) . ' total after merge/dedupe');
+    }
+    if (trim((string)($rd['raw'] ?? '')) !== '') {
+        $man('redirects_raw', 'Server-level redirect block', 'The package includes raw .htaccess/nginx redirect text. It is never executed — review it and apply anything the rule list above does not cover by hand.');
+    }
+
+    // 6 ── security headers
+    $hdrs = cmsPkgParseHeaders((string)(($pkg['security_headers']['raw'] ?? '')));
+    // A Content-Security-Policy is never applied automatically. A wrong one
+    // blocks the site's OWN scripts and stylesheets — the page renders blank or
+    // unstyled and PageSpeed collapses — and a package cannot know what a given
+    // site loads. It goes on the manual list to be tested on staging instead.
+    if (isset($hdrs['Content-Security-Policy']) || isset($hdrs['Content-Security-Policy-Report-Only'])) {
+        unset($hdrs['Content-Security-Policy'], $hdrs['Content-Security-Policy-Report-Only']);
+        $man('security_headers', 'Content-Security-Policy',
+            'The package included a CSP. Fourge does not apply one automatically — a CSP that does not match what this site loads will block its own scripts and styles, and the page renders blank or unstyled. Test it on staging, then add it at the server level.');
+    }
+    if ($hdrs) {
+        if (!$dry) { cmsPkgBackup('.htaccess'); cmsPkgWriteHeaders($hdrs); }
+        $add('security_headers', implode(', ', array_keys($hdrs)), count($hdrs) . ' header(s) sent on every response');
+    } elseif (trim((string)($pkg['security_headers']['raw'] ?? '')) !== '') {
+        $skip('security_headers', 'raw block', 'No valid `Header set` / `add_header` name-value pairs found in the block');
+    }
+
+    // 6b ── approved business facts → richer site-wide schema on every page
+    if (!empty($pkg['business']) && is_array($pkg['business'])) {
+        $biz = cmsPkgBusiness($pkg['business']);
+        if (!$biz) {
+            $skip('business', 'business profile', 'The block carried no usable fields');
+        } else {
+            $site = cmsPkgReadJson('site.json', []);
+            if (!is_array($site)) $site = [];
+            $site['business'] = $biz;                       // the delivered record, kept whole
+            list($site, $filled) = cmsPkgBusinessToSite($biz, $site);
+            if (!$dry) cmsPkgWriteJson('site.json', $site);
+            $bits = [];
+            if (!empty($biz['city']))          $bits[] = 'NAP';
+            if (!empty($biz['hours']))         $bits[] = 'hours';
+            if (!empty($biz['sameas']))        $bits[] = count($biz['sameas']) . ' profile link(s)';
+            if (!empty($biz['service_area']))  $bits[] = 'service area';
+            if (!empty($biz['rating_value']))  $bits[] = 'rating ' . $biz['rating_value'] . ' (' . $biz['rating_count'] . ')';
+            $note = ($bits ? implode(', ', $bits) : 'business profile')
+                  . ' — every page now carries a complete LocalBusiness graph'
+                  . ($filled ? '; filled empty Site Info fields: ' . implode(', ', $filled) : '');
+            $add('business', (string)($biz['name'] ?? 'business profile'), $note);
+            // The facts belong in the AI-crawler map too — but only if that file
+            // is one Fourge generated; a delivered llms.txt is left alone.
+            if (!$dry) { try { fourgeEnsureLlms(true); } catch (Throwable $e) {} }
+            if (isset($pkg['business']['rating_value']) && empty($biz['rating_value'])) {
+                $skip('business.rating', 'aggregate rating',
+                    'The rating was incomplete or out of range, so it was dropped — a made-up AggregateRating is a structured-data violation');
+            }
+        }
+    }
+
+    // 6c ── site-level things a package cannot fix, surfaced so they are not
+    // silently missing. Checked against what this site actually has.
+    $siteNow = cmsPkgReadJson('site.json', []);
+    if (!is_array($siteNow)) $siteNow = [];
+    $hasFavicon = trim((string)($siteNow['favicon'] ?? '')) !== '' || is_file(PUBLIC_HTML . '/favicon.ico');
+    if (!$hasFavicon) {
+        $man('site_task', 'Favicon', 'This site has no favicon. Add one in Design → Favicon — browsers show a blank page icon without it, and the audit counts it.');
+    }
+    $an = is_array($siteNow['analytics'] ?? null) ? $siteNow['analytics'] : [];
+    if (trim((string)($an['ga4'] ?? '')) === '' && trim((string)($an['custom'] ?? '')) === '') {
+        $man('site_task', 'Analytics', 'No analytics tag is installed. Add the GA4 measurement ID in the Analytics tab, or nothing this package does can be measured.');
+    }
+    $hasPrivacy = false;
+    foreach ((array)$pages as $rec) {
+        if (!is_array($rec)) continue;
+        $hay = strtolower((string)($rec['title'] ?? '') . ' ' . (string)($rec['path'] ?? ($rec['file'] ?? '')));
+        if (strpos($hay, 'privacy') !== false) { $hasPrivacy = true; break; }
+    }
+    if (!$hasPrivacy) {
+        $man('site_task', 'Privacy policy', 'This site has no privacy policy page. The audit\'s trust pillar needs one, linked from the footer — create it in Pages.');
+    }
+    // Whether www or non-www is canonical cannot be inferred, and guessing 301s
+    // an indexed domain at a hostname that may have no certificate. It is a
+    // human decision, so it is listed rather than applied.
+    $wsite = trim((string)($siteNow['website'] ?? ''));
+    if ($wsite !== '') {
+        $wHost = (string)parse_url(preg_match('~^https?://~i', $wsite) ? $wsite : 'https://' . $wsite, PHP_URL_HOST);
+        if ($wHost !== '') {
+            $other = stripos($wHost, 'www.') === 0 ? substr($wHost, 4) : 'www.' . $wHost;
+            $man('site_task', 'Canonical host',
+                'Confirm that https://' . $other . ' redirects to https://' . $wHost . ' (your configured domain). Fourge does not add that redirect itself — a wrong guess sends an indexed domain to a hostname that may have no certificate. Set it at the host or in DNS.');
+        }
+    }
+
+    // 7 ── content (external_id is the idempotency key)
+    $posts = cmsPkgReadJson('posts.json', []);
+    if (!is_array($posts)) $posts = [];
+    $nowTs = time();
+    foreach ((array)($pkg['content'] ?? []) as $c) {
+        $title = trim((string)($c['title'] ?? ''));
+        $ext   = trim((string)($c['external_id'] ?? ''));
+        if ($title === '') { $skip('content', $ext ?: '(untitled)', 'Entry has no title'); continue; }
+        if (isset($c['approved']) && $c['approved'] === false) { $skip('content', $title, 'Marked not approved in the package'); continue; }
+        $bodyRaw = (string)($c['body_html'] ?? '');
+        // cmsPkgPageFromShell() renders the title as the page's H1. An H1 inside
+        // the body makes two, which fails the single-H1 check Fourge's own
+        // Post-Launch Check reports — demote body H1s so an import cannot
+        // regress the on-page score of the page it just created.
+        $bodyRaw = preg_replace('~<(/?)h1\b~i', '<$1h2', $bodyRaw);
+        $body = cmsPkgSanitizeHtml($bodyRaw);
+        if ($body === '') { $skip('content', $title, 'Body was empty (or contained nothing that survived sanitizing)'); continue; }
+        $status = strtolower(trim((string)($c['status'] ?? 'draft')));
+        // UNRESOLVED QA HOLDS PUBLICATION. The platform leaves markers like
+        // "[CLIENT TO CONFIRM] …" in qa[] for anything a human still has to
+        // answer. Publishing copy with an open question — a made-up statistic,
+        // an unconfirmed licence number, a placeholder price — is worse than
+        // publishing nothing, so the item is created as a draft for review no
+        // matter what the package's status field says.
+        $qa = array_values(array_filter(array_map(function ($q) {
+            return trim(is_array($q) ? (string)($q['note'] ?? ($q['text'] ?? '')) : (string)$q);
+        }, (array)($c['qa'] ?? []))));
+        $qaHold = count($qa) > 0;
+        if ($qaHold) $status = 'draft';
+        $schedRaw = trim((string)($c['schedule'] ?? ''));
+        $schedTs = $schedRaw !== '' ? strtotime($schedRaw) : false;
+        $isPage = strtolower(trim((string)($c['post_type'] ?? 'post'))) === 'page';
+        $publishNow = false; $publishAt = '';
+        if ($status === 'publish') $publishNow = true;
+        elseif ($status === 'schedule') {
+            if ($schedTs === false) { $publishNow = true; }
+            elseif ($schedTs <= $nowTs) { $publishNow = true; }
+            else { $publishAt = gmdate('c', $schedTs); }
+        }
+        $meta = cmsPkgContentMeta($c);
+        $slugSrc = $meta['slug'] !== '' ? $meta['slug'] : $title;
+        $noteBits = [];
+        if ($publishNow && $status === 'schedule' && $schedTs !== false && $schedTs <= $nowTs) $noteBits[] = 'schedule date already passed — published now';
+        elseif ($publishAt !== '') $noteBits[] = 'scheduled for ' . $publishAt;
+        elseif (!$publishNow) $noteBits[] = 'draft, awaiting review';
+        if ($qaHold) {
+            $noteBits[] = 'HELD as a draft: ' . count($qa) . ' unresolved question' . (count($qa) === 1 ? '' : 's')
+                        . ' — ' . mb_substr(implode('; ', $qa), 0, 220);
+        }
+
+        if ($meta['split']) $noteBits[] = 'its title tag, description and H1 came inside the slug field — split out and used';
+        if ($isPage) {
+            $slug = cmsPkgPageSlug($slugSrc);
+            if ($slug === '') { $skip('content', $title, 'Could not derive a filename from the title'); continue; }
+            $pid = null;
+            foreach ($pages as $k => $rec) { if (is_array($rec) && $ext !== '' && (string)($rec['extId'] ?? '') === $ext) { $pid = $k; break; } }
+            $isNew = ($pid === null);
+            if ($isNew) {
+                $pid = $slug;
+                $n = 2; while (isset($pages[$pid])) { $pid = $slug . '-' . $n; $n++; }
+            }
+            $file = (string)($pages[$pid]['file'] ?? ($pid . '.html'));
+            $html = cmsPkgPageFromShell($title, $body, $meta['h1']);
+            $rec = is_array($pages[$pid] ?? null) ? $pages[$pid] : [];
+            $rec['title'] = $title; $rec['file'] = $file; $rec['path'] = $file;
+            if ($ext !== '') $rec['extId'] = $ext;
+            // NEVER demote something a human already published. A re-import
+            // whose console copy is still unapproved must not take a live page
+            // off the site, and a page already scheduled must not be reset to a
+            // draft — it keeps the schedule it has.
+            $wasLive      = !$isNew && empty($rec['draft']);
+            $wasScheduled = !$isNew && !empty($rec['draft']) && trim((string)($rec['publishAt'] ?? '')) !== '';
+            // Live page + unresolved questions in the new copy: do NOTHING.
+            // Un-publishing takes a working page off the site; overwriting puts
+            // unreviewed copy live. Leaving it exactly as it is, and saying so,
+            // is the only move that is not a regression.
+            if ($wasLive && $qaHold) {
+                $skip('content', $title, 'This page is live and the new copy still has ' . count($qa)
+                    . ' unresolved question(s) — left untouched rather than publishing unreviewed copy. Resolve in the platform and re-import: ' . mb_substr(implode('; ', $qa), 0, 200));
+                continue;
+            }
+            if ($wasLive && !$publishNow) {
+                $publishNow = true; $publishAt = '';
+                $noteBits = ['already live — updated in place, not un-published'];
+            } elseif ($wasScheduled && !$publishNow && $publishAt === '') {
+                $publishAt = (string)$rec['publishAt'];
+                $noteBits = ['already scheduled for ' . $publishAt . ' — schedule kept'];
+            }
+            $rec['draft'] = !$publishNow;
+            if ($publishAt !== '') $rec['publishAt'] = $publishAt; else unset($rec['publishAt']);
+            // Remember WHY this was held. The reason otherwise lives only in the
+            // import report, and "publish everything now" would then be a blind
+            // override of the one gate that exists to stop unreviewed copy going
+            // live. Recorded here so that button can name the open questions.
+            if ($qaHold && !$publishNow) $rec['pkgQa'] = $qa; else unset($rec['pkgQa']);
+            if (!isset($seo[$pid]) || !is_array($seo[$pid])) $seo[$pid] = [];
+            // A title or description already on the page (a person's, or an earlier
+            // import's) is kept; only a gap is filled.
+            if (trim((string)($seo[$pid]['title'] ?? '')) === '') $seo[$pid]['title'] = $meta['title'] !== '' ? $meta['title'] : $title;
+            if ($meta['description'] !== '' && trim((string)($seo[$pid]['description'] ?? '')) === '') $seo[$pid]['description'] = $meta['description'];
+            $fk = trim((string)($c['focus_keyword'] ?? ''));
+            if ($fk !== '' && trim((string)($seo[$pid]['focusKeyword'] ?? '')) === '') $seo[$pid]['focusKeyword'] = $fk;
+            if (!$dry) {
+                cmsPkgBackup($file);
+                $canon = cmsPkgPageUrl($baseUrl, $file);   // URL emitter, not the match key
+                fourgeSitePut(PUBLIC_HTML . '/' . $file, cmsPkgStampSeo($html, $seo[$pid], $canon, $rec['draft']), 'Fourge: SEO package');
+                $pages[$pid] = $rec;
+            } else { $pages[$pid] = $rec; }
+            $add('content_page', $title, ($isNew ? 'created ' : 'updated ') . $file . ($noteBits ? ' — ' . implode('; ', $noteBits) : ''));
+        } else {
+            $idx = null;
+            foreach ($posts as $i => $p) { if (is_array($p) && $ext !== '' && (string)($p['extId'] ?? '') === $ext) { $idx = $i; break; } }
+            $isNew = ($idx === null);
+            $slug = cmsPkgSlug($slugSrc);
+            if ($slug === '') $slug = 'post-' . substr(md5($title), 0, 6);
+            foreach ($posts as $i => $p) {   // keep slugs unique across other posts
+                if ($i === $idx || !is_array($p)) continue;
+                if ((string)($p['slug'] ?? '') === $slug) { $slug .= '-' . substr(md5($ext . $title), 0, 4); break; }
+            }
+            $rec = $isNew ? [] : $posts[$idx];
+            $rec['id']    = (string)($rec['id'] ?? ('pkg' . substr(md5($ext . $title . microtime(true)), 0, 9)));
+            $rec['title'] = $title;
+            $rec['slug']  = $slug;
+            $rec['blocks'] = [['id' => substr(md5($rec['id'] . 'b'), 0, 7), 'type' => 'html', 'html' => $body]];
+            if (trim((string)($rec['excerpt'] ?? '')) === '') {
+                // The excerpt is the post's meta description: the package's own, when it has one.
+                $plain = trim(preg_replace('~\s+~', ' ', strip_tags($body)));
+                $rec['excerpt'] = $meta['description'] !== '' ? $meta['description'] : mb_substr($plain, 0, 155);
+            }
+            // Same protection as pages: a re-import never un-publishes a post
+            // that is already live, and never drops a schedule already set.
+            $wasLive      = !$isNew && !empty($rec['published']);
+            $wasScheduled = !$isNew && empty($rec['published']) && trim((string)($rec['publishAt'] ?? '')) !== '';
+            if ($wasLive && $qaHold) {
+                $skip('content', $title, 'This post is live and the new copy still has ' . count($qa)
+                    . ' unresolved question(s) — left untouched rather than publishing unreviewed copy. Resolve in the platform and re-import: ' . mb_substr(implode('; ', $qa), 0, 200));
+                continue;
+            }
+            if ($wasLive && !$publishNow) {
+                $publishNow = true; $publishAt = '';
+                $noteBits = ['already live — updated in place, not un-published'];
+            } elseif ($wasScheduled && !$publishNow && $publishAt === '') {
+                $publishAt = (string)$rec['publishAt'];
+                $noteBits = ['already scheduled for ' . $publishAt . ' — schedule kept'];
+            }
+            $rec['date'] = $publishAt !== '' ? substr($publishAt, 0, 10)
+                        : (trim((string)($rec['date'] ?? '')) !== '' ? $rec['date'] : gmdate('Y-m-d'));
+            $rec['published'] = $publishNow;
+            if ($publishAt !== '') $rec['publishAt'] = $publishAt; else unset($rec['publishAt']);
+            if ($qaHold && !$publishNow) $rec['pkgQa'] = $qa; else unset($rec['pkgQa']);
+            if ($ext !== '') $rec['extId'] = $ext;
+            $fk = trim((string)($c['focus_keyword'] ?? ''));
+            if ($fk !== '') $rec['focusKeyword'] = $fk;
+            $kind = trim((string)($c['kind'] ?? ''));
+            if ($kind !== '') $rec['pkgKind'] = $kind;
+            if ($isNew) array_unshift($posts, $rec); else $posts[$idx] = $rec;
+            $add('content_post', $title, ($isNew ? 'created' : 'updated') . ' /posts.html?p=' . $slug . ($noteBits ? ' — ' . implode('; ', $noteBits) : ''));
+        }
+    }
+
+    // 8 ── manual tasks
+    foreach ((array)($pkg['manual_tasks'] ?? []) as $t) {
+        $man((string)($t['kind'] ?? 'task'), (string)($t['title'] ?? 'Task'), (string)($t['action'] ?? ''));
+    }
+
+    // Re-stamp every page whose SEO record changed.
+    foreach (array_keys($touched) as $pid) {
+        $rec = is_array($pages[$pid] ?? null) ? $pages[$pid] : null;
+        $file = $rec ? (string)($rec['path'] ?? $rec['file'] ?? '') : '';
+        if ($file === '') { $skip('stamp', (string)$pid, 'Page has no file on disk'); continue; }
+        $abs = PUBLIC_HTML . '/' . ltrim($file, '/');
+        if (!is_file($abs)) { $skip('stamp', $file, 'Page file not found on the server'); continue; }
+        $html = (string)@file_get_contents($abs);
+        if (trim($html) === '' || (stripos($html, '</html>') === false && stripos($html, '</body>') === false)) {
+            $skip('stamp', $file, 'Page file looked empty or truncated — refused to rewrite it');
+            continue;
+        }
+        $canon = cmsPkgPageUrl($baseUrl, $file);   // URL emitter, not the match key
+        $next = cmsPkgStampSeo($html, $seo[$pid], $canon, !empty($rec['draft']));
+        if ($next === $html) continue;
+        if (!$dry) { cmsPkgBackup($file); fourgeSitePut($abs, $next, 'Fourge: SEO package'); }
+    }
+
+    if (!$dry) {
+        cmsPkgWriteJson('seo.json', $seo);
+        cmsPkgWriteJson('pages.json', $pages);
+        cmsPkgWriteJson('posts.json', $posts);
+    }
+
+    return [
+        'ok' => true,
+        'imported_at' => date('c'),
+        'dry_run' => (bool)$dry,
+        'source' => [
+            'site' => (string)($pkg['site'] ?? ''),
+            'generated_at' => (string)($pkg['generated_at'] ?? ''),
+            'package_id' => (string)(($pkg['source']['package_id'] ?? '')),
+            'audit_score' => ($pkg['source']['audit_score'] ?? null),
+            'client' => (string)(($pkg['client']['name'] ?? '')),
+            'tier' => (string)(($pkg['client']['tier'] ?? '')),
+        ],
+        'applied' => $applied,
+        'skipped' => $skipped,
+        'manual'  => $manual,
+        'counts'  => ['applied' => count($applied), 'skipped' => count($skipped), 'manual' => count($manual)],
+    ];
+}
+
+function fourgeApiSeoPackage($me, $body) {
+    if (!cmsPkgAuthorized($me, $body)) {
+        http_response_code(401);
+        echo json_encode(['ok' => false, 'error' => 'Unauthorized — sign in to the CMS or present the site\'s deploy-package Bearer token.']);
+        return;
+    }
+    // The pretty endpoint posts the package as the whole body; the admin screen
+    // nests it under "package" alongside action/mode.
+    $pkg = (is_array($body['package'] ?? null)) ? $body['package'] : $body;
+    $mode = strtolower(trim((string)($body['mode'] ?? ($_GET['mode'] ?? 'apply'))));
+    if (!is_array($pkg)) { http_response_code(400); echo json_encode(['ok' => false, 'error' => 'Request body was not valid JSON']); return; }
+    if (strlen((string)json_encode($pkg)) > 8 * 1024 * 1024) {
+        http_response_code(413); echo json_encode(['ok' => false, 'error' => 'Package is larger than 8 MB']); return;
+    }
+    if (!in_array((string)($pkg['format'] ?? ''), cmsPkgFormats(), true)) {
+        http_response_code(400);
+        echo json_encode(['ok' => false, 'error' => 'Not a deploy package from the SEO platform (expected format "ydg-deploy-package"). Nothing was applied.']);
+        return;
+    }
+    $fv = (int)($pkg['format_version'] ?? 0);
+    if ($fv > 1) {
+        http_response_code(400);
+        echo json_encode(['ok' => false, 'error' => 'This package is format_version ' . $fv . '; this site understands version 1. Update Fourge, then re-import. Nothing was applied.']);
+        return;
+    }
+    $dry = ($mode === 'preview' || $mode === 'dry-run' || $mode === 'dry_run');
+    $report = cmsPkgApply($pkg, $dry);
+    if (!$dry) {
+        try { $report['published_now'] = cmsPkgTick(false); } catch (Throwable $e) {}
+        cmsPkgWriteJson('seo-package-report.json', $report);
+    }
+    echo json_encode($report);
+}
+
+// "Publish everything the package brought in, now." The tick above only
+// releases content whose scheduled time has arrived; this releases the lot —
+// drafts awaiting review and future schedules alike.
+//
+// Scope is deliberately package content ONLY (records carrying an extId). A
+// blanket publish of every draft on the site would sweep up half-written pages
+// a client left alone, which is not what anyone means by this button.
+//
+// The subtle part is the HTML. A draft page is stamped noindex by
+// cmsPkgStampSeo, so flipping draft=false in pages.json without re-stamping the
+// file would "publish" a page that still tells search engines to ignore it.
+// Each page is therefore re-stamped (and backed up first) as it goes live.
+function cmsPkgPublishAll($dry = false) {
+    $site    = cmsPkgReadJson('site.json', []);
+    $baseUrl = trim((string)($site['website'] ?? ''));
+    if ($baseUrl !== '' && !preg_match('~^https?://~i', $baseUrl)) $baseUrl = 'https://' . $baseUrl;
+    $seo     = cmsPkgReadJson('seo.json', []);
+    $items   = [];
+
+    $pages = cmsPkgReadJson('pages.json', []);
+    $pagesDirty = false;
+    if (is_array($pages)) {
+        foreach ($pages as $pid => $rec) {
+            if (!is_array($rec) || trim((string)($rec['extId'] ?? '')) === '') continue;
+            $sched = trim((string)($rec['publishAt'] ?? ''));
+            if (empty($rec['draft']) && $sched === '') continue;   // already live
+            $qa = array_values(array_filter(array_map('strval', (array)($rec['pkgQa'] ?? []))));
+            $items[] = [
+                'type'  => 'page',
+                'id'    => (string)$pid,
+                'title' => (string)($rec['title'] ?? $pid),
+                'was'   => $sched !== '' ? ('scheduled for ' . $sched) : 'draft',
+                'qa'    => $qa,
+            ];
+            if ($dry) continue;
+            $rec['draft'] = false;
+            unset($rec['publishAt'], $rec['pkgQa']);
+            $pages[$pid] = $rec; $pagesDirty = true;
+            $file = (string)($rec['file'] ?? ($pid . '.html'));
+            $full = PUBLIC_HTML . '/' . $file;
+            if (is_file($full)) {
+                $html = (string)@file_get_contents($full);
+                if (trim($html) !== '') {
+                    cmsPkgBackup($file);
+                    $canon = cmsPkgPageUrl($baseUrl, $file);
+                    $srec  = is_array($seo[$pid] ?? null) ? $seo[$pid] : [];
+                    fourgeSitePut($full, cmsPkgStampSeo($html, $srec, $canon, false), 'Fourge: SEO package');
+                }
+            }
+        }
+    }
+
+    $posts = cmsPkgReadJson('posts.json', []);
+    $postsDirty = false;
+    if (is_array($posts)) {
+        foreach ($posts as $i => $p) {
+            if (!is_array($p) || trim((string)($p['extId'] ?? '')) === '') continue;
+            $sched = trim((string)($p['publishAt'] ?? ''));
+            if (!empty($p['published']) && $sched === '') continue;
+            $qa = array_values(array_filter(array_map('strval', (array)($p['pkgQa'] ?? []))));
+            $items[] = [
+                'type'  => 'post',
+                'id'    => (string)($p['id'] ?? $i),
+                'title' => (string)($p['title'] ?? ''),
+                'was'   => $sched !== '' ? ('scheduled for ' . $sched) : 'draft',
+                'qa'    => $qa,
+            ];
+            if ($dry) continue;
+            $posts[$i]['published'] = true;
+            unset($posts[$i]['publishAt'], $posts[$i]['pkgQa']);
+            // A post released early should not still advertise a future date.
+            $d = trim((string)($posts[$i]['date'] ?? ''));
+            if ($d === '' || strtotime($d) > time()) $posts[$i]['date'] = gmdate('Y-m-d');
+            $postsDirty = true;
+        }
+    }
+
+    if (!$dry) {
+        if ($pagesDirty) cmsPkgWriteJson('pages.json', $pages);
+        if ($postsDirty) cmsPkgWriteJson('posts.json', $posts);
+    }
+    $held = array_values(array_filter($items, function ($x) { return !empty($x['qa']); }));
+    return ['items' => $items, 'count' => count($items), 'questioned' => $held];
+}
+function fourgeApiSeoPkgPublishAll($me, $body) {
+    if (!$me || fourgeLevel($me) < 2) {
+        http_response_code(403); echo json_encode(['error' => 'Admin access required']); return;
+    }
+    $dry = !empty($body['dry']);
+    $r = cmsPkgPublishAll($dry);
+    echo json_encode(['ok' => true, 'dry' => $dry] + $r);
+}
+
+function fourgeApiSeoPkgTick($me, $body) {
+    if (!cmsPkgAuthorized($me, $body)) {
+        http_response_code(401); echo json_encode(['ok' => false, 'error' => 'Unauthorized']); return;
+    }
+    // Riding the platform's own scheduled ping is what makes "daily" actually
+    // mean daily, independent of whether anyone happens to sign into THIS
+    // site's admin — which is exactly the human step this is meant to remove.
+    // Never allowed to affect the response this endpoint exists for.
+    try { fourgeAiDailyTick(); } catch (Throwable $e) {}
+    $done = cmsPkgTick(false);
+    echo json_encode(['ok' => true, 'published' => $done, 'count' => count($done), 'checked_at' => date('c')]);
+}
+
+// Admin-side status + token rotation. The token is shown ONCE at generation.
+function fourgeApiSeoPkgAdmin($me, $body) {
+    if (fourgeLevel($me) < 2) { http_response_code(403); echo json_encode(['error' => 'Admin access required']); return; }
+    $op = strtolower(trim((string)($body['op'] ?? 'status')));
+    $has = false;
+    try { $has = trim((string)fourgeGetSecret(fourgeDb(), 'seo_pkg_token')) !== ''; } catch (Throwable $e) { $has = false; }
+    $scheme = fourgeIsHttps() ? 'https' : 'http';
+    $host   = (string)($_SERVER['HTTP_HOST'] ?? '');
+    $endpoint = $host !== '' ? ($scheme . '://' . $host . '/api/seo-platform/package') : '/api/seo-platform/package';
+    if ($op === 'regenerate') {
+        if (fourgeLevel($me) < 3) { http_response_code(403); echo json_encode(['error' => 'Super Admin access required to rotate the key']); return; }
+        try {
+            $tok = bin2hex(random_bytes(24));
+            fourgeSetSecret(fourgeDb(), 'seo_pkg_token', $tok, (string)($me['username'] ?? ''));
+            echo json_encode(['ok' => true, 'token' => $tok, 'endpoint' => $endpoint, 'hasToken' => true,
+                'note' => 'Copy this key now — it is stored encrypted and cannot be shown again.']);
+        } catch (Throwable $e) {
+            http_response_code(500); echo json_encode(['error' => 'Could not store the key: ' . $e->getMessage()]);
+        }
+        return;
+    }
+    if ($op === 'revoke') {
+        if (fourgeLevel($me) < 3) { http_response_code(403); echo json_encode(['error' => 'Super Admin access required']); return; }
+        try { fourgeDb()->prepare("DELETE FROM secrets WHERE name=?")->execute(['seo_pkg_token']); } catch (Throwable $e) {}
+        echo json_encode(['ok' => true, 'hasToken' => false, 'endpoint' => $endpoint]);
+        return;
+    }
+    echo json_encode(['ok' => true, 'hasToken' => $has, 'endpoint' => $endpoint,
+        'tickEndpoint' => str_replace('/package', '/tick', $endpoint),
+        'lastReport' => cmsPkgReadJson('seo-package-report.json', null)]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARKUP REVIEWS — THE CLIENT-SITE SIDE
+// Clients pin comments on a site in MarkUp.io. The agency's hub (one Fourge
+// install holding the MarkUp key, the queue and the approvals) turns each into a
+// change; when someone approves it, the hub reads the page from this site and
+// writes it back here. Nothing is set up per site: every request carries an
+// Ed25519 signature from the hub, checked against the hub public keys this engine
+// ships with (fourgeMarkupHubKeys) or that the server sets in the environment
+// (FOURGE_MARKUP_HUB_KEYS, comma-separated). A public key can only check a
+// signature, never make one, so a site holding it gives nothing away.
+//
+// A request: {action, payload (a JSON string), host, ts, nonce, sig}, signed over
+//   "fourge-markup-v1\n<action>\n<host>\n<ts>\n<nonce>\n<sha256 of payload>"
+// host binds it to this site, ts must be within 5 minutes, and a nonce is only
+// accepted once. A site can switch MarkUp off in Plugins (site.json
+// markup.enabled = false); it is on unless switched off.
+// ─────────────────────────────────────────────────────────────────────────────
+function fourgeMarkupHubKeys() {
+    $keys = [];   // a hub public key (base64) can also be built in here and released to every site with the engine
+    foreach (explode(',', (string)getenv('FOURGE_MARKUP_HUB_KEYS')) as $k) { $k = trim($k); if ($k !== '') $keys[] = $k; }
+    try {
+        // This install is the hub: its own key. Any other site: the key the hub's address published (fourgeMarkupFetchHubKey).
+        if (fourgeMarkupIsHub() && ($own = (string)fourgeMarkupKvGet('hub_pk', '')) !== '') $keys[] = $own;
+        if (($got = (string)fourgeMarkupKvGet('hub_pk_fetched', '')) !== '') $keys[] = $got;
+    } catch (Throwable $e) {}
+    return array_values(array_unique($keys));
+}
+// The hub's address (fourge.com unless the server says otherwise) publishes the
+// key it signs with (markup_hub_key). A site asks for it the first time a hub
+// request arrives, or when a request doesn't verify with the key it has (the hub
+// made a new one) — at most once every 5 minutes, and only over HTTPS. Trusting
+// what that address serves trusts nothing more than the hub itself: whoever
+// controls it holds the signing key anyway.
+function fourgeMarkupFetchHubKey() {
+    if ((int)fourgeMarkupKvGet('hub_pk_fetch_at', '0') > time() - 300) return '';
+    fourgeMarkupKvSet('hub_pk_fetch_at', (string)time());
+    $hub = fourgeMarkupHubUrl();
+    if (!preg_match('~^https://~i', $hub) && !getenv('FOURGE_PROBE_ALLOW_LOCAL')) return '';
+    $hubHost = fourgeMarkupHostKey((string)@parse_url($hub, PHP_URL_HOST));
+    for ($hop = 0; $hop < 3; $hop++) {
+        list($code, $raw, $err, $h) = fourgeMarkupHttp('POST', $hub . '/admin/api.php', ['Content-Type: application/json', 'Accept: application/json'], json_encode(['action' => 'markup_hub_key']), 8);
+        if (!in_array($code, [301, 302, 307, 308], true) || empty($h['location'])) break;
+        // fourge.com ↔ www.fourge.com: followed, but only to the hub's own host and only over HTTPS (tests aside)
+        $l = @parse_url((string)$h['location']);
+        if (!is_array($l) || empty($l['host']) || fourgeMarkupHostKey($l['host']) !== $hubHost) return '';
+        $scheme = strtolower((string)($l['scheme'] ?? 'https'));
+        if ($scheme !== 'https' && !getenv('FOURGE_PROBE_ALLOW_LOCAL')) return '';
+        $hub = $scheme . '://' . strtolower((string)$l['host']) . (isset($l['port']) ? ':' . (int)$l['port'] : '');
+    }
+    $j = json_decode((string)$raw, true);
+    $k = is_array($j) ? (string)($j['key'] ?? '') : '';
+    $pk = base64_decode($k, true);
+    if ($code !== 200 || $pk === false || strlen($pk) !== SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES) return '';
+    fourgeMarkupKvSet('hub_pk_fetched', $k);
+    return $k;
+}
+function fourgeMarkupEnabled() {
+    $site = json_decode((string)@file_get_contents(PUBLIC_HTML . '/data/site.json'), true);
+    return !(is_array($site) && is_array($site['markup'] ?? null) && array_key_exists('enabled', $site['markup']) && !$site['markup']['enabled']);
+}
+function fourgeMarkupHostKey($h) {
+    $h = strtolower(trim((string)$h));
+    $h = preg_replace('~:\d+$~', '', $h);
+    return preg_replace('~^www\.~', '', $h);
+}
+// Check a hub request. Returns the decoded payload array, or [code, message] on failure.
+function fourgeMarkupVerify($body, $action) {
+    if (!function_exists('sodium_crypto_sign_verify_detached')) return [500, 'This server\'s PHP has no sodium extension, so it cannot check the hub\'s signature.'];
+    $payload = (string)($body['payload'] ?? '');
+    $host = (string)($body['host'] ?? '');
+    $ts = (int)($body['ts'] ?? 0);
+    $nonce = (string)($body['nonce'] ?? '');
+    $sig = base64_decode((string)($body['sig'] ?? ''), true);
+    if ($sig === false || strlen($sig) !== SODIUM_CRYPTO_SIGN_BYTES || !preg_match('~^[A-Za-z0-9_-]{16,64}$~', $nonce)) return [401, 'Missing or malformed signature.'];
+    if (abs(time() - $ts) > 300) return [401, 'The request is too old (or the clocks disagree by over 5 minutes).'];
+    if (fourgeMarkupHostKey($host) === '' || fourgeMarkupHostKey($host) !== fourgeMarkupHostKey($_SERVER['HTTP_HOST'] ?? '')) return [401, 'The request was signed for a different site.'];
+    $msg = "fourge-markup-v1\n" . $action . "\n" . $host . "\n" . $ts . "\n" . $nonce . "\n" . hash('sha256', $payload);
+    $check = function ($keys) use ($sig, $msg) {
+        foreach ($keys as $k) {
+            $pk = base64_decode($k, true);
+            if ($pk !== false && strlen($pk) === SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES && sodium_crypto_sign_verify_detached($sig, $msg, $pk)) return true;
+        }
+        return false;
+    };
+    $keys = fourgeMarkupHubKeys();
+    $ok = $check($keys);
+    if (!$ok) {   // a hub key this site hasn't seen yet: ask the hub's address (rate-limited)
+        $got = '';
+        try { $got = fourgeMarkupFetchHubKey(); } catch (Throwable $e) { $got = ''; }
+        if ($got !== '') { $keys[] = $got; $ok = $check([$got]); }
+    }
+    if (!$keys) return [503, 'This site does not trust a MarkUp hub yet.'];
+    if (!$ok) return [401, 'The signature does not match a trusted hub.'];
+    try {
+        $pdo = fourgeDb();
+        $pdo->exec("CREATE TABLE IF NOT EXISTS markup_nonces (nonce TEXT PRIMARY KEY, ts INTEGER NOT NULL)");
+        $pdo->prepare("DELETE FROM markup_nonces WHERE ts < ?")->execute([time() - 3600]);
+        $st = $pdo->prepare("INSERT OR IGNORE INTO markup_nonces (nonce, ts) VALUES (?, ?)");
+        $st->execute([$nonce, time()]);
+        if ($st->rowCount() < 1) return [401, 'That request was already used.'];
+    } catch (Throwable $e) { return [500, 'Could not record the request.']; }
+    $p = json_decode($payload, true);
+    return is_array($p) ? $p : [];
+}
+// A page this site serves, as the hub names it: a path from the page scan (the
+// same list Pages shows), never anything else — not admin/, data/, a script, the
+// CMS's own page or a path outside the site. Returns the relative path, or ''.
+function fourgeMarkupPagePath($p) {
+    $p = ltrim(str_replace('\\', '/', trim((string)$p)), '/');
+    if ($p === '' || strpos($p, "\0") !== false || strpos($p, '..') !== false || !preg_match('~\.html?$~i', $p)) return '';
+    $pages = [];
+    scanHtml(PUBLIC_HTML, PUBLIC_HTML, ['preview.html', '404.html', '500.html', 'maintenance.html', 'coming-soon.html', 'offline.html'], $pages);
+    foreach ($pages as $pg) if ((string)$pg['path'] === $p && empty($pg['is_cms'])) return $p;
+    return '';
+}
+function fourgeMarkupPages() {
+    $pages = [];
+    scanHtml(PUBLIC_HTML, PUBLIC_HTML, ['preview.html', '404.html', '500.html', 'maintenance.html', 'coming-soon.html', 'offline.html'], $pages);
+    $meta = cmsPkgReadJson('pages.json', []);
+    $out = [];
+    foreach ($pages as $pg) {
+        if (!empty($pg['is_cms'])) continue;
+        $title = (string)$pg['title'];
+        if (is_array($meta)) foreach ($meta as $rec) if (is_array($rec) && (string)($rec['path'] ?? $rec['file'] ?? '') === (string)$pg['path'] && trim((string)($rec['title'] ?? '')) !== '') { $title = (string)$rec['title']; break; }
+        $out[] = ['path' => (string)$pg['path'], 'title' => $title];
+    }
+    return $out;
+}
+// A revision entry and snapshot, in the same shape the editor's logRevision()
+// writes, so a hub-applied change shows in Revisions and can be viewed or restored.
+function fourgeLogRevisionServer($path, $html, $who, $username) {
+    $revs = cmsPkgReadJson('revisions.json', []);
+    if (!is_array($revs)) $revs = [];
+    $rid = 'rev_' . (int)round(microtime(true) * 1000);
+    $title = '';
+    $meta = cmsPkgReadJson('pages.json', []);
+    if (is_array($meta)) foreach ($meta as $rec) if (is_array($rec) && (string)($rec['path'] ?? $rec['file'] ?? '') === $path && trim((string)($rec['title'] ?? '')) !== '') { $title = (string)$rec['title']; break; }
+    if ($title === '' && preg_match('~<title[^>]*>([^<]+)</title>~i', $html, $m)) $title = trim(html_entity_decode($m[1], ENT_QUOTES, 'UTF-8'));
+    if ($title === '') $title = $path;
+    array_unshift($revs, [
+        'id' => $rid, 'page' => (string)preg_replace('~\.html?$~i', '', basename($path)), 'pageTitle' => $title,
+        'path' => $path, 'user' => (string)$who, 'username' => (string)$username, 'timestamp' => gmdate('c'),
+        'size' => strlen($html),
+        'preview' => mb_substr(trim(preg_replace('~\s+~', ' ', preg_replace('~<[^>]+>~', ' ', $html))), 0, 160),
+    ]);
+    $dropped = array_slice($revs, 100);
+    $revs = array_slice($revs, 0, 100);
+    fourgeSitePut(cmsPkgDataPath('revisions.json'), json_encode($revs, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), 'Fourge: revision index');
+    fourgeSitePut(cmsPkgDataPath('rev_' . $rid . '.html'), $html, 'Fourge: revision snapshot ' . $rid);
+    foreach ($dropped as $d) { $f = cmsPkgDataPath('rev_' . (string)($d['id'] ?? '') . '.html'); if (is_array($d) && !empty($d['id']) && is_file($f)) @unlink($f); }
+    return $rid;
+}
+function fourgeMarkupOut($code, $arr) { if ($code !== 200) http_response_code($code); echo json_encode($arr); }
+
+function fourgeApiMarkupHello($body) {
+    $p = fourgeMarkupVerify($body, 'markup_hello');
+    if (isset($p[0]) && is_int($p[0])) { fourgeMarkupOut($p[0], ['ok' => false, 'error' => $p[1]]); return; }
+    $site = cmsPkgReadJson('site.json', []); if (!is_array($site)) $site = [];
+    $hosts = [];
+    foreach (array_merge([(string)($site['website'] ?? ''), (string)($_SERVER['HTTP_HOST'] ?? '')], array_map('strval', (array)($site['devHosts'] ?? []))) as $h) {
+        $h = preg_match('~^https?://~i', $h) ? (string)parse_url($h, PHP_URL_HOST) : $h;
+        $k = fourgeMarkupHostKey($h);
+        if ($k !== '' && preg_match('~^[a-z0-9.\-]+$~', $k)) $hosts[] = $k;
+    }
+    $enabled = fourgeMarkupEnabled();
+    fourgeMarkupOut(200, ['ok' => true, 'fourge' => true, 'version' => FOURGE_API_VERSION, 'enabled' => $enabled,
+        'name' => (string)($site['name'] ?? ''), 'website' => (string)($site['website'] ?? ''), 'hosts' => array_values(array_unique($hosts)),
+        'pages' => $enabled ? fourgeMarkupPages() : []]);
+}
+function fourgeApiMarkupRead($body) {
+    $p = fourgeMarkupVerify($body, 'markup_read');
+    if (isset($p[0]) && is_int($p[0])) { fourgeMarkupOut($p[0], ['ok' => false, 'error' => $p[1]]); return; }
+    if (!fourgeMarkupEnabled()) { fourgeMarkupOut(403, ['ok' => false, 'error' => 'MarkUp changes are switched off on this site.', 'reason' => 'disabled']); return; }
+    $path = fourgeMarkupPagePath($p['path'] ?? '');
+    if ($path === '') { fourgeMarkupOut(404, ['ok' => false, 'error' => 'No such page on this site.', 'reason' => 'no_page']); return; }
+    $html = (string)@file_get_contents(PUBLIC_HTML . '/' . $path);
+    fourgeMarkupOut(200, ['ok' => true, 'path' => $path, 'html' => $html, 'sha256' => hash('sha256', $html)]);
+}
+function fourgeApiMarkupWrite($body) {
+    $p = fourgeMarkupVerify($body, 'markup_write');
+    if (isset($p[0]) && is_int($p[0])) { fourgeMarkupOut($p[0], ['ok' => false, 'error' => $p[1]]); return; }
+    if (!fourgeMarkupEnabled()) { fourgeMarkupOut(403, ['ok' => false, 'error' => 'MarkUp changes are switched off on this site.', 'reason' => 'disabled']); return; }
+    $path = fourgeMarkupPagePath($p['path'] ?? '');
+    if ($path === '') { fourgeMarkupOut(404, ['ok' => false, 'error' => 'No such page on this site.', 'reason' => 'no_page']); return; }
+    $html = (string)($p['html'] ?? '');
+    $abs = PUBLIC_HTML . '/' . $path;
+    $cur = (string)@file_get_contents($abs);
+    // Stale: the page changed since the hub read it. Nothing is written; the hub regenerates or flags it.
+    if (hash('sha256', $cur) !== (string)($p['expect'] ?? '')) { fourgeMarkupOut(409, ['ok' => false, 'error' => 'The page changed since this change was made.', 'reason' => 'stale', 'sha256' => hash('sha256', $cur)]); return; }
+    if ($html === '' || strlen($html) > 8 * 1024 * 1024 || !preg_match('~<(html|body)\b~i', $html)) { fourgeMarkupOut(400, ['ok' => false, 'error' => 'That is not a whole page.', 'reason' => 'bad_html']); return; }
+    // The same guard the editor has (fourgeShrinkAlarm): a page that loses most of itself is refused.
+    if (strlen($cur) > 2000 && strlen($html) < strlen($cur) * 0.2) { fourgeMarkupOut(400, ['ok' => false, 'error' => 'The new page is under a fifth of the old one; refused as a safety check.', 'reason' => 'shrink']); return; }
+    cmsPkgBackup($path);
+    $who = 'MarkUp: ' . mb_substr(trim((string)($p['by'] ?? 'agency')), 0, 80);
+    fourgeLogRevisionServer($path, $html, $who, 'markup');
+    $tmp = $abs . '.tmp-' . bin2hex(random_bytes(4));
+    if (@file_put_contents($tmp, $html) !== strlen($html) || !@rename($tmp, $abs)) { @unlink($tmp); fourgeMarkupOut(500, ['ok' => false, 'error' => 'Could not write the page.', 'reason' => 'write_failed']); return; }
+    fourgeMirrorLater($abs, $html, 'Fourge: MarkUp change' . (trim((string)($p['note'] ?? '')) !== '' ? ' — ' . mb_substr(trim((string)$p['note']), 0, 80) : ''));
+    fourgeMarkupOut(200, ['ok' => true, 'path' => $path, 'sha256' => hash('sha256', $html)]);
+}
+// An image from a client's MarkUp attachment, for an image swap. Images only,
+// checked by their bytes, saved under assets/markup/ with a new name each time
+// (so no browser keeps showing a cached old picture).
+function fourgeApiMarkupUpload($body) {
+    $p = fourgeMarkupVerify($body, 'markup_upload');
+    if (isset($p[0]) && is_int($p[0])) { fourgeMarkupOut($p[0], ['ok' => false, 'error' => $p[1]]); return; }
+    if (!fourgeMarkupEnabled()) { fourgeMarkupOut(403, ['ok' => false, 'error' => 'MarkUp changes are switched off on this site.', 'reason' => 'disabled']); return; }
+    $bytes = base64_decode((string)($p['data_b64'] ?? ''), true);
+    if ($bytes === false || $bytes === '' || strlen($bytes) > 10 * 1024 * 1024) { fourgeMarkupOut(400, ['ok' => false, 'error' => 'No image, or over 10 MB.', 'reason' => 'bad_file']); return; }
+    $info = @getimagesizefromstring($bytes);
+    $ext = ['image/png' => 'png', 'image/jpeg' => 'jpg', 'image/gif' => 'gif', 'image/webp' => 'webp'][is_array($info) ? (string)($info['mime'] ?? '') : ''] ?? '';
+    if ($ext === '') { fourgeMarkupOut(400, ['ok' => false, 'error' => 'Only PNG, JPEG, GIF or WebP images.', 'reason' => 'bad_type']); return; }
+    $base = trim(preg_replace('~[^a-z0-9]+~', '-', strtolower((string)pathinfo((string)($p['name'] ?? 'image'), PATHINFO_FILENAME))), '-') ?: 'image';
+    $rel = 'assets/markup/' . gmdate('Ymd') . '-' . bin2hex(random_bytes(3)) . '-' . mb_substr($base, 0, 40) . '.' . $ext;
+    $abs = PUBLIC_HTML . '/' . $rel;
+    if (!is_dir(dirname($abs))) @mkdir(dirname($abs), 0755, true);
+    if (fourgeSitePut($abs, $bytes, 'Fourge: MarkUp image') === false) { fourgeMarkupOut(500, ['ok' => false, 'error' => 'Could not save the image.', 'reason' => 'write_failed']); return; }
+    fourgeMarkupOut(200, ['ok' => true, 'url' => '/' . $rel]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARKUP REVIEWS — THE HUB
+// One Fourge install runs the agency's MarkUp pipeline: the one at
+// fourgeMarkupHubUrl() (https://fourge.com unless FOURGE_MARKUP_HUB_URL says
+// otherwise). It holds the MarkUp key, receives MarkUp's webhook, keeps a copy of
+// each comment thread, finds the client site and page each comment is on, and
+// holds the approval queue. The MarkUp panel in the browser does the work that
+// needs a real page: finding the element, asking Claude for the change (through
+// claude_proxy), previewing it and building the new page. Everything that needs
+// a credential happens here: MarkUp's API with the key, and client sites with the
+// hub's signing key (markup_read / markup_write / markup_upload above).
+//
+// No cron: the webhook records each event once (by its id) and answers at once;
+// with php-fpm or LiteSpeed the events are worked through right after the answer
+// has gone, elsewhere when someone opens the queue (markup_hub_process). A failed
+// MarkUp call is tried again later (1, 4, 16, 64 minutes … at most 6 hours apart,
+// then given up and shown). The MarkUp key is never logged or sent to a browser.
+// ─────────────────────────────────────────────────────────────────────────────
+function fourgeMarkupHubUrl() {
+    $u = trim((string)getenv('FOURGE_MARKUP_HUB_URL'));
+    return rtrim($u !== '' ? $u : 'https://fourge.com', '/');
+}
+function fourgeMarkupApiBase() {
+    $u = trim((string)getenv('FOURGE_MARKUP_API_BASE'));
+    return rtrim($u !== '' ? $u : 'https://api.markup.io/api/v2', '/');
+}
+// host[:port] for comparing two addresses of one install: lower-case, no www., the port only when it isn't 80 or 443.
+function fourgeMarkupHostPortKey($host, $port = 0) {
+    $port = (int)$port;
+    return fourgeMarkupHostKey($host) . (($port && $port !== 80 && $port !== 443) ? ':' . $port : '');
+}
+function fourgeMarkupIsHub() {
+    $u = @parse_url(fourgeMarkupHubUrl());
+    if (!is_array($u) || empty($u['host'])) return false;
+    $cur = strtolower(trim((string)($_SERVER['HTTP_HOST'] ?? '')));
+    if ($cur === '') return false;
+    $curPort = preg_match('~:(\d+)$~', $cur, $m) ? (int)$m[1] : 0;
+    return fourgeMarkupHostPortKey($u['host'], $u['port'] ?? 0) === fourgeMarkupHostPortKey($cur, $curPort);
+}
+
+// A small key/value store next to the users (the database is never served): the
+// hub's settings and bookkeeping, and on a client site the hub key it fetched.
+function fourgeMarkupKvDb() {
+    static $ready = false;
+    $pdo = fourgeDb();
+    if (!$ready) { $pdo->exec("CREATE TABLE IF NOT EXISTS markup_kv (k TEXT PRIMARY KEY, v TEXT)"); $ready = true; }
+    return $pdo;
+}
+function fourgeMarkupKvGet($k, $default = null) {
+    $st = fourgeMarkupKvDb()->prepare("SELECT v FROM markup_kv WHERE k=?");
+    $st->execute([$k]);
+    $v = $st->fetchColumn();
+    return ($v === false || $v === null) ? $default : $v;
+}
+function fourgeMarkupKvSet($k, $v) {
+    $pdo = fourgeMarkupKvDb();
+    if ($v === null) { $pdo->prepare("DELETE FROM markup_kv WHERE k=?")->execute([$k]); return; }
+    $pdo->prepare("INSERT INTO markup_kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v")->execute([$k, (string)$v]);
+}
+function fourgeMarkupKvJson($k, $default = []) {
+    $j = json_decode((string)fourgeMarkupKvGet($k, ''), true);
+    return is_array($j) ? $j : $default;
+}
+function fourgeMarkupJson($v) { return json_encode($v, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE); }
+
+// The hub's tables (made on first use, on the hub only):
+//   markup_events    each webhook event once (its id), with retry bookkeeping
+//   markup_markups   MarkUp projects: name, address, status
+//   markup_threads   our copy of each comment thread (fourgeMarkupSlimThread)
+//   markup_sites     client sites found by a signed hello: their addresses and pages
+//   markup_overrides a person's site/page choice for a markup (path '' = all of it)
+//   markup_items     the queue: one per thread — where it goes, the change, its state
+function fourgeMarkupHubDb() {
+    static $ready = false;
+    $pdo = fourgeMarkupKvDb();
+    if (!$ready) {
+        $pdo->exec("CREATE TABLE IF NOT EXISTS markup_events (id TEXT PRIMARY KEY, type TEXT NOT NULL, markup_id TEXT, thread_id TEXT, received_at INTEGER NOT NULL, processed_at INTEGER, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0, error TEXT)");
+        $pdo->exec("CREATE TABLE IF NOT EXISTS markup_markups (id TEXT PRIMARY KEY, name TEXT, url TEXT, app_url TEXT, status TEXT, updated_at INTEGER)");
+        $pdo->exec("CREATE TABLE IF NOT EXISTS markup_threads (id TEXT PRIMARY KEY, markup_id TEXT, url TEXT, resolved INTEGER NOT NULL DEFAULT 0, sig TEXT, body TEXT, fetched_at INTEGER)");
+        $pdo->exec("CREATE TABLE IF NOT EXISTS markup_sites (site TEXT PRIMARY KEY, base TEXT NOT NULL, name TEXT, hosts TEXT, pages TEXT, enabled INTEGER NOT NULL DEFAULT 1, version TEXT, checked_at INTEGER)");
+        $pdo->exec("CREATE TABLE IF NOT EXISTS markup_overrides (markup_id TEXT NOT NULL, path TEXT NOT NULL, site TEXT NOT NULL, page TEXT NOT NULL DEFAULT '', by_user TEXT, at INTEGER, PRIMARY KEY (markup_id, path))");
+        $pdo->exec("CREATE TABLE IF NOT EXISTS markup_items (id INTEGER PRIMARY KEY AUTOINCREMENT, thread_id TEXT NOT NULL UNIQUE, markup_id TEXT, site TEXT NOT NULL DEFAULT '', page TEXT NOT NULL DEFAULT '', mapped_by TEXT, status TEXT NOT NULL, note TEXT, gen TEXT, sig TEXT, applied TEXT, loop_state TEXT, log TEXT, created_at INTEGER, updated_at INTEGER)");
+        $pdo->exec("CREATE INDEX IF NOT EXISTS markup_items_status ON markup_items (status)");
+        $pdo->exec("CREATE INDEX IF NOT EXISTS markup_events_todo ON markup_events (processed_at, next_at)");
+        $ready = true;
+    }
+    return $pdo;
+}
+
+// One request out. Returns [HTTP code (0 = no answer), body, error, lower-case response headers].
+// opts: resolve (a CURLOPT_RESOLVE pin), max (bytes; a bigger answer is cut off and reported).
+function fourgeMarkupHttp($method, $url, $headers = [], $body = null, $timeout = 20, $opts = []) {
+    $ch = curl_init($url);
+    $hdrs = [];
+    $res = [];
+    $env = trim((string)getenv('FOURGE_PROBE_RESOLVE'));   // tests: production-looking names reach the test servers
+    if ($env !== '') $res = array_map('trim', explode(',', $env));
+    if (!empty($opts['resolve'])) $res[] = (string)$opts['resolve'];
+    if ($res) curl_setopt($ch, CURLOPT_RESOLVE, $res);
+    curl_setopt_array($ch, [
+        CURLOPT_CUSTOMREQUEST  => $method,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => (int)$timeout,
+        CURLOPT_CONNECTTIMEOUT => 6,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_HTTPHEADER     => $headers,
+        CURLOPT_USERAGENT      => 'FourgeCMS MarkUp hub',
+        CURLOPT_HEADERFUNCTION => function ($c, $line) use (&$hdrs) {
+            $p = strpos($line, ':');
+            if ($p !== false) $hdrs[strtolower(trim(substr($line, 0, $p)))] = trim(substr($line, $p + 1));
+            return strlen($line);
+        },
+    ]);
+    $buf = null;
+    if (!empty($opts['max'])) {
+        $buf = ''; $max = (int)$opts['max'];
+        curl_setopt($ch, CURLOPT_WRITEFUNCTION, function ($c, $data) use (&$buf, $max) { $buf .= $data; return strlen($buf) > $max ? 0 : strlen($data); });
+    }
+    if ($body !== null) curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+    elseif ($method === 'POST') curl_setopt($ch, CURLOPT_POSTFIELDS, '');
+    $raw = curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err = (string)curl_error($ch);
+    fourgeCurlClose($ch);
+    if ($buf !== null) {
+        if (strlen($buf) > (int)$opts['max']) return [0, '', 'too large', $hdrs];
+        $raw = ($raw === false) ? false : $buf;
+    }
+    return [$raw === false ? 0 : $code, $raw === false ? '' : (string)$raw, $err, $hdrs];
+}
+// An address MarkUp handed us (a client page, an attachment): http(s) on the
+// standard ports and a public IP — never this server's own network (tests aside).
+// Returns [url, CURLOPT_RESOLVE pin to the address that was checked] or null.
+function fourgeMarkupSafeTarget($url) {
+    $p = @parse_url((string)$url);
+    if (!is_array($p) || empty($p['host']) || !in_array(strtolower((string)($p['scheme'] ?? '')), ['http', 'https'], true)) return null;
+    if (getenv('FOURGE_PROBE_ALLOW_LOCAL')) return [(string)$url, ''];
+    $host = strtolower(trim((string)$p['host'], '[]'));
+    $port = (int)($p['port'] ?? (strtolower((string)$p['scheme']) === 'https' ? 443 : 80));
+    if (($port !== 80 && $port !== 443) || $host === 'localhost' || preg_match('~\.(local|localhost|internal|lan|test|invalid)$~', $host)) return null;
+    $isIp = (bool)filter_var($host, FILTER_VALIDATE_IP);
+    $ips = $isIp ? [$host] : (@gethostbynamel($host) ?: []);
+    if (!$ips) return null;
+    foreach ($ips as $ip) if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) return null;
+    return [(string)$url, $isIp ? '' : ($host . ':' . $port . ':' . $ips[0])];
+}
+
+// The key pair the hub signs client-site requests with. The secret half stays in
+// the encrypted secret store (never listed in fourgeSecretPolicy, so no setting
+// screen can read or replace it); the public half is published by markup_hub_key.
+function fourgeMarkupHubKeypair($create = false) {
+    if (!function_exists('sodium_crypto_sign_keypair')) return null;
+    $pdo = fourgeMarkupKvDb();
+    $raw = base64_decode((string)fourgeGetSecret($pdo, 'markup_hub_sk'), true);
+    if ($raw === false || strlen($raw) !== SODIUM_CRYPTO_SIGN_SECRETKEYBYTES) {
+        if (!$create) return null;
+        $raw = sodium_crypto_sign_secretkey(sodium_crypto_sign_keypair());
+        fourgeSetSecret($pdo, 'markup_hub_sk', base64_encode($raw), 'markup-hub');
+    }
+    $pk = base64_encode(sodium_crypto_sign_publickey_from_secretkey($raw));
+    if ((string)fourgeMarkupKvGet('hub_pk', '') !== $pk) fourgeMarkupKvSet('hub_pk', $pk);
+    return ['sk' => $raw, 'pk' => $pk];
+}
+// Public: the hub's public key, for client sites to check its signatures with.
+function fourgeApiMarkupHubKey() {
+    $pk = fourgeMarkupIsHub() ? (string)fourgeMarkupKvGet('hub_pk', '') : '';
+    if ($pk === '') { fourgeMarkupOut(404, ['ok' => false, 'error' => 'There is no MarkUp hub at this address.']); return; }
+    fourgeMarkupOut(200, ['ok' => true, 'key' => $pk, 'alg' => 'ed25519']);
+}
+// A signed request to a client site (checked there by fourgeMarkupVerify). $base
+// is the site's origin, e.g. https://client.com. A redirect to the same site
+// (http → https, www. ↔ bare) is followed, signed again for the new address.
+// Returns [code, answer|null, error, the origin that answered].
+function fourgeMarkupSiteCall($base, $action, $payload, $timeout = 20) {
+    $kp = fourgeMarkupHubKeypair(false);
+    if (!$kp) return [0, null, 'The hub has no signing key yet: save the MarkUp settings once.', ''];
+    $json = fourgeMarkupJson((object)$payload);
+    $base = rtrim((string)$base, '/');
+    for ($hop = 0; $hop < 3; $hop++) {
+        $u = @parse_url($base);
+        if (!is_array($u) || empty($u['host'])) return [0, null, 'Not a web address: ' . $base, ''];
+        $host = strtolower((string)$u['host']) . (isset($u['port']) ? ':' . (int)$u['port'] : '');
+        $t = fourgeMarkupSafeTarget($base . '/admin/api.php');
+        if (!$t) return [0, null, $host . ' is not a public web address.', ''];
+        $ts = time();
+        $nonce = rtrim(strtr(base64_encode(random_bytes(24)), '+/', '-_'), '=');
+        $sig = sodium_crypto_sign_detached("fourge-markup-v1\n" . $action . "\n" . $host . "\n" . $ts . "\n" . $nonce . "\n" . hash('sha256', $json), $kp['sk']);
+        $req = fourgeMarkupJson(['action' => $action, 'payload' => $json, 'host' => $host, 'ts' => $ts, 'nonce' => $nonce, 'sig' => base64_encode($sig)]);
+        list($code, $raw, $err, $h) = fourgeMarkupHttp('POST', $t[0], ['Content-Type: application/json', 'Accept: application/json'], $req, $timeout, ['resolve' => $t[1]]);
+        if (in_array($code, [301, 302, 307, 308], true) && !empty($h['location'])) {
+            $l = @parse_url((string)$h['location']);
+            if (is_array($l) && !empty($l['host']) && fourgeMarkupHostKey($l['host']) === fourgeMarkupHostKey($u['host'])) {
+                $base = strtolower((string)($l['scheme'] ?? 'https')) . '://' . strtolower((string)$l['host']) . (isset($l['port']) ? ':' . (int)$l['port'] : '');
+                continue;
+            }
+            return [$code, null, 'The site sends its visitors to another address (' . (is_array($l) ? (string)($l['host'] ?? '') : '') . ').', ''];
+        }
+        if ($code === 0) return [0, null, 'No answer from ' . $host . ($err !== '' ? ' (' . $err . ')' : '') . '.', ''];
+        $j = json_decode($raw, true);
+        if (!is_array($j)) return [$code, null, 'HTTP ' . $code . ' from ' . $host . ' is not a Fourge answer.', $base];
+        return [$code, $j, $code === 200 ? '' : (is_string($j['error'] ?? null) ? $j['error'] : 'HTTP ' . $code . ' from ' . $host), $base];
+    }
+    return [0, null, 'Too many redirects.', ''];
+}
+
+// MarkUp's API (https://developer.markup.io). Returns [code, answer, error text,
+// seconds MarkUp asked us to wait]. A 429 asking for 5 s or less is waited out and
+// tried again; a dropped connection or a 5xx is tried once more.
+function fourgeMarkupApiKey() {
+    try { return trim((string)fourgeGetSecret(fourgeDb(), 'markup_api_key')); } catch (Throwable $e) { return ''; }
+}
+function fourgeMarkupApi($method, $path, $query = [], $json = null, $key = null) {
+    $key = ($key !== null) ? (string)$key : fourgeMarkupApiKey();
+    if ($key === '') return [0, null, 'No MarkUp key is saved yet.', 0];
+    $url = fourgeMarkupApiBase() . $path . ($query ? '?' . http_build_query($query) : '');
+    $hdr = ['Authorization: Bearer ' . $key, 'Markup-API-Version: 2023-02-22', 'Accept: application/json'];
+    $body = null;
+    if ($json !== null) { $hdr[] = 'Content-Type: application/json'; $body = fourgeMarkupJson($json); }
+    $code = 0; $raw = ''; $err = ''; $h = [];
+    for ($try = 0; $try < 3; $try++) {
+        list($code, $raw, $err, $h) = fourgeMarkupHttp($method, $url, $hdr, $body, 25);
+        $ra = (int)($h['retry-after'] ?? 0);
+        if ($code === 429 && $try < 2 && $ra <= 5) { sleep(max(1, $ra)); continue; }
+        if (($code === 0 || $code >= 500) && $try === 0) { usleep(700000); continue; }
+        break;
+    }
+    $j = json_decode($raw, true);
+    if ($code >= 200 && $code < 300) return [$code, is_array($j) ? $j : [], '', 0];
+    $msg = '';
+    if (is_array($j)) { $e = $j['error'] ?? ($j['message'] ?? ''); $msg = is_array($e) ? (string)($e['message'] ?? ($e['code'] ?? '')) : (string)$e; }
+    if ($code === 0) $text = 'Could not reach MarkUp' . ($err !== '' ? ' (' . $err . ')' : '') . '.';
+    elseif ($code === 401 || $code === 403) $text = 'MarkUp did not accept the key (HTTP ' . $code . ($msg !== '' ? ': ' . $msg : '') . ').';
+    elseif ($code === 429) $text = 'MarkUp asked the hub to slow down (HTTP 429).';
+    else $text = 'MarkUp answered HTTP ' . $code . ($msg !== '' ? ': ' . $msg : '') . '.';
+    return [$code, is_array($j) ? $j : null, $text, $code === 429 ? max(1, (int)($h['retry-after'] ?? 60)) : 0];
+}
+// MarkUp wraps answers in {"data": …}.
+function fourgeMarkupData($j) { return (is_array($j) && is_array($j['data'] ?? null)) ? $j['data'] : []; }
+
+// ── WEBHOOK ──────────────────────────────────────────────────────────────────
+// MarkUp's webhooks carry no documented signature, so the address itself is the
+// lock: /integrations/markup/webhook/<40 random characters>. An event is never
+// acted on as sent: it only says what to read again from MarkUp's API.
+function fourgeMarkupWebhookSecret($create = false) {
+    $s = '';
+    try { $s = (string)fourgeGetSecret(fourgeDb(), 'markup_webhook_secret'); } catch (Throwable $e) { $s = ''; }
+    if ($s === '' && $create) {
+        $s = rtrim(strtr(base64_encode(random_bytes(30)), '+/', '-_'), '=');
+        fourgeSetSecret(fourgeDb(), 'markup_webhook_secret', $s, 'markup-hub');
+    }
+    return $s;
+}
+function fourgeMarkupWebhookUrls() {
+    $s = fourgeMarkupWebhookSecret(false);
+    if ($s === '') return null;
+    $base = fourgeMarkupHubUrl();
+    return ['pretty' => $base . '/integrations/markup/webhook/' . $s, 'direct' => $base . '/admin/api.php?action=markup_webhook&secret=' . $s];
+}
+// Apache rewrites the pretty address onto this file (same shape as the SEO platform's endpoints).
+function fourgeWriteMarkupWebhookHtaccess() {
+    $htPath   = PUBLIC_HTML . '/.htaccess';
+    $existing = is_file($htPath) ? (string)file_get_contents($htPath) : '';
+    $begin = '# BEGIN Fourge MarkUp Webhook';
+    $end   = '# END Fourge MarkUp Webhook';
+    $rules = <<<'HT'
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteRule ^integrations/markup/webhook/([A-Za-z0-9_-]{20,100})/?$ admin/api.php?action=markup_webhook&secret=$1 [L,QSA]
+</IfModule>
+HT;
+    $block = $begin . "\n" . $rules . "\n" . $end;
+    $s = strpos($existing, $begin);
+    $e = strpos($existing, $end);
+    if ($s !== false && $e !== false && $e >= $s) {
+        $out = substr($existing, 0, $s) . $block . substr($existing, $e + strlen($end));
+    } else {
+        // Above the clean-URL block, which would rewrite the address to <path>.html.
+        $cu = strpos($existing, '# BEGIN Fourge Clean URLs');
+        if ($cu !== false) $out = substr($existing, 0, $cu) . $block . "\n\n" . substr($existing, $cu);
+        else $out = ($existing === '' ? '' : rtrim($existing) . "\n\n") . $block . "\n";
+    }
+    if ($out === $existing) return true;
+    return fourgeSitePut($htPath, $out, 'Fourge: server rules') !== false;
+}
+function fourgeApiMarkupWebhook($body) {
+    $secret = (string)($_GET['secret'] ?? '');
+    $want = fourgeMarkupIsHub() ? fourgeMarkupWebhookSecret(false) : '';
+    if ($want === '' || $secret === '' || !hash_equals($want, $secret)) { fourgeMarkupOut(404, ['ok' => false, 'error' => 'Not found.']); return; }
+    // The hub's own check that this address reaches here (fourgeMarkupWebhookSelfCheck).
+    if (strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? 'POST')) !== 'POST') { fourgeMarkupOut(200, ['ok' => true, 'markup' => 'webhook']); return; }
+    $id = trim((string)($body['id'] ?? ''));
+    $type = trim((string)($body['type'] ?? ''));
+    if ($id === '' || $type === '' || strlen($id) > 200 || strlen($type) > 80) { fourgeMarkupOut(400, ['ok' => false, 'error' => 'Not a MarkUp event.']); return; }
+    $d = is_array($body['data'] ?? null) ? $body['data'] : [];
+    $markupId = is_array($d['markup'] ?? null) ? substr((string)($d['markup']['id'] ?? ''), 0, 200) : '';
+    $threadId = is_array($d['comment'] ?? null) ? substr((string)($d['comment']['id'] ?? ''), 0, 200) : '';
+    $st = fourgeMarkupHubDb()->prepare("INSERT OR IGNORE INTO markup_events (id, type, markup_id, thread_id, received_at) VALUES (?,?,?,?,?)");
+    $st->execute([$id, $type, $markupId, $threadId, time()]);
+    $new = $st->rowCount() > 0;
+    fourgeMarkupOut(200, ['ok' => true, 'duplicate' => !$new]);
+    if (!$new) return;
+    // Answer MarkUp first, then do the work; without a way to do that, the queue does it when it opens.
+    if (function_exists('fastcgi_finish_request')) @fastcgi_finish_request();
+    elseif (function_exists('litespeed_finish_request')) @litespeed_finish_request();
+    else return;
+    @ignore_user_abort(true);
+    @set_time_limit(150);
+    try { fourgeMarkupProcess(90); } catch (Throwable $e) {}
+}
+
+// ── WORKING THROUGH EVENTS ───────────────────────────────────────────────────
+function fourgeMarkupLock($name, $ttl) {
+    $pdo = fourgeMarkupKvDb();
+    $k = 'lock_' . $name;
+    $pdo->prepare("DELETE FROM markup_kv WHERE k=? AND CAST(v AS INTEGER) < ?")->execute([$k, time()]);
+    $st = $pdo->prepare("INSERT OR IGNORE INTO markup_kv (k, v) VALUES (?, ?)");
+    $st->execute([$k, (string)(time() + (int)$ttl)]);
+    return $st->rowCount() > 0;
+}
+function fourgeMarkupUnlock($name) { fourgeMarkupKvSet('lock_' . $name, null); }
+
+function fourgeMarkupProcess($budget = 20) {
+    $out = ['processed' => 0, 'retrying' => 0, 'failed' => 0, 'pending' => 0, 'busy' => false];
+    $pdo = fourgeMarkupHubDb();
+    if (fourgeMarkupApiKey() === '') return $out;
+    if (!fourgeMarkupLock('process', (int)$budget + 60)) { $out['busy'] = true; return $out; }
+    $t0 = microtime(true);
+    try {
+        while (microtime(true) - $t0 < $budget) {
+            $st = $pdo->prepare("SELECT * FROM markup_events WHERE processed_at IS NULL AND next_at <= ? ORDER BY received_at, id LIMIT 1");
+            $st->execute([time()]);
+            $ev = $st->fetch();
+            if (!$ev) break;
+            try { $err = fourgeMarkupHandleEvent($ev); } catch (Throwable $e) { $err = 'Error: ' . $e->getMessage(); }
+            if ($err === '') {
+                $pdo->prepare("UPDATE markup_events SET processed_at=?, error=NULL WHERE id=?")->execute([time(), $ev['id']]);
+                $out['processed']++;
+                continue;
+            }
+            $n = (int)$ev['attempts'] + 1;
+            if ($n >= 8) {
+                $pdo->prepare("UPDATE markup_events SET attempts=?, processed_at=?, error=? WHERE id=?")->execute([$n, time(), 'Gave up: ' . $err, $ev['id']]);
+                $out['failed']++;
+            } else {
+                $pdo->prepare("UPDATE markup_events SET attempts=?, next_at=?, error=? WHERE id=?")->execute([$n, time() + min(21600, 60 * (4 ** ($n - 1))), $err, $ev['id']]);
+                $out['retrying']++;
+            }
+            fourgeMarkupKvSet('last_error', gmdate('Y-m-d H:i') . ' UTC — ' . $err);
+        }
+        fourgeMarkupRetryLoops($t0, $budget);
+        // an event id only needs remembering while MarkUp might still send it again
+        $pdo->prepare("DELETE FROM markup_events WHERE processed_at IS NOT NULL AND processed_at < ?")->execute([time() - 30 * 86400]);
+    } finally {
+        fourgeMarkupUnlock('process');
+    }
+    $out['pending'] = (int)$pdo->query("SELECT COUNT(*) FROM markup_events WHERE processed_at IS NULL")->fetchColumn();
+    fourgeMarkupKvSet('last_process', (string)time());
+    return $out;
+}
+// One event. '' when done; otherwise what went wrong (it is tried again later).
+function fourgeMarkupHandleEvent($ev) {
+    $type = (string)$ev['type'];
+    $mid = (string)$ev['markup_id'];
+    $tid = (string)$ev['thread_id'];
+    if ($type === 'markup_status_changed' || $type === 'markup_created') return $mid === '' ? '' : fourgeMarkupSyncMarkup($mid, $type === 'markup_status_changed');
+    if (strpos($type, 'comment_') === 0 && $tid !== '') {
+        // Comments only keep our copy of the thread current: a batch starts from a status change or "Pull changes now".
+        if ($mid !== '' && !fourgeMarkupMarkupRow($mid)) { $e = fourgeMarkupSyncMarkup($mid, false); if ($e !== '') return $e; }
+        list($th, $err) = fourgeMarkupFetchThread($tid);
+        if ($err !== '') return $err;
+        if ($th) fourgeMarkupStoreThread($th, $mid);
+        else fourgeMarkupThreadGone($tid);
+    }
+    return '';
+}
+function fourgeMarkupMarkupRow($id) {
+    $st = fourgeMarkupHubDb()->prepare("SELECT * FROM markup_markups WHERE id=?");
+    $st->execute([(string)$id]);
+    return $st->fetch() ?: null;
+}
+function fourgeMarkupNormStatus($s) { return trim((string)preg_replace('~[^a-z0-9]+~', '_', strtolower(trim((string)$s))), '_'); }
+// The statuses that start a batch. MarkUp's documentation lists none, so these
+// are guesses until the settings pick from the ones MarkUp has actually sent.
+function fourgeMarkupTriggerStatuses() {
+    $t = fourgeMarkupKvJson('trigger_statuses', null);
+    if (!is_array($t)) $t = ['approved', 'ready_for_changes', 'ready_for_change', 'changes_requested'];
+    return array_values(array_unique(array_filter(array_map('fourgeMarkupNormStatus', $t))));
+}
+function fourgeMarkupStoreMarkup($m) {
+    fourgeMarkupHubDb()->prepare("INSERT INTO markup_markups (id, name, url, app_url, status, updated_at) VALUES (?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET name=excluded.name, url=excluded.url, app_url=excluded.app_url, status=excluded.status, updated_at=excluded.updated_at")
+        ->execute([(string)$m['id'], mb_substr((string)($m['name'] ?? ''), 0, 200), (string)($m['url'] ?? ($m['webpageUrl'] ?? '')),
+                   (string)($m['markupUrl'] ?? ($m['appUrl'] ?? '')), (string)($m['status'] ?? ''), time()]);
+}
+function fourgeMarkupSyncMarkup($id, $trigger) {
+    list($code, $j, $err) = fourgeMarkupApi('GET', '/markups/' . rawurlencode((string)$id));
+    if ($code === 404) return '';   // deleted in MarkUp
+    if ($err !== '') return $err;
+    $m = fourgeMarkupData($j);
+    $status = (string)($m['status'] ?? '');
+    fourgeMarkupStoreMarkup(['id' => (string)$id] + $m);
+    if ($status !== '') {   // remembered for the settings, which offer the statuses MarkUp really uses
+        $seen = fourgeMarkupKvJson('statuses_seen', []);
+        if (!in_array($status, $seen, true)) { $seen[] = $status; fourgeMarkupKvSet('statuses_seen', fourgeMarkupJson(array_values(array_slice($seen, -30)))); }
+    }
+    if ($trigger && $status !== '' && in_array(fourgeMarkupNormStatus($status), fourgeMarkupTriggerStatuses(), true)) {
+        $r = fourgeMarkupSyncThreads((string)$id, true);
+        return $r['error'];
+    }
+    return '';
+}
+function fourgeMarkupFetchThread($id) {
+    list($code, $j, $err) = fourgeMarkupApi('GET', '/threads/' . rawurlencode((string)$id));
+    if ($code === 404) return [null, ''];
+    if ($err !== '') return [null, $err];
+    $t = fourgeMarkupData($j);
+    if (empty($t['id']) && is_array($j) && !empty($j['id'])) $t = $j;
+    return [!empty($t['id']) ? $t : null, ''];
+}
+// MarkUp's timestamps are milliseconds (sometimes an ISO date): seconds.
+function fourgeMarkupTs($v) {
+    if (is_numeric($v)) { $n = (float)$v; return (int)($n > 1e11 ? $n / 1000 : $n); }
+    if (is_string($v) && $v !== '' && ($t = strtotime($v)) !== false) return $t;
+    return 0;
+}
+// Our copy of a thread: what the queue and Claude need, nothing more (no e-mail addresses).
+function fourgeMarkupSlimThread($t) {
+    $msgs = [];
+    foreach ((array)($t['messages'] ?? []) as $m) {
+        if (!is_array($m) || !empty($m['deletedAt'])) continue;
+        $att = [];
+        foreach ((array)($m['attachments'] ?? []) as $a) {
+            if (is_array($a) && !empty($a['url'])) $att[] = ['id' => (string)($a['id'] ?? ''), 'url' => (string)$a['url'], 'mimeType' => (string)($a['mimeType'] ?? ''),
+                'name' => (string)($a['originalFilename'] ?? ''), 'width' => (int)($a['width'] ?? 0), 'height' => (int)($a['height'] ?? 0)];
+        }
+        $loom = [];
+        foreach ((array)($m['loomVideos'] ?? []) as $v) if (is_array($v) && !empty($v['sharedUrl'])) $loom[] = ['url' => (string)$v['sharedUrl'], 'title' => (string)($v['title'] ?? '')];
+        $u = is_array($m['user'] ?? null) ? $m['user'] : [];
+        $text = (string)($m['message'] ?? '');
+        if ($text === '' && is_string($m['content'] ?? null)) $text = (string)$m['content'];
+        $msgs[] = ['id' => (string)($m['id'] ?? ''), 'text' => $text, 'author' => (string)($u['name'] ?? ''), 'guest' => !empty($u['guest']),
+                   'at' => fourgeMarkupTs($m['createdAt'] ?? null), 'attachments' => $att, 'loom' => $loom];
+    }
+    $paths = function ($list) {
+        $o = [];
+        foreach ((array)$list as $e) {
+            if (!is_array($e) || !isset($e['path'])) continue;
+            $o[] = ['path' => is_string($e['path']) ? $e['path'] : fourgeMarkupJson($e['path']), 'depth' => (int)($e['depth'] ?? 0),
+                    'x' => is_numeric($e['offsetXPercentage'] ?? null) ? (float)$e['offsetXPercentage'] : null, 'y' => is_numeric($e['offsetYPercentage'] ?? null) ? (float)$e['offsetYPercentage'] : null];
+        }
+        return $o;
+    };
+    $hl = is_array($t['textHighlight'] ?? null) ? $t['textHighlight'] : [];
+    $sc = is_array($t['screenshot'] ?? null) ? $t['screenshot'] : [];
+    $bc = is_array($t['browserContext'] ?? null) ? $t['browserContext'] : [];
+    $canon = (string)($t['canonicalUrl'] ?? '');
+    return [
+        'id' => (string)$t['id'], 'number' => (int)($t['number'] ?? 0),
+        'resolved' => !empty($t['resolved']) || !empty($t['deletedAt']),
+        'url' => $canon !== '' ? $canon : (string)($t['originalUrl'] ?? ''), 'originalUrl' => (string)($t['originalUrl'] ?? ''),
+        'elements' => $paths($t['elements'] ?? []), 'parents' => $paths($t['parents'] ?? []),
+        'highlight' => (string)($hl['text'] ?? ''),
+        'viewMode' => (string)($t['viewModeId'] ?? ''),
+        'viewport' => ['w' => (int)($bc['viewportWidth'] ?? 0), 'h' => (int)($bc['viewportHeight'] ?? 0), 'screenW' => (int)($bc['screenWidth'] ?? 0),
+                       'platform' => (string)($bc['platform'] ?? ''), 'os' => (string)($bc['os'] ?? ''), 'browser' => (string)($bc['browserName'] ?? '')],
+        'screenshot' => !empty($sc['url']) ? ['url' => (string)$sc['url'], 'width' => (int)($sc['width'] ?? 0), 'height' => (int)($sc['height'] ?? 0)] : null,
+        'at' => fourgeMarkupTs($t['createdAt'] ?? null), 'author' => is_array($t['user'] ?? null) ? (string)($t['user']['name'] ?? '') : '',
+        'messages' => $msgs,
+    ];
+}
+// What a change depends on: the messages, the element and the selected text.
+function fourgeMarkupThreadSig($s) {
+    $m = [];
+    foreach ((array)$s['messages'] as $x) $m[] = [$x['id'], $x['text'], count($x['attachments'])];
+    return substr(hash('sha256', fourgeMarkupJson([$m, $s['elements'], $s['highlight']])), 0, 16);
+}
+function fourgeMarkupStoreThread($t, $markupId) {
+    $s = fourgeMarkupSlimThread($t);
+    $pdo = fourgeMarkupHubDb();
+    $pdo->prepare("INSERT INTO markup_threads (id, markup_id, url, resolved, sig, body, fetched_at) VALUES (?,?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET markup_id=CASE WHEN excluded.markup_id<>'' THEN excluded.markup_id ELSE markup_threads.markup_id END,
+        url=excluded.url, resolved=excluded.resolved, sig=excluded.sig, body=excluded.body, fetched_at=excluded.fetched_at")
+        ->execute([$s['id'], (string)$markupId, $s['url'], $s['resolved'] ? 1 : 0, fourgeMarkupThreadSig($s), fourgeMarkupJson($s), time()]);
+    $now = time();
+    // Resolved in MarkUp before its change was approved: nothing is left to do. Opened again: back in the queue.
+    if ($s['resolved']) $pdo->prepare("UPDATE markup_items SET status='resolved', updated_at=? WHERE thread_id=? AND status IN ('new','pending','needs_human','no_change','unmapped','failed')")->execute([$now, $s['id']]);
+    else $pdo->prepare("UPDATE markup_items SET status=CASE WHEN site<>'' AND page<>'' THEN 'new' ELSE 'unmapped' END, gen=NULL, updated_at=? WHERE thread_id=? AND status='resolved'")->execute([$now, $s['id']]);
+    return $s;
+}
+function fourgeMarkupThreadGone($id) {
+    $pdo = fourgeMarkupHubDb();
+    $pdo->prepare("UPDATE markup_threads SET resolved=1 WHERE id=?")->execute([(string)$id]);
+    $pdo->prepare("UPDATE markup_items SET status='resolved', updated_at=? WHERE thread_id=? AND status IN ('new','pending','needs_human','no_change','unmapped','failed')")->execute([time(), (string)$id]);
+}
+// Every open thread of a markup, into our copy and (with $enqueue) the queue.
+function fourgeMarkupSyncThreads($markupId, $enqueue) {
+    $out = ['error' => '', 'threads' => 0, 'queued' => 0];
+    $offset = 0;
+    for ($pg = 0; $pg < 40; $pg++) {
+        list($code, $j, $err) = fourgeMarkupApi('GET', '/threads', ['markupId' => $markupId, 'resolved' => 'false', 'limit' => 50, 'offset' => $offset]);
+        if ($err !== '') { $out['error'] = $err; return $out; }
+        $d = fourgeMarkupData($j);
+        $list = is_array($d['threads'] ?? null) ? $d['threads'] : [];
+        foreach ($list as $t) {
+            if (!is_array($t) || empty($t['id'])) continue;
+            if (!array_key_exists('messages', $t) || !array_key_exists('elements', $t)) {   // a summary: read the whole thread
+                list($full, $e2) = fourgeMarkupFetchThread((string)$t['id']);
+                if ($e2 !== '') { $out['error'] = $e2; return $out; }
+                if (!$full) continue;
+                $t = $full;
+            }
+            $s = fourgeMarkupStoreThread($t, $markupId);
+            $out['threads']++;
+            if ($enqueue && !$s['resolved'] && fourgeMarkupEnqueue($s, $markupId)) $out['queued']++;
+        }
+        $offset += count($list);
+        $total = (int)($d['total'] ?? 0);
+        if (count($list) < 50 || ($total > 0 && $offset >= $total)) break;
+    }
+    return $out;
+}
+function fourgeMarkupItemRow($id) {
+    $st = fourgeMarkupHubDb()->prepare("SELECT * FROM markup_items WHERE id=?");
+    $st->execute([(int)$id]);
+    return $st->fetch() ?: null;
+}
+function fourgeMarkupItemByThread($tid) {
+    $st = fourgeMarkupHubDb()->prepare("SELECT * FROM markup_items WHERE thread_id=?");
+    $st->execute([(string)$tid]);
+    return $st->fetch() ?: null;
+}
+function fourgeMarkupWho($me) {
+    $n = trim((string)($me['display_name'] ?? ''));
+    if ($n === '') $n = trim((string)($me['first_name'] ?? '') . ' ' . (string)($me['last_name'] ?? ''));
+    return $n !== '' ? mb_substr($n, 0, 80) : 'Agency';   // shown in the client site's Revisions: never an address
+}
+function fourgeMarkupItemLog($id, $entry, $me = null) {
+    $pdo = fourgeMarkupHubDb();
+    $st = $pdo->prepare("SELECT log FROM markup_items WHERE id=?");
+    $st->execute([(int)$id]);
+    $log = json_decode((string)$st->fetchColumn(), true);
+    if (!is_array($log)) $log = [];
+    $log[] = ['at' => time()] + ($me ? ['by' => (string)$me['username'], 'byName' => fourgeMarkupWho($me)] : []) + $entry;
+    $pdo->prepare("UPDATE markup_items SET log=? WHERE id=?")->execute([fourgeMarkupJson(array_slice($log, -40)), (int)$id]);
+}
+// A thread into the queue: a new item, or an item made again because the thread
+// changed since its change was made. Applied, declined and reverted items stay.
+function fourgeMarkupEnqueue($s, $markupId) {
+    $pdo = fourgeMarkupHubDb();
+    $now = time();
+    $sig = fourgeMarkupThreadSig($s);
+    $it = fourgeMarkupItemByThread($s['id']);
+    if ($it) {
+        if (in_array($it['status'], ['applied', 'declined', 'reverted', 'new'], true)) return false;
+        if (in_array($it['status'], ['pending', 'needs_human', 'no_change'], true) && (string)$it['sig'] === $sig) return false;   // nothing new
+        if ($it['mapped_by'] === 'manual' && $it['site'] !== '' && $it['page'] !== '') { $site = $it['site']; $page = $it['page']; $how = 'manual'; $note = ''; }
+        else list($site, $page, $how, $note) = fourgeMarkupMap($s['url'], (string)$markupId);
+        $pdo->prepare("UPDATE markup_items SET markup_id=?, site=?, page=?, mapped_by=?, status=?, note=?, gen=NULL, updated_at=? WHERE id=?")
+            ->execute([(string)$markupId !== '' ? (string)$markupId : (string)$it['markup_id'], $site, $page, $how, ($site !== '' && $page !== '') ? 'new' : 'unmapped', $note, $now, $it['id']]);
+        fourgeMarkupItemLog($it['id'], ['what' => 'requeued', 'was' => $it['status']]);
+        return true;
+    }
+    list($site, $page, $how, $note) = fourgeMarkupMap($s['url'], (string)$markupId);
+    $pdo->prepare("INSERT OR IGNORE INTO markup_items (thread_id, markup_id, site, page, mapped_by, status, note, log, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
+        ->execute([$s['id'], (string)$markupId, $site, $page, $how, ($site !== '' && $page !== '') ? 'new' : 'unmapped', $note, '[]', $now, $now]);
+    return true;
+}
+
+// ── WHICH SITE, WHICH PAGE ───────────────────────────────────────────────────
+// The page file for an address path, among a site's pages: / → index.html,
+// /about and /about/ → about.html or about/index.html, /about.html as named.
+function fourgeMarkupMatchPage($path, $pages) {
+    $path = '/' . ltrim((string)preg_replace('~/{2,}~', '/', rawurldecode((string)$path)), '/');
+    $have = [];
+    foreach ((array)$pages as $pg) { $p = is_array($pg) ? (string)($pg['path'] ?? '') : (string)$pg; if ($p !== '') $have[strtolower($p)] = $p; }
+    $t = trim($path, '/');
+    if ($t === '') $cands = ['index.html', 'index.htm'];
+    elseif (preg_match('~\.html?$~i', $t)) $cands = [$t];
+    else $cands = [$t . '.html', $t . '/index.html', $t . '.htm', $t . '/index.htm'];
+    foreach ($cands as $c) if (isset($have[strtolower($c)])) return $have[strtolower($c)];
+    return '';
+}
+function fourgeMarkupUrlPath($url) {
+    $p = (string)@parse_url((string)$url, PHP_URL_PATH);
+    return '/' . ltrim((string)preg_replace('~/{2,}~', '/', rawurldecode($p)), '/');
+}
+function fourgeMarkupOverridePath($url) { $p = rtrim(fourgeMarkupUrlPath($url), '/'); return $p === '' ? '/' : $p; }
+function fourgeMarkupSiteDecode($r) {
+    if (!$r) return null;
+    $r['hosts'] = json_decode((string)$r['hosts'], true) ?: [];
+    $r['pages'] = json_decode((string)$r['pages'], true) ?: [];
+    $r['enabled'] = (int)$r['enabled'] === 1;
+    return $r;
+}
+function fourgeMarkupSiteRow($site) {
+    $st = fourgeMarkupHubDb()->prepare("SELECT * FROM markup_sites WHERE site=?");
+    $st->execute([(string)$site]);
+    return fourgeMarkupSiteDecode($st->fetch() ?: null);
+}
+function fourgeMarkupSites() {
+    $out = [];
+    foreach (fourgeMarkupHubDb()->query("SELECT * FROM markup_sites ORDER BY name, site")->fetchAll() as $r) $out[] = fourgeMarkupSiteDecode($r);
+    return $out;
+}
+// Record a site from its hello. Keyed by its Website URL's host, so its staging
+// and www. addresses are one site; the origin that answered is where calls go.
+function fourgeMarkupSiteSave($base, $hello, $hostKey) {
+    $web = trim((string)($hello['website'] ?? ''));
+    $wk = $web !== '' ? fourgeMarkupHostKey((string)@parse_url((preg_match('~^https?://~i', $web) ? '' : 'https://') . $web, PHP_URL_HOST)) : '';
+    $site = $wk !== '' ? $wk : $hostKey;
+    $hosts = [$hostKey, $site];
+    foreach ((array)($hello['hosts'] ?? []) as $h) { $h = fourgeMarkupHostKey((string)$h); if ($h !== '' && preg_match('~^[a-z0-9.\-]+$~', $h)) $hosts[] = $h; }
+    $hosts = array_values(array_unique($hosts));
+    $pages = [];
+    foreach ((array)($hello['pages'] ?? []) as $pg) if (is_array($pg) && !empty($pg['path'])) $pages[] = ['path' => (string)$pg['path'], 'title' => mb_substr((string)($pg['title'] ?? ''), 0, 120)];
+    $pdo = fourgeMarkupHubDb();
+    // the same install known under another key (it got a Website URL since): one row
+    foreach (fourgeMarkupSites() as $old) {
+        if ($old['site'] === $site || !array_intersect($old['hosts'], $hosts)) continue;
+        $pdo->prepare("UPDATE markup_items SET site=? WHERE site=?")->execute([$site, $old['site']]);
+        $pdo->prepare("UPDATE markup_overrides SET site=? WHERE site=?")->execute([$site, $old['site']]);
+        $pdo->prepare("DELETE FROM markup_sites WHERE site=?")->execute([$old['site']]);
+    }
+    $pdo->prepare("INSERT INTO markup_sites (site, base, name, hosts, pages, enabled, version, checked_at) VALUES (?,?,?,?,?,?,?,?)
+        ON CONFLICT(site) DO UPDATE SET base=excluded.base, name=excluded.name, hosts=excluded.hosts, pages=excluded.pages, enabled=excluded.enabled, version=excluded.version, checked_at=excluded.checked_at")
+        ->execute([$site, rtrim((string)$base, '/'), mb_substr((string)($hello['name'] ?? ''), 0, 120), fourgeMarkupJson($hosts), fourgeMarkupJson($pages),
+                   !empty($hello['enabled']) ? 1 : 0, mb_substr((string)($hello['version'] ?? ''), 0, 20), time()]);
+    return fourgeMarkupSiteRow($site);
+}
+// The Fourge site at a page address: one we know (checked within a day), else ask
+// the address itself with a signed hello (as given, then https, then http).
+function fourgeMarkupSiteFor($url, &$note = '', $fresh = false) {
+    $p = @parse_url((string)$url);
+    if (!is_array($p) || empty($p['host'])) { $note = 'The comment has no page address.'; return null; }
+    $hk = fourgeMarkupHostKey($p['host']);
+    if (!$fresh) foreach (fourgeMarkupSites() as $s) if (in_array($hk, $s['hosts'], true) && (int)$s['checked_at'] > time() - 86400) return $s;
+    $origin = '://' . strtolower((string)$p['host']) . (isset($p['port']) ? ':' . (int)$p['port'] : '');
+    $scheme = strtolower((string)($p['scheme'] ?? 'https'));
+    $tries = array_values(array_unique([(in_array($scheme, ['http', 'https'], true) ? $scheme : 'https') . $origin, 'https' . $origin, 'http' . $origin]));
+    $why = '';
+    foreach ($tries as $base) {
+        list($code, $j, $err, $answered) = fourgeMarkupSiteCall($base, 'markup_hello', [], 12);
+        if ($code === 200 && is_array($j) && !empty($j['fourge'])) return fourgeMarkupSiteSave($answered !== '' ? $answered : $base, $j, $hk);
+        if ($code === 503) $why = $p['host'] . ' runs Fourge but does not trust this hub yet: it needs Fourge 1.14.159 or later (a site that has just updated trusts the hub within 5 minutes).';
+        elseif ($code === 401 && stripos($err, 'API token') !== false) $why = $p['host'] . ' runs an older Fourge without MarkUp: it needs Fourge 1.14.159 or later.';
+        elseif ($code === 401) $why = $p['host'] . ' refused the hub\'s signature (' . $err . ').';
+        elseif ($why === '') $why = $p['host'] . ' did not answer as a Fourge site' . ($err !== '' ? ' (' . $err . ')' : '') . '.';
+        if ($code !== 0) break;   // it answered; another scheme won't change that
+    }
+    foreach (fourgeMarkupSites() as $s) if (in_array($hk, $s['hosts'], true)) return $s;   // known, just not answering now
+    $note = $why;
+    return null;
+}
+// [site, page, how ('auto' | 'manual' | ''), note when it couldn't be placed]
+function fourgeMarkupMap($url, $markupId) {
+    $ov = null;
+    if ((string)$markupId !== '') {
+        $st = fourgeMarkupHubDb()->prepare("SELECT * FROM markup_overrides WHERE markup_id=? AND path IN (?, '') ORDER BY CASE WHEN path='' THEN 1 ELSE 0 END LIMIT 1");
+        $st->execute([(string)$markupId, fourgeMarkupOverridePath($url)]);
+        $ov = $st->fetch() ?: null;
+    }
+    $note = '';
+    $site = $ov ? fourgeMarkupSiteRow($ov['site']) : fourgeMarkupSiteFor($url, $note);
+    if (!$site) return ['', '', '', $note !== '' ? $note : 'No Fourge site is known for this address.'];
+    $label = $site['name'] !== '' ? $site['name'] : $site['site'];
+    if ($ov && $ov['path'] !== '' && $ov['page'] !== '') return [$site['site'], (string)$ov['page'], 'manual', ''];
+    if (!$site['enabled']) return [$site['site'], '', '', 'MarkUp changes are switched off on ' . $label . ' (Plugins → MarkUp reviews).'];
+    $path = fourgeMarkupUrlPath($url);
+    $query = (string)@parse_url((string)$url, PHP_URL_QUERY);
+    if (preg_match('~(^|&)p=~', $query) && preg_match('~/posts?(\.html?)?$~i', $path)) return [$site['site'], '', '', 'The comment is on a blog post, which lives in Posts rather than in a page file.'];
+    $page = fourgeMarkupMatchPage($path, $site['pages']);
+    if ($page === '') return [$site['site'], '', '', 'No page on ' . $label . ' matches ' . $path . '.'];
+    return [$site['site'], $page, $ov ? 'manual' : 'auto', ''];
+}
+
+// ── CLOSING THE LOOP IN MARKUP ───────────────────────────────────────────────
+// After a change goes live: the reply, then resolve. Each step once; a failure is
+// tried again later (fourgeMarkupRetryLoops) and the queue shows it.
+function fourgeMarkupDoneText() { return 'Done — this change is now live.'; }
+function fourgeMarkupCloseLoop($itemId, $threadId, $l = null) {
+    if (!is_array($l) || !in_array($l['state'] ?? '', ['reply', 'resolve'], true)) $l = ['state' => 'reply', 'tries' => 0];
+    $tid = rawurlencode((string)$threadId);
+    if ($l['state'] === 'reply') {
+        list($c, $j, $e) = fourgeMarkupApi('POST', '/threads/' . $tid . '/messages', [], ['content' => fourgeMarkupDoneText()]);
+        if ($e === '') $l = ['state' => 'resolve', 'tries' => 0]; else $l['error'] = $e;
+    }
+    if ($l['state'] === 'resolve') {
+        list($c, $j, $e) = fourgeMarkupApi('POST', '/threads/' . $tid . '/resolve');
+        if ($e === '') $l = ['state' => 'done', 'at' => time()]; else $l['error'] = $e;
+    }
+    if ($l['state'] !== 'done') {
+        $l['tries'] = (int)($l['tries'] ?? 0) + 1;
+        $l['next'] = time() + min(21600, 60 * (4 ** min(6, $l['tries'] - 1)));
+        if ($l['tries'] >= 10) $l['gaveUp'] = true;
+    }
+    fourgeMarkupHubDb()->prepare("UPDATE markup_items SET loop_state=? WHERE id=?")->execute([fourgeMarkupJson($l), (int)$itemId]);
+    return $l;
+}
+function fourgeMarkupRetryLoops($t0, $budget) {
+    $rows = fourgeMarkupHubDb()->query("SELECT id, thread_id, loop_state FROM markup_items WHERE status='applied' AND (loop_state LIKE '%\"state\":\"reply\"%' OR loop_state LIKE '%\"state\":\"resolve\"%') LIMIT 25")->fetchAll();
+    foreach ($rows as $r) {
+        if (microtime(true) - $t0 >= $budget) break;
+        $l = json_decode((string)$r['loop_state'], true);
+        if (!is_array($l) || !empty($l['gaveUp']) || (int)($l['next'] ?? 0) > time()) continue;
+        fourgeMarkupCloseLoop($r['id'], $r['thread_id'], $l);
+    }
+}
+
+// ── THE QUEUE'S ACTIONS (Super Admin and Architect; settings: Architect) ─────
+function fourgeMarkupHubGate($me, $level = 3) {
+    if (!$me || fourgeLevel($me) < $level) { fourgeMarkupOut(403, ['ok' => false, 'error' => $level >= 4 ? 'Only an Architect can change the MarkUp settings.' : 'MarkUp reviews are for Super Admins and Architects.']); return false; }
+    if (!fourgeMarkupIsHub()) { fourgeMarkupOut(200, ['ok' => false, 'notHub' => true, 'hub' => fourgeMarkupHubUrl(), 'error' => 'MarkUp reviews run on the agency hub, ' . (string)@parse_url(fourgeMarkupHubUrl(), PHP_URL_HOST) . '.']); return false; }
+    return true;
+}
+function fourgeMarkupStatusOut($me) {
+    $pdo = fourgeMarkupHubDb();
+    $counts = [];
+    foreach ($pdo->query("SELECT status, COUNT(*) AS n FROM markup_items GROUP BY status")->fetchAll() as $r) $counts[$r['status']] = (int)$r['n'];
+    $ev = $pdo->query("SELECT SUM(CASE WHEN processed_at IS NULL THEN 1 ELSE 0 END) AS pending, SUM(CASE WHEN processed_at IS NOT NULL AND error IS NOT NULL THEN 1 ELSE 0 END) AS failed FROM markup_events")->fetch();
+    $urls = fourgeMarkupWebhookUrls();
+    $mode = (string)fourgeMarkupKvGet('webhook_mode', '');
+    $arch = fourgeLevel($me) >= 4;
+    return [
+        'ok' => true, 'isHub' => true, 'hub' => fourgeMarkupHubUrl(), 'canSetup' => $arch,
+        'hasKey' => fourgeMarkupApiKey() !== '',
+        'workspace' => ['id' => (string)fourgeMarkupKvGet('workspace_id', ''), 'name' => (string)fourgeMarkupKvGet('workspace_name', '')],
+        'publicKey' => (string)fourgeMarkupKvGet('hub_pk', ''),
+        'webhook' => [
+            'registered' => (string)fourgeMarkupKvGet('webhook_id', '') !== '',
+            'mode' => $mode,
+            'url' => ($arch && $urls) ? ($mode === 'direct' ? $urls['direct'] : $urls['pretty']) : '',   // the address is the webhook's lock: Architects only
+            'at' => (int)fourgeMarkupKvGet('webhook_at', '0'),
+            'error' => (string)fourgeMarkupKvGet('webhook_error', ''),
+        ],
+        'triggerStatuses' => fourgeMarkupTriggerStatuses(),
+        'statusesSeen' => fourgeMarkupKvJson('statuses_seen', []),
+        'counts' => (object)$counts,
+        'events' => ['pending' => (int)($ev['pending'] ?? 0), 'failed' => (int)($ev['failed'] ?? 0)],
+        'lastError' => (string)fourgeMarkupKvGet('last_error', ''),
+        'lastProcess' => (int)fourgeMarkupKvGet('last_process', '0'),
+        'lastPull' => (int)fourgeMarkupKvGet('last_pull', '0'),
+    ];
+}
+function fourgeApiMarkupHubStatus($me, $body) {
+    if (!$me || fourgeLevel($me) < 3) { fourgeMarkupOut(403, ['ok' => false, 'error' => 'MarkUp reviews are for Super Admins and Architects.']); return; }
+    if (!fourgeMarkupIsHub()) { fourgeMarkupOut(200, ['ok' => true, 'isHub' => false, 'hub' => fourgeMarkupHubUrl()]); return; }
+    fourgeMarkupOut(200, fourgeMarkupStatusOut($me));
+}
+// The webhook's pretty address works when it answers as the webhook.
+function fourgeMarkupWebhookSelfCheck($url) {
+    list($code, $raw) = fourgeMarkupHttp('GET', $url, ['Accept: application/json'], null, 8);
+    $j = json_decode((string)$raw, true);
+    return $code === 200 && is_array($j) && ($j['markup'] ?? '') === 'webhook';
+}
+// One registration for this hub, made or brought up to date.
+function fourgeMarkupRegisterWebhook() {
+    $ws = (string)fourgeMarkupKvGet('workspace_id', '');
+    if ($ws === '') {
+        list($c, $j, $e) = fourgeMarkupApi('GET', '/workspace');
+        if ($e !== '') { fourgeMarkupKvSet('webhook_error', $e); return ['ok' => false, 'error' => $e]; }
+        $ws = (string)(fourgeMarkupData($j)['id'] ?? '');
+        if ($ws !== '') fourgeMarkupKvSet('workspace_id', $ws);
+    }
+    $urls = fourgeMarkupWebhookUrls();
+    if (!$urls) return ['ok' => false, 'error' => 'No webhook address yet.'];
+    try { fourgeWriteMarkupWebhookHtaccess(); } catch (Throwable $e) {}
+    $mode = fourgeMarkupWebhookSelfCheck($urls['pretty']) ? 'pretty' : 'direct';   // without Apache's rewrite, the plain address
+    $url = $urls[$mode];
+    $events = ['comment_created', 'comment_updated', 'comment_resolved', 'comment_unresolved', 'comment_reply_created', 'markup_created', 'markup_status_changed'];
+    $known = (string)fourgeMarkupKvGet('webhook_id', '');
+    $hubHost = fourgeMarkupHostKey((string)@parse_url(fourgeMarkupHubUrl(), PHP_URL_HOST));
+    $mine = null;
+    list($c, $j, $e) = fourgeMarkupApi('GET', '/webhook-registrations', $ws !== '' ? ['workspaceId' => $ws] : []);
+    if ($e === '') {
+        $d = fourgeMarkupData($j);
+        $list = isset($d['data']) && is_array($d['data']) ? $d['data'] : (array_values($d) === $d ? $d : []);
+        foreach ($list as $r) {
+            if (!is_array($r) || empty($r['id'])) continue;
+            $ru = (string)($r['url'] ?? '');
+            $ours = fourgeMarkupHostKey((string)@parse_url($ru, PHP_URL_HOST)) === $hubHost && (strpos($ru, '/integrations/markup/webhook/') !== false || strpos($ru, 'action=markup_webhook') !== false);
+            if ((string)$r['id'] === $known || $ours) { $mine = $r; break; }
+        }
+    }
+    $req = ['url' => $url, 'eventTypes' => $events, 'enabled' => true];
+    if ($mine) list($c2, $j2, $e2) = fourgeMarkupApi('POST', '/webhook-registrations/' . rawurlencode((string)$mine['id']), [], $req);
+    else list($c2, $j2, $e2) = fourgeMarkupApi('POST', '/webhook-registrations', [], $req + ['workspaceId' => $ws]);
+    if ($e2 !== '') { fourgeMarkupKvSet('webhook_error', $e2); return ['ok' => false, 'error' => $e2]; }
+    $rid = (string)(fourgeMarkupData($j2)['id'] ?? ($mine['id'] ?? ''));
+    fourgeMarkupKvSet('webhook_id', $rid !== '' ? $rid : 'registered');
+    fourgeMarkupKvSet('webhook_mode', $mode);
+    fourgeMarkupKvSet('webhook_at', (string)time());
+    fourgeMarkupKvSet('webhook_error', null);
+    return ['ok' => true, 'url' => $url, 'mode' => $mode];
+}
+function fourgeApiMarkupHubSave($me, $body) {
+    if (!fourgeMarkupHubGate($me, 4)) return;
+    $pdo = fourgeMarkupHubDb();
+    $msg = [];
+    $register = !empty($body['registerWebhook']);
+    if (array_key_exists('apiKey', $body)) {
+        $k = trim((string)$body['apiKey']);
+        if ($k === '') {
+            $pdo->prepare("DELETE FROM secrets WHERE name=?")->execute(['markup_api_key']);
+            foreach (['workspace_id', 'workspace_name', 'webhook_id', 'webhook_mode', 'webhook_at', 'webhook_error'] as $x) fourgeMarkupKvSet($x, null);
+            $msg[] = 'MarkUp is disconnected. (The webhook stays registered in MarkUp until it is removed there; events it sends are ignored.)';
+            $register = false;
+        } else {
+            if (strlen($k) > 500 || preg_match('~\s~', $k)) { fourgeMarkupOut(200, ['ok' => false, 'error' => 'That does not look like a MarkUp API key.']); return; }
+            list($code, $j, $err) = fourgeMarkupApi('GET', '/workspace', [], null, $k);
+            if ($err !== '') { fourgeMarkupOut(200, ['ok' => false, 'error' => 'MarkUp did not accept that key. ' . $err]); return; }
+            $w = fourgeMarkupData($j);
+            fourgeSetSecret($pdo, 'markup_api_key', $k, (string)$me['username']);
+            fourgeMarkupKvSet('workspace_id', (string)($w['id'] ?? ''));
+            fourgeMarkupKvSet('workspace_name', mb_substr((string)($w['name'] ?? ''), 0, 120));
+            $msg[] = 'Connected to ' . ((string)($w['name'] ?? '') !== '' ? (string)$w['name'] : 'MarkUp') . '.';
+            $register = true;
+        }
+    }
+    if (array_key_exists('triggerStatuses', $body)) {
+        $t = [];
+        foreach ((array)$body['triggerStatuses'] as $s) { $s = fourgeMarkupNormStatus($s); if ($s !== '' && strlen($s) <= 60) $t[] = $s; }
+        fourgeMarkupKvSet('trigger_statuses', fourgeMarkupJson(array_values(array_unique(array_slice($t, 0, 20)))));
+        $msg[] = 'Saved.';
+    }
+    // Made once and kept: the key the hub signs with, and the webhook's secret address.
+    fourgeMarkupHubKeypair(true);
+    fourgeMarkupWebhookSecret(true);
+    if ($register && fourgeMarkupApiKey() !== '') {
+        $r = fourgeMarkupRegisterWebhook();
+        $msg[] = $r['ok'] ? 'MarkUp now tells the hub about new comments and status changes.' : ('The webhook could not be registered: ' . $r['error']);
+    }
+    $out = fourgeMarkupStatusOut($me);
+    $out['message'] = implode(' ', $msg);
+    fourgeMarkupOut(200, $out);
+}
+function fourgeApiMarkupHubProcess($me, $body) {
+    if (!fourgeMarkupHubGate($me)) return;
+    $r = fourgeMarkupProcess(min(25, max(2, (int)($body['budget'] ?? 15))));
+    fourgeMarkupOut(200, ['ok' => true] + $r);
+}
+// "Pull changes now": every website markup (of one site, or all), its open
+// threads into the queue — whatever the markup's status. Works in slices of about
+// 20 seconds; the browser calls again with the cursor until done.
+function fourgeApiMarkupHubPull($me, $body) {
+    if (!fourgeMarkupHubGate($me)) return;
+    if (fourgeMarkupApiKey() === '') { fourgeMarkupOut(200, ['ok' => false, 'error' => 'Connect MarkUp first: paste the MarkUp API key in the settings.']); return; }
+    $t0 = microtime(true);
+    $siteKey = trim((string)($body['site'] ?? ''));
+    $site = $siteKey !== '' ? fourgeMarkupSiteRow($siteKey) : null;
+    if ($siteKey !== '' && !$site) { fourgeMarkupOut(200, ['ok' => false, 'error' => 'That site is not known to the hub yet.']); return; }
+    $cursor = (string)($body['cursor'] ?? '');
+    $skip = max(0, (int)($body['skip'] ?? 0));
+    $tot = ['markups' => 0, 'threads' => 0, 'queued' => 0, 'errors' => []];
+    $q = ['limit' => 25];
+    $ws = (string)fourgeMarkupKvGet('workspace_id', '');
+    if ($ws !== '') $q['workspaceId'] = $ws;
+    $ovSt = fourgeMarkupHubDb()->prepare("SELECT site FROM markup_overrides WHERE markup_id=? AND path=''");
+    for ($pg = 0; $pg < 40; $pg++) {
+        if ($cursor !== '') $q['since'] = $cursor; else unset($q['since']);
+        list($code, $j, $err) = fourgeMarkupApi('GET', '/markups', $q);
+        if ($err !== '') { fourgeMarkupOut(200, ['ok' => false, 'error' => $err] + $tot); return; }
+        $d = fourgeMarkupData($j);
+        $list = is_array($d['data'] ?? null) ? $d['data'] : [];
+        foreach ($list as $i => $m) {
+            if ($i < $skip) continue;
+            if (microtime(true) - $t0 > 20) { fourgeMarkupOut(200, ['ok' => true, 'done' => false, 'cursor' => $cursor, 'skip' => $i] + $tot); return; }
+            if (!is_array($m) || empty($m['id']) || trim((string)($m['url'] ?? '')) === '') continue;   // an image, PDF or video markup: not a website
+            fourgeMarkupStoreMarkup($m);
+            if ($site) {
+                $ovSt->execute([(string)$m['id']]);
+                $ov = $ovSt->fetchColumn();
+                $hk = fourgeMarkupHostKey((string)@parse_url((string)$m['url'], PHP_URL_HOST));
+                if (!($ov !== false ? $ov === $site['site'] : in_array($hk, $site['hosts'], true))) continue;
+            }
+            if (isset($m['activeThreads']) && is_numeric($m['activeThreads']) && (int)$m['activeThreads'] === 0) continue;   // nothing open on it
+            $tot['markups']++;
+            $r = fourgeMarkupSyncThreads((string)$m['id'], true);
+            $tot['threads'] += $r['threads'];
+            $tot['queued'] += $r['queued'];
+            if ($r['error'] !== '') $tot['errors'][] = ((string)($m['name'] ?? '') !== '' ? (string)$m['name'] : (string)$m['id']) . ': ' . $r['error'];
+        }
+        $skip = 0;
+        $next = (string)($d['nextCursor'] ?? '');
+        if (empty($d['hasMore']) || $next === '' || $next === $cursor) break;
+        $cursor = $next;
+    }
+    fourgeMarkupKvSet('last_pull', (string)time());
+    fourgeMarkupOut(200, ['ok' => true, 'done' => true] + $tot);
+}
+function fourgeMarkupItemOut($r) {
+    $applied = json_decode((string)($r['applied'] ?? ''), true);
+    if (is_array($applied)) { $applied['hasPageBefore'] = !empty($applied['pageBefore']); unset($applied['pageBefore']); }
+    $thread = isset($r['thread']) ? json_decode((string)$r['thread'], true) : null;
+    return [
+        'id' => (int)$r['id'], 'threadId' => (string)$r['thread_id'], 'markupId' => (string)$r['markup_id'],
+        'markup' => ['name' => (string)($r['mname'] ?? ''), 'url' => (string)($r['murl'] ?? ''), 'appUrl' => (string)($r['mapp'] ?? ''), 'status' => (string)($r['mstatus'] ?? '')],
+        'site' => (string)$r['site'], 'page' => (string)$r['page'], 'mappedBy' => (string)$r['mapped_by'], 'status' => (string)$r['status'], 'note' => (string)$r['note'],
+        'gen' => json_decode((string)$r['gen'], true), 'sig' => (string)$r['sig'], 'threadSig' => (string)($r['tsig'] ?? ''),
+        'applied' => $applied, 'loop' => json_decode((string)$r['loop_state'], true), 'log' => json_decode((string)$r['log'], true) ?: [],
+        'thread' => is_array($thread) ? $thread : null, 'createdAt' => (int)$r['created_at'], 'updatedAt' => (int)$r['updated_at'],
+    ];
+}
+function fourgeMarkupItemSelect() {
+    return "SELECT i.*, t.body AS thread, t.sig AS tsig, m.name AS mname, m.app_url AS mapp, m.status AS mstatus, m.url AS murl
+            FROM markup_items i LEFT JOIN markup_threads t ON t.id=i.thread_id LEFT JOIN markup_markups m ON m.id=i.markup_id";
+}
+function fourgeMarkupItemFull($id) {
+    $st = fourgeMarkupHubDb()->prepare(fourgeMarkupItemSelect() . " WHERE i.id=?");
+    $st->execute([(int)$id]);
+    $r = $st->fetch();
+    return $r ? fourgeMarkupItemOut($r) : null;
+}
+function fourgeMarkupSitesOut() {
+    $out = [];
+    foreach (fourgeMarkupSites() as $s) $out[] = ['site' => $s['site'], 'name' => (string)$s['name'], 'base' => (string)$s['base'], 'hosts' => $s['hosts'], 'pages' => $s['pages'],
+        'enabled' => $s['enabled'], 'version' => (string)$s['version'], 'checkedAt' => (int)$s['checked_at']];
+    return $out;
+}
+// Everything still open, and what was closed in the last 30 days.
+function fourgeApiMarkupHubQueue($me, $body) {
+    if (!fourgeMarkupHubGate($me)) return;
+    $st = fourgeMarkupHubDb()->prepare(fourgeMarkupItemSelect() . " WHERE i.status IN ('new','pending','needs_human','no_change','unmapped','failed') OR i.updated_at > ? ORDER BY i.updated_at DESC LIMIT 400");
+    $st->execute([time() - 30 * 86400]);
+    $items = [];
+    foreach ($st->fetchAll() as $r) $items[] = fourgeMarkupItemOut($r);
+    fourgeMarkupOut(200, ['ok' => true, 'items' => $items, 'sites' => fourgeMarkupSitesOut(), 'status' => fourgeMarkupStatusOut($me)]);
+}
+function fourgeApiMarkupHubSites($me, $body) {
+    if (!fourgeMarkupHubGate($me)) return;
+    $note = '';
+    $refresh = trim((string)($body['refresh'] ?? ''));
+    $add = trim((string)($body['add'] ?? ''));
+    if ($refresh !== '') {
+        $s = fourgeMarkupSiteRow($refresh);
+        if (!$s) { fourgeMarkupOut(200, ['ok' => false, 'error' => 'Unknown site.']); return; }
+        if (!fourgeMarkupSiteFor($s['base'], $note, true)) { fourgeMarkupOut(200, ['ok' => false, 'error' => $note, 'sites' => fourgeMarkupSitesOut()]); return; }
+    } elseif ($add !== '') {
+        if (!fourgeMarkupSiteFor(preg_match('~^https?://~i', $add) ? $add : 'https://' . $add, $note, true)) { fourgeMarkupOut(200, ['ok' => false, 'error' => $note, 'sites' => fourgeMarkupSitesOut()]); return; }
+    }
+    fourgeMarkupOut(200, ['ok' => true, 'sites' => fourgeMarkupSitesOut()]);
+}
+// The page as the client site has it now (for finding the element, the preview and the change).
+function fourgeApiMarkupHubPage($me, $body) {
+    if (!fourgeMarkupHubGate($me)) return;
+    $site = fourgeMarkupSiteRow((string)($body['site'] ?? ''));
+    if (!$site) { fourgeMarkupOut(200, ['ok' => false, 'error' => 'That site is not known to the hub.']); return; }
+    $page = (string)($body['page'] ?? '');
+    list($code, $j, $err) = fourgeMarkupSiteCall($site['base'], 'markup_read', ['path' => $page]);
+    if ($code !== 200 || !is_array($j) || !isset($j['html'])) {
+        fourgeMarkupOut(200, ['ok' => false, 'code' => $code, 'reason' => is_array($j) ? (string)($j['reason'] ?? '') : '',
+            'error' => 'Could not read ' . $page . ' from ' . ($site['name'] !== '' ? $site['name'] : $site['site']) . ': ' . ($err !== '' ? $err : 'HTTP ' . $code)]);
+        return;
+    }
+    fourgeMarkupOut(200, ['ok' => true, 'html' => (string)$j['html'], 'sha256' => (string)$j['sha256'], 'base' => $site['base'], 'url' => $site['base'] . '/' . ltrim($page, '/')]);
+}
+// A generated change, cleaned to the AI Markup op format (the browser checked it
+// against the page first; this keeps whatever is stored to the known shape).
+function fourgeMarkupOpFields() { return ['text', 'html', 'size', 'weight', 'color', 'bgColor', 'align', 'lineHeight', 'padding', 'margin', 'radius', 'width', 'height', 'src', 'alt', 'imgHref']; }
+function fourgeMarkupCleanOps($ops) {
+    $out = [];
+    foreach ((array)$ops as $op) {
+        if (!is_array($op) || !in_array((string)($op['field'] ?? ''), fourgeMarkupOpFields(), true)) continue;
+        $v = $op['value'] ?? '';
+        if (!is_scalar($v)) continue;
+        $out[] = ['field' => (string)$op['field'], 'value' => mb_substr((string)$v, 0, 20000)];
+        if (count($out) >= 16) break;
+    }
+    return $out;
+}
+function fourgeMarkupCleanGen($g) {
+    $str = function ($k, $max) use ($g) { return mb_substr(trim((string)($g[$k] ?? '')), 0, $max); };
+    $undo = [];
+    foreach ((array)($g['styleUndo'] ?? []) as $u) {
+        if (!is_array($u) || !preg_match('~^fge-r\d+$~', (string)($u['cls'] ?? '')) || !in_array((string)($u['dev'] ?? ''), ['desktop', 'tablet', 'mobile'], true) || !preg_match('~^[a-z-]{1,40}$~', (string)($u['prop'] ?? ''))) continue;
+        $undo[] = ['cls' => (string)$u['cls'], 'dev' => (string)$u['dev'], 'prop' => (string)$u['prop'], 'before' => isset($u['before']) && is_scalar($u['before']) ? mb_substr((string)$u['before'], 0, 200) : null];
+    }
+    return [
+        'classification' => in_array((string)($g['classification'] ?? ''), ['text_edit', 'style', 'image_swap', 'structural', 'question_or_vague', 'not_a_change'], true) ? (string)$g['classification'] : '',
+        'summary' => $str('summary', 300),
+        'device' => in_array((string)($g['device'] ?? ''), ['all', 'desktop', 'tablet', 'mobile'], true) ? (string)$g['device'] : 'all',
+        'ops' => fourgeMarkupCleanOps($g['ops'] ?? []),
+        'confidence' => max(0.0, min(1.0, (float)($g['confidence'] ?? 0))),
+        'method' => in_array((string)($g['method'] ?? ''), ['path', 'parent', 'text', 'manual', 'none'], true) ? (string)$g['method'] : 'none',
+        'methodConfidence' => max(0.0, min(1.0, (float)($g['methodConfidence'] ?? 0))),
+        'block' => preg_match('~^[A-Za-z0-9_-]{1,60}$~', (string)($g['block'] ?? '')) ? (string)$g['block'] : '',
+        'locator' => $str('locator', 1500),
+        'blockBefore' => mb_substr((string)($g['blockBefore'] ?? ''), 0, 120000),
+        'blockAfter' => mb_substr((string)($g['blockAfter'] ?? ''), 0, 120000),
+        'styleUndo' => $undo,
+        'pageSha' => preg_match('~^[a-f0-9]{64}$~', (string)($g['pageSha'] ?? '')) ? (string)$g['pageSha'] : '',
+        'note' => $str('note', 800),
+        'tries' => max(0, min(9, (int)($g['tries'] ?? 1))),
+    ];
+}
+function fourgeApiMarkupHubItem($me, $body) {
+    if (!fourgeMarkupHubGate($me)) return;
+    $pdo = fourgeMarkupHubDb();
+    $id = (int)($body['id'] ?? 0);
+    $op = (string)($body['op'] ?? '');
+    $it = fourgeMarkupItemRow($id);
+    if (!$it) { fourgeMarkupOut(404, ['ok' => false, 'error' => 'That item is gone.']); return; }
+    $now = time();
+    $open = ['new', 'pending', 'needs_human', 'no_change', 'unmapped', 'failed'];
+    $deny = function () use ($it) { fourgeMarkupOut(409, ['ok' => false, 'error' => 'This one is already ' . str_replace('_', ' ', $it['status']) . '.', 'item' => fourgeMarkupItemFull($it['id'])]); };
+    switch ($op) {
+        case 'refresh':   // the thread as MarkUp has it now, before a change is made from it
+            list($th, $err) = fourgeMarkupFetchThread($it['thread_id']);
+            if ($err !== '') { fourgeMarkupOut(200, ['ok' => false, 'error' => $err]); return; }
+            if (!$th) fourgeMarkupThreadGone($it['thread_id']);
+            else fourgeMarkupStoreThread($th, (string)$it['markup_id']);
+            break;
+        case 'save':      // the browser's generated change
+            if (!in_array($it['status'], $open, true)) { $deny(); return; }
+            $status = (string)($body['status'] ?? '');
+            if (!in_array($status, ['pending', 'needs_human', 'no_change', 'failed'], true)) { fourgeMarkupOut(400, ['ok' => false, 'error' => 'Unknown state.']); return; }
+            $gen = fourgeMarkupCleanGen(is_array($body['gen'] ?? null) ? $body['gen'] : []);
+            $gen['by'] = (string)$me['username'];
+            $gen['at'] = $now;
+            $sig = preg_match('~^[a-f0-9]{16}$~', (string)($body['sig'] ?? '')) ? (string)$body['sig'] : '';
+            $pdo->prepare("UPDATE markup_items SET status=?, gen=?, sig=?, note=?, updated_at=? WHERE id=?")->execute([$status, fourgeMarkupJson($gen), $sig, $gen['note'], $now, $id]);
+            fourgeMarkupItemLog($id, ['what' => 'generated', 'status' => $status, 'classification' => $gen['classification'], 'method' => $gen['method'], 'confidence' => $gen['confidence']], $me);
+            break;
+        case 'assign':    // a person places a comment the hub couldn't
+            if (!in_array($it['status'], $open, true)) { $deny(); return; }
+            $site = fourgeMarkupSiteRow((string)($body['site'] ?? ''));
+            $page = (string)($body['page'] ?? '');
+            if (!$site || !in_array($page, array_column($site['pages'], 'path'), true)) { fourgeMarkupOut(400, ['ok' => false, 'error' => 'Pick a site and one of its pages.']); return; }
+            $pdo->prepare("UPDATE markup_items SET site=?, page=?, mapped_by='manual', status='new', note='', gen=NULL, updated_at=? WHERE id=?")->execute([$site['site'], $page, $now, $id]);
+            if (!empty($body['remember']) && (string)$it['markup_id'] !== '') {
+                // Remembered for this markup: this page's address → this page, and its other pages → this site.
+                $tu = $pdo->prepare("SELECT url FROM markup_threads WHERE id=?");
+                $tu->execute([$it['thread_id']]);
+                $url = (string)$tu->fetchColumn();
+                $ins = $pdo->prepare("INSERT INTO markup_overrides (markup_id, path, site, page, by_user, at) VALUES (?,?,?,?,?,?) ON CONFLICT(markup_id, path) DO UPDATE SET site=excluded.site, page=excluded.page, by_user=excluded.by_user, at=excluded.at");
+                if ($url !== '') $ins->execute([$it['markup_id'], fourgeMarkupOverridePath($url), $site['site'], $page, (string)$me['username'], $now]);
+                $ins->execute([$it['markup_id'], '', $site['site'], '', (string)$me['username'], $now]);
+                $others = $pdo->prepare("SELECT i.id, t.url FROM markup_items i JOIN markup_threads t ON t.id=i.thread_id WHERE i.markup_id=? AND i.status='unmapped' AND i.id<>?");
+                $others->execute([$it['markup_id'], $id]);
+                foreach ($others->fetchAll() as $o) {
+                    list($s2, $p2, $h2, $n2) = fourgeMarkupMap((string)$o['url'], (string)$it['markup_id']);
+                    $pdo->prepare("UPDATE markup_items SET site=?, page=?, mapped_by=?, status=?, note=?, updated_at=? WHERE id=?")->execute([$s2, $p2, $h2, ($s2 !== '' && $p2 !== '') ? 'new' : 'unmapped', $n2, $now, $o['id']]);
+                }
+            }
+            fourgeMarkupItemLog($id, ['what' => 'assigned', 'site' => $site['site'], 'page' => $page, 'remember' => !empty($body['remember'])], $me);
+            break;
+        case 'decline':   // handled by hand: the thread stays open in MarkUp and nothing is posted
+            if (!in_array($it['status'], $open, true)) { $deny(); return; }
+            $pdo->prepare("UPDATE markup_items SET status='declined', updated_at=? WHERE id=?")->execute([$now, $id]);
+            fourgeMarkupItemLog($id, ['what' => 'declined'], $me);
+            break;
+        case 'regenerate':
+            if (!in_array($it['status'], array_merge($open, ['declined', 'resolved', 'reverted']), true)) { $deny(); return; }
+            $pdo->prepare("UPDATE markup_items SET status=?, gen=NULL, note='', updated_at=? WHERE id=?")->execute([($it['site'] !== '' && $it['page'] !== '') ? 'new' : 'unmapped', $now, $id]);
+            fourgeMarkupItemLog($id, ['what' => 'regenerate', 'was' => $it['status']], $me);
+            break;
+        case 'loop':      // post the MarkUp reply / resolve again
+            if ($it['status'] !== 'applied') { $deny(); return; }
+            $l = json_decode((string)$it['loop_state'], true);
+            if (!is_array($l) || ($l['state'] ?? '') === 'done') break;
+            $l['tries'] = 0; unset($l['gaveUp'], $l['next']);
+            fourgeMarkupCloseLoop($id, $it['thread_id'], $l);
+            break;
+        default:
+            fourgeMarkupOut(400, ['ok' => false, 'error' => 'Unknown request.']);
+            return;
+    }
+    fourgeMarkupOut(200, ['ok' => true, 'item' => fourgeMarkupItemFull($id)]);
+}
+// Approve (mode apply) or Revert. The browser built the new page from the copy
+// with fingerprint `expect`; the site writes it only if the page still has that
+// fingerprint, keeping a backup and a revision.
+function fourgeApiMarkupHubApply($me, $body) {
+    if (!fourgeMarkupHubGate($me)) return;
+    $pdo = fourgeMarkupHubDb();
+    $id = (int)($body['id'] ?? 0);
+    $mode = (string)($body['mode'] ?? 'apply');
+    $it = fourgeMarkupItemRow($id);
+    if (!$it) { fourgeMarkupOut(404, ['ok' => false, 'error' => 'That item is gone.']); return; }
+    $site = fourgeMarkupSiteRow((string)$it['site']);
+    $page = (string)$it['page'];
+    if (!$site || $page === '') { fourgeMarkupOut(200, ['ok' => false, 'error' => 'This comment is not matched to a page yet.']); return; }
+    if ($mode === 'apply' && !in_array($it['status'], ['pending', 'needs_human', 'no_change', 'failed'], true)) { fourgeMarkupOut(409, ['ok' => false, 'error' => 'This one is already ' . str_replace('_', ' ', $it['status']) . '.']); return; }
+    if ($mode === 'revert' && $it['status'] !== 'applied') { fourgeMarkupOut(409, ['ok' => false, 'error' => 'Only an applied change can be reverted.']); return; }
+    if ($mode !== 'apply' && $mode !== 'revert') { fourgeMarkupOut(400, ['ok' => false, 'error' => 'Unknown request.']); return; }
+    $who = fourgeMarkupWho($me);
+    $now = time();
+    $expect = (string)($body['expect'] ?? '');
+    // The page as the site has it now: the copy kept for Revert, and the stale check.
+    list($c1, $j1, $e1) = fourgeMarkupSiteCall($site['base'], 'markup_read', ['path' => $page]);
+    if ($c1 !== 200 || !is_array($j1) || !isset($j1['html'])) { fourgeMarkupOut(200, ['ok' => false, 'error' => 'Could not read the page from the site: ' . ($e1 !== '' ? $e1 : 'HTTP ' . $c1)]); return; }
+    if ((string)$j1['sha256'] !== $expect) { fourgeMarkupOut(200, ['ok' => false, 'reason' => 'stale', 'error' => 'The page changed in the meantime.']); return; }
+    $applied = json_decode((string)$it['applied'], true);
+    if (!is_array($applied)) $applied = [];
+    if ($mode === 'apply') {
+        $gen = json_decode((string)$it['gen'], true);
+        if (!is_array($gen)) $gen = [];
+        $final = fourgeMarkupCleanGen(['ops' => $body['ops'] ?? [], 'summary' => $body['summary'] ?? ($gen['summary'] ?? ''), 'device' => $body['device'] ?? ($gen['device'] ?? 'all'),
+            'classification' => $gen['classification'] ?? '', 'block' => $body['block'] ?? '', 'blockBefore' => $body['blockBefore'] ?? '', 'blockAfter' => $body['blockAfter'] ?? '', 'styleUndo' => $body['styleUndo'] ?? []]);
+        if (!$final['ops']) { fourgeMarkupOut(400, ['ok' => false, 'error' => 'There is no change to apply.']); return; }
+        $html = (string)($body['html'] ?? '');
+        list($c2, $j2, $e2) = fourgeMarkupSiteCall($site['base'], 'markup_write', ['path' => $page, 'html' => $html, 'expect' => $expect, 'by' => $who, 'note' => $final['summary']], 30);
+        if ($c2 === 409) { fourgeMarkupOut(200, ['ok' => false, 'reason' => 'stale', 'error' => 'The page changed in the meantime.']); return; }
+        if ($c2 !== 200) {
+            $err = 'The site did not take the change: ' . ($e2 !== '' ? $e2 : 'HTTP ' . $c2);
+            $pdo->prepare("UPDATE markup_items SET note=?, updated_at=? WHERE id=?")->execute([$err, $now, $id]);
+            fourgeMarkupItemLog($id, ['what' => 'apply_failed', 'error' => $err], $me);
+            fourgeMarkupOut(200, ['ok' => false, 'error' => $err, 'item' => fourgeMarkupItemFull($id)]);
+            return;
+        }
+        $applied = ['at' => $now, 'by' => (string)$me['username'], 'byName' => $who, 'ops' => $final['ops'], 'device' => $final['device'], 'summary' => $final['summary'],
+            'edited' => !empty($body['edited']), 'threadId' => (string)$it['thread_id'], 'beforeSha' => $expect, 'afterSha' => (string)($j2['sha256'] ?? ''), 'pageBefore' => (string)$j1['html'],
+            'block' => $final['block'], 'blockBefore' => $final['blockBefore'], 'blockAfter' => $final['blockAfter'], 'styleUndo' => $final['styleUndo']];
+        $pdo->prepare("UPDATE markup_items SET status='applied', applied=?, loop_state=?, note='', updated_at=? WHERE id=?")->execute([fourgeMarkupJson($applied), fourgeMarkupJson(['state' => 'reply', 'tries' => 0]), $now, $id]);
+        fourgeMarkupItemLog($id, ['what' => 'approved', 'threadId' => (string)$it['thread_id'], 'ops' => $final['ops'], 'device' => $final['device'], 'summary' => $final['summary'], 'edited' => !empty($body['edited'])], $me);
+        // The client hears it is live, and the thread is resolved.
+        $loop = fourgeMarkupCloseLoop($id, $it['thread_id'], ['state' => 'reply', 'tries' => 0]);
+        fourgeMarkupOut(200, ['ok' => true, 'sha256' => (string)($j2['sha256'] ?? ''), 'loop' => $loop, 'item' => fourgeMarkupItemFull($id)]);
+        return;
+    }
+    // Revert: the browser's page with the element put back, or (full) the whole page as it was before the change.
+    $html = !empty($body['full']) ? (string)($applied['pageBefore'] ?? '') : (string)($body['html'] ?? '');
+    if ($html === '') { fourgeMarkupOut(400, ['ok' => false, 'error' => 'There is no earlier copy to put back.']); return; }
+    list($c2, $j2, $e2) = fourgeMarkupSiteCall($site['base'], 'markup_write', ['path' => $page, 'html' => $html, 'expect' => $expect, 'by' => $who, 'note' => 'Revert: ' . (string)($applied['summary'] ?? '')], 30);
+    if ($c2 === 409) { fourgeMarkupOut(200, ['ok' => false, 'reason' => 'stale', 'error' => 'The page changed in the meantime.']); return; }
+    if ($c2 !== 200) { fourgeMarkupOut(200, ['ok' => false, 'error' => 'The site did not take the revert: ' . ($e2 !== '' ? $e2 : 'HTTP ' . $c2)]); return; }
+    $applied['revertedAt'] = $now;
+    $applied['revertedBy'] = (string)$me['username'];
+    $applied['revertedByName'] = $who;
+    $applied['revertFull'] = !empty($body['full']);
+    $pdo->prepare("UPDATE markup_items SET status='reverted', applied=?, updated_at=? WHERE id=?")->execute([fourgeMarkupJson($applied), $now, $id]);
+    fourgeMarkupItemLog($id, ['what' => 'reverted', 'full' => !empty($body['full'])], $me);
+    // The change is gone from the site, so the thread is open again in MarkUp (nothing is posted).
+    list($c3, $j3, $e3) = fourgeMarkupApi('POST', '/threads/' . rawurlencode((string)$it['thread_id']) . '/unresolve');
+    fourgeMarkupOut(200, ['ok' => true, 'unresolved' => $e3 === '', 'note' => $e3, 'item' => fourgeMarkupItemFull($id)]);
+}
+// An image a client attached to the comment, copied onto the client site for an
+// image swap. Only an attachment of this item's thread is fetched.
+function fourgeApiMarkupHubImage($me, $body) {
+    if (!fourgeMarkupHubGate($me)) return;
+    $it = fourgeMarkupItemRow((int)($body['id'] ?? 0));
+    if (!$it) { fourgeMarkupOut(404, ['ok' => false, 'error' => 'That item is gone.']); return; }
+    $site = fourgeMarkupSiteRow((string)$it['site']);
+    if (!$site) { fourgeMarkupOut(200, ['ok' => false, 'error' => 'This comment is not matched to a site yet.']); return; }
+    $url = (string)($body['url'] ?? '');
+    $st = fourgeMarkupHubDb()->prepare("SELECT body FROM markup_threads WHERE id=?");
+    $st->execute([$it['thread_id']]);
+    $th = json_decode((string)$st->fetchColumn(), true);
+    $att = null;
+    foreach ((array)($th['messages'] ?? []) as $m) foreach ((array)($m['attachments'] ?? []) as $a) if (is_array($a) && (string)($a['url'] ?? '') === $url && $url !== '') $att = $a;
+    if (!$att) { fourgeMarkupOut(400, ['ok' => false, 'error' => 'Only an image attached to this comment can be used.']); return; }
+    $bytes = null;
+    $u = $url;
+    for ($hop = 0; $hop < 4 && $bytes === null; $hop++) {
+        $t = fourgeMarkupSafeTarget($u);
+        if (!$t) { fourgeMarkupOut(200, ['ok' => false, 'error' => 'The attachment is not at a public address.']); return; }
+        list($code, $raw, $err, $h) = fourgeMarkupHttp('GET', $t[0], ['Accept: image/*'], null, 30, ['resolve' => $t[1], 'max' => 10 * 1024 * 1024]);
+        if (in_array($code, [301, 302, 303, 307, 308], true) && !empty($h['location'])) {
+            $loc = (string)$h['location'];
+            if (strpos($loc, '//') === 0) $loc = 'https:' . $loc;
+            elseif ($loc !== '' && $loc[0] === '/') { $pu = parse_url($u); $loc = $pu['scheme'] . '://' . $pu['host'] . (isset($pu['port']) ? ':' . $pu['port'] : '') . $loc; }
+            $u = $loc;
+            continue;
+        }
+        if ($code !== 200) { fourgeMarkupOut(200, ['ok' => false, 'error' => 'Could not download the attachment (' . ($err !== '' ? $err : 'HTTP ' . $code) . ').']); return; }
+        $bytes = $raw;
+    }
+    if ($bytes === null) { fourgeMarkupOut(200, ['ok' => false, 'error' => 'Too many redirects.']); return; }
+    $name = (string)($att['name'] ?? '') !== '' ? (string)$att['name'] : basename((string)parse_url($url, PHP_URL_PATH));
+    list($c2, $j2, $e2) = fourgeMarkupSiteCall($site['base'], 'markup_upload', ['name' => $name, 'data_b64' => base64_encode($bytes)], 60);
+    if ($c2 !== 200 || empty($j2['url'])) { fourgeMarkupOut(200, ['ok' => false, 'error' => 'The site did not take the image: ' . ($e2 !== '' ? $e2 : 'HTTP ' . $c2)]); return; }
+    fourgeMarkupItemLog((int)$it['id'], ['what' => 'image', 'url' => (string)$j2['url']], $me);
+    fourgeMarkupOut(200, ['ok' => true, 'url' => (string)$j2['url']]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SELF-UPDATE FETCH
+// Fetches a single CMS engine file from the template repo so the browser can
+// write it back to THIS server. Public repos resolve over raw.githubusercontent
+// with no auth; PRIVATE repos use the server-held github_pat via the GitHub
+// Contents API. Locked down: session-only, an explicit path allow-list (never
+// api.php / config.secret.php / site data), and a strict owner/repo shape.
+// ─────────────────────────────────────────────────────────────────────────────
+function fourgeUpdateFetchAllow() {
+    return [
+        'admin/version.json',
+        'admin/index.html',
+        'admin/db.php',
+        'block-renderer.jsx',
+        'blog-post.jsx',
+        'interior-shell.jsx',
+        'posts.jsx',
+        'preview.html',
+        'adaptify.js',
+        'fourge-chat.js',
+        'admin/api.php',
+    ];
+}
+
+function fourgeApiRepoFetch($me, $body) {
+    $repo   = trim($body['repo'] ?? '');
+    $branch = trim($body['branch'] ?? 'main');
+    if ($branch === '') $branch = 'main';
+    $path   = trim($body['path'] ?? '');
+
+    if (!in_array($path, fourgeUpdateFetchAllow(), true)) {
+        http_response_code(400);
+        echo json_encode(['error' => 'That file is not part of the update set.']);
+        return;
+    }
+    if (!preg_match('~^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$~', $repo)) {
+        http_response_code(400);
+        echo json_encode(['error' => 'Bad repository (expected owner/repo).']);
+        return;
+    }
+    if (!preg_match('~^[A-Za-z0-9][A-Za-z0-9_./-]*$~', $branch)) {
+        http_response_code(400);
+        echo json_encode(['error' => 'Bad branch name.']);
+        return;
+    }
+
+    // PRIVATE repos: authenticated GitHub Contents API (raw media type).
+    $pat = null;
+    try { $pat = fourgeGetSecret(fourgeDb(), 'github_pat'); } catch (Throwable $e) { $pat = null; }
+    $patNote = ' No GitHub token is saved (Settings → GitHub), which a private repo needs.';
+    if ($pat) {
+        $api = cmsGhBase() . "/repos/{$repo}/contents/" . $path . '?ref=' . rawurlencode($branch);
+        $ch  = curl_init($api);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER     => [
+                'Authorization: token ' . $pat,
+                'Accept: application/vnd.github.raw',
+                'User-Agent: Fourge-CMS-Updater',
+            ],
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_TIMEOUT        => 60,
+        ]);
+        $res  = curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $err  = curl_error($ch);
+        fourgeCurlClose($ch);
+        if (!$err && $code >= 200 && $code < 300 && $res !== '') {
+            echo json_encode(['ok' => true, 'content' => $res, 'source' => 'api', 'branch' => $branch]);
+            return;
+        }
+        // Capture WHY the authenticated call failed, so the client can guide the user.
+        if ($err) {
+            $patNote = ' GitHub API request failed: ' . $err . '.';
+        } else {
+            $msg = '';
+            $j = json_decode((string)$res, true);
+            if (is_array($j) && !empty($j['message'])) $msg = $j['message'];
+            if ($code === 401)      $patNote = ' The saved GitHub token is invalid or expired (401).';
+            elseif ($code === 404)  $patNote = ' The saved GitHub token cannot see ' . $repo . ' or that file (404) — give the token access to this private repo.';
+            elseif ($code === 403)  $patNote = ' GitHub denied the token (403' . ($msg ? ': ' . $msg : '') . ') — check its scope/rate limit.';
+            else                    $patNote = ' GitHub API responded ' . $code . ($msg ? ' ("' . $msg . '")' : '') . '.';
+        }
+        // fall through to public raw as a last resort
+    }
+
+    // PUBLIC repos: raw.githubusercontent (no token).
+    $rawUrl = "https://raw.githubusercontent.com/{$repo}/{$branch}/" . $path;
+    $ch = curl_init($rawUrl);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_HTTPHEADER     => ['User-Agent: Fourge-CMS-Updater'],
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_TIMEOUT        => 60,
+    ]);
+    $res  = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err  = curl_error($ch);
+    fourgeCurlClose($ch);
+
+    if ($err) { http_response_code(502); echo json_encode(['error' => 'Repo fetch failed: ' . $err]); return; }
+    if ($code < 200 || $code >= 300) {
+        http_response_code(502);
+        echo json_encode(['error' => "Couldn't fetch {$path} from {$repo}@{$branch} (HTTP {$code})." . ($code === 404 ? $patNote : '')]);
+        return;
+    }
+    echo json_encode(['ok' => true, 'content' => $res, 'source' => 'raw', 'branch' => $branch]);
+}
